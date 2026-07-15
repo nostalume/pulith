@@ -1,23 +1,27 @@
 [workspace]
-members = ["crates/*", "examples/*"]
+members = ["crates/pulith"]
 resolver = "3"
 
 [workspace.dependencies]
 blake3 = "1.8"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 flate2 = "1.1.8"
+governor = { version = "0.10", default-features = false, features = ["std"] }
 hex = "0.4"
+httpdate = "1.0.3"
 once_cell = "1.21.4"
 regex = "1.12.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+same-file = "1"
 sha2 = "0.10"
 tar = "0.4.45"
 thiserror = "2.0.18"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "time"] }
 tracing = "0.1"
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 xz2 = "0.1.7"
 url = { version = "2.5", features = ["serde"] }
+walkdir = "2.5"
 zip = "8.4.0"
 zstd = "0.13.3"
