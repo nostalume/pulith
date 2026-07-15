@@ -1,34 +1,25 @@
 # Publish Overview
 
-## Goal
+## Current source candidate
 
-Ship public Pulith crates to crates.io using dependency-order publish stages with reproducible dry-run evidence.
+The active workspace contains one package:
 
-This document now tracks the published baseline and the dependency order to reuse for the next version wave.
+```text
+pulith 0.1.0
+```
 
-## Scope
+The previous `pulith-*` side crates were published historically, but they are not current source packages and must not be used as the release graph for this repository revision.
 
-Public crates:
+## Release policy
 
-- `pulith-fs`, `pulith-version`, `pulith-resource`, `pulith-source`, `pulith-verify`, `pulith-archive`, `pulith-fetch`, `pulith-store`, `pulith-state`, `pulith-lock`, `pulith-install`, `pulith-platform`, `pulith-shim`, `pulith-serde-backend`
+The consolidated crate is not release-ready merely because historical side crates were published. A release requires:
 
-Internal/non-publish crates:
+1. feature graph and package metadata review;
+2. smallest-feature compilation checks;
+3. all-feature fmt, clippy, test, and rustdoc gates;
+4. security/dependency review;
+5. public API and SemVer review against historical names;
+6. crates.io-targeted dry run from a clean commit;
+7. explicit go/no-go decision in the readiness matrix.
 
-- `pulith-backend-example`, `runtime-manager-example`
-
-## Stages
-
-1. Stage 1: `pulith-fs`, `pulith-version`, `pulith-verify`, `pulith-shim`
-2. Stage 2: `pulith-resource`, `pulith-platform`, `pulith-archive`
-3. Stage 3: `pulith-serde-backend`, `pulith-source`
-4. Stage 4: `pulith-fetch`, `pulith-lock`, `pulith-store`
-5. Stage 5: `pulith-state`
-6. Stage 6: `pulith-install`
-
-## Current Status
-
-- stages 1-6 are now published on crates.io in dependency order
-- this session published: `pulith-serde-backend 0.1.0`, `pulith-lock 0.1.0`, `pulith-source 0.1.0`, `pulith-archive 0.2.0`, `pulith-verify 0.2.0`, `pulith-fetch 0.2.0`, `pulith-store 0.1.0`, `pulith-state 0.1.0`, `pulith-install 0.1.0`
-- readiness focus now shifts from environment/auth blockers to maintaining version/dependency coherence for the next release wave
-- canonical detailed status: `docs/publish/readiness-matrix.md`
-- active operational checklist: `docs/publish/checklist.md`
+Operational status is recorded in [`readiness-matrix.md`](readiness-matrix.md). The executable gate list is [`checklist.md`](checklist.md).

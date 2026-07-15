@@ -1,224 +1,116 @@
 # Pulith Engineering Guide
 
-This document defines coding, testing, CI, and publishing expectations for contributors.
-It is aligned with `docs/design.md` and `docs/roadmap.md`.
+This guide is subordinate to [`architecture.md`](architecture.md).
 
-## Language and Tooling
+## Repository shape
 
-- **Rust Edition**: 2024
-- **MSRV**: 1.88.0
-- **Formatter**: `cargo fmt --all`
-- **Linter**: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- **Docs**: `cargo doc --workspace --all-features --no-deps` with `RUSTDOCFLAGS=-D warnings`
-- **Task runner**: `just` (`just --list` for available commands)
-
-## Philosophy (Design-Aligned)
-
-### 1) Mechanism-first, policy-free core
-
-Pulith provides composable primitives and workflows, not a hidden framework.
-
-- Keep crate APIs mechanism-oriented and explicit.
-- Do not embed manager policy (ranking, trust, channels, cleanup decisions) in helpers.
-- Prefer data and typed contracts over implicit conventions.
-
-### 2) Explicit composition contract
-
-Code and APIs should support this pipeline directly:
-
-1. describe resource semantics
-2. plan or derive sources
-3. fetch and verify material
-4. register/store or extract
-5. install and optionally activate
-6. persist lifecycle facts
-7. inspect drift and apply explicit repair plans
-
-If a change forces callers to rebuild key/path/provenance glue manually, the design likely needs adjustment.
-
-### 3) Pure reasoning, explicit effects
-
-- Keep decision logic deterministic where possible.
-- Keep I/O, network, filesystem, and platform effects at clear boundaries.
-- Surface side effects and randomness in interfaces and types.
-- Prefer typed receipts/reports over ad hoc reconstruction.
-
-### 4) Guarantees and non-guarantees must stay honest
-
-- Only claim guarantees backed by tests and documented behavior.
-- Preserve explicit non-guarantees (no dependency solving, no hidden repair, no global rollback journal).
-- Platform differences should surface as typed, explainable behavior.
-
-## Architecture and Workspace
+The active Rust workspace contains exactly one package:
 
 ```text
-pulith/
-├── Cargo.toml                 # Workspace manifest
-├── justfile                   # Local command entrypoints
-├── crates/
-│   ├── pulith-*/              # Library and adapter crates
-│   └── ...
-├── examples/
-│   └── runtime-manager/       # Composition reference
-└── .github/workflows/         # CI and benchmark workflows
+crates/pulith
 ```
 
-Crate roles should remain narrow and composable:
+Do not reintroduce deleted side crates, compatibility shims, registries, factories, middleware layers, or empty feature flags without a demonstrated caller and a complete behavior contract.
 
-- **Primitive**: `pulith-platform`, `pulith-version`, `pulith-fs`, `pulith-verify`, `pulith-archive`, `pulith-fetch`, `pulith-shim`
-- **Semantic**: `pulith-resource`, `pulith-source`, `pulith-store`, `pulith-state`, `pulith-lock`
-- **Workflow**: `pulith-install`
-- **Adapter/example**: `examples/pulith-backend-example`, `examples/runtime-manager`
+## Design rules
 
-Module guidance:
+- Design first; code only after the behavior boundary and evidence law are explicit.
+- Preserve the typed transition chain and associated `Need`/`Evidence`/`Error`/`Output` types.
+- Keep caller policy outside mechanisms.
+- Prefer enum/ZST/associated-type identity over strings.
+- Keep sync and async semantics aligned; only execution modality may differ.
+- Keep request admission, concurrency, and byte pacing as distinct resources.
+- Delete speculative abstraction rather than preserving compatibility shells.
+- Document destructive capability types and non-guarantees honestly.
 
-- Name modules and types by functionality.
-- Keep module count small and cohesive.
-- Prefer `name.rs + name/*` layout for growing modules.
+## Feature rules
 
-## Dependencies
+Every public feature must:
 
-- Declare shared dependencies in workspace root under `[workspace.dependencies]`.
-- Reuse workspace dependencies from crates when possible.
-- Gate heavy or optional behavior behind features.
-- Pin versions intentionally when stability or compatibility requires it.
+1. enable real behavior or shared vocabulary;
+2. compile in its smallest supported combination;
+3. own only the dependencies it uses;
+4. avoid parallel aliases for the same capability.
 
-## Error Handling and Boundaries
+Current graph:
 
-### Error model
+```text
+default = local + sync
+runtime-tokio -> async
+net -> local
+ureq -> net + sync
+reqwest -> net + runtime-tokio
+blake3 -> hash
+sha2 -> hash
+zip -> local
+tar -> local
+gzip/xz/zstd -> tar
+```
 
-- Library code returns concrete crate-local error enums (`thiserror`).
-- Application/binary code may use `anyhow` for top-level orchestration.
-- Do not use `unwrap()`, `expect()`, or `panic!()` in library code paths.
+## Error rules
 
-### Boundary guideline (cross-crate)
+- Use concrete owner-local error enums.
+- Preserve source errors.
+- Carry evidence needed to explain retries, resume, limits, and partial behavior.
+- Box a large nested error at an outer boundary rather than inflating every unrelated result.
+- Any lint allowance must be local and include a reason.
 
-When one Pulith crate composes another:
+## Filesystem rules
 
-- own one public error enum per crate;
-- wrap direct dependency errors as source-bearing variants (`#[from]`/`#[source]`);
-- keep crate-specific policy/contract errors explicit;
-- avoid mirroring every nested dependency variant in upper layers.
+- Use `Path`/`PathBuf`.
+- Stage before publication.
+- Reject same-file, directory-cycle, traversal, and symlink hazards where the contract promises it.
+- Never report failure after successful publication merely because best-effort cleanup failed.
+- Treat `ExistingExtractRoot` as exclusive and destructive.
+- State trusted-parent and cross-filesystem limitations explicitly.
 
-## Async and Concurrency
+## Network rules
 
-- Use shared runtime strategy; do not spawn ad hoc runtimes in libraries.
-- Keep public types `Send + Sync` where cross-thread composition is expected.
-- Prefer deterministic coordination and bounded concurrency for reproducible behavior.
+- Admit each outbound attempt separately, including retries.
+- Enforce `max_bytes` before pacing and staged writes.
+- Persist only after body copy and stage finalization succeed.
+- Record attempt outcome, resume evidence, admission wait, and pacing wait.
+- Do not call attempt rate concurrency.
+- Do not describe decoded-body pacing as socket-level bandwidth control.
 
-## Cross-Platform Requirements
+## Required local gates
 
-- Use `Path`/`PathBuf` for all filesystem paths.
-- Keep OS-specific code behind `cfg` gates.
-- Prefer `pulith-platform` for platform/distro detection and normalization.
-- Write explicit tests for platform contracts (especially Windows activation behavior).
-- In core crates, prefer `pulith-fs` for atomic/transactional filesystem behavior; `std::fs` is acceptable in top-level example orchestration paths where those guarantees are not being implemented.
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo package -p pulith --allow-dirty --no-verify
+```
 
-## Serialization
+Run smallest-combination checks for every changed feature, for example:
 
-- Use `serde` derive for stable structured data.
-- Use `postcard`/binary or JSON intentionally per boundary contract.
-- Keep serialized layout as an implementation contract, not accidental public API.
+```bash
+cargo check -p pulith --no-default-features --features local
+cargo check -p pulith --no-default-features --features ureq
+cargo check -p pulith --no-default-features --features reqwest
+cargo check -p pulith --no-default-features --features blake3
+cargo check -p pulith --no-default-features --features sha2
+cargo check -p pulith --no-default-features --features zip
+cargo check -p pulith --no-default-features --features tar
+cargo check -p pulith --no-default-features --features gzip
+cargo check -p pulith --no-default-features --features xz
+cargo check -p pulith --no-default-features --features zstd
+```
 
-## Testing
-
-### Required layers
-
-- **Unit tests**: colocated `#[cfg(test)]` modules for local behavior.
-- **Integration tests**: `tests/` for crate/public API composition.
-- **Contract tests**: guarantee-focused behavior (archive safety, recovery, activation).
-- **Property/corpus tests**: parser/selector correctness (notably version behavior).
-- **Benchmarks**: criterion benches for threshold decisions and regressions.
-
-### Local test commands
-
-- `just test` -> `cargo test --workspace --all-features`
-- `just ci` -> local CI parity (`quality + verify`)
-- Targeted benches:
-  - `cargo bench -p pulith-fetch --bench multi_source`
-  - `cargo bench -p pulith-install --bench pipeline`
-  - `cargo bench -p pulith-install --bench copy_transition`
-
-### Test quality expectations
-
-- Add tests for every behavior-affecting change.
-- Prefer contract-oriented assertions over implementation-detail assertions.
-- Keep guarantees/non-guarantees in docs synchronized with executable tests.
-
-### Benchmark evidence expectations
-
-- benchmark-driven changes must include command lines and environment notes (OS, CPU class, storage context)
-- avoid changing thresholds from a single noisy run; use repeated runs and summarize spread
-- when thresholds change, document interpretation in `docs/roadmap.md` or crate-level design docs
-- check in benchmark notes under `docs/benchmarks/` for milestone/block evidence
-
-## CI
-
-CI is defined in `.github/workflows/ci.yml` and must remain aligned with local `just` tasks.
-
-Current required checks:
-
-- **Lint job (Ubuntu)**: fmt check, clippy `-D warnings`, docs build with rustdoc warnings denied.
-- **Test matrix**: `cargo test --workspace --all-features` on Linux, Windows, and macOS.
-- **MSRV job**: `cargo check --workspace --all-features` on Rust 1.88.0.
-- **Security and dependency checks**:
-  - `cargo audit`
-  - `cargo deny --all-features check advisories bans sources`
-  - `cargo tree --workspace --all-features -d`
-
-Benchmark workflow lives in `.github/workflows/benchmark.yml` and is run on demand.
-
-## Publish and crates.io Readiness
-
-Pulith is in active hardening. Publishing should be deliberate and checklist-driven.
-
-### Release policy
-
-- Publish only crates intended for external consumption.
-- Mark internal-only crates/examples/binaries with `publish = false` when not meant for crates.io.
-- Keep crate metadata complete (`description`, `license`, `repository`, `readme`, categories/keywords as appropriate).
-- Current internal/non-publish examples include `runtime-manager-example` and `pulith-backend-example`.
-
-### Pre-publish checklist
-
-1. Run `just ci` locally and ensure parity with GitHub CI.
-2. Verify docs build cleanly with rustdoc warnings denied.
-3. Confirm API and error-boundary contracts are documented.
-4. Ensure tests cover changed guarantees, including platform-specific behavior.
-5. Dry-run publish for each crate:
-   - `cargo publish -p <crate> --dry-run`
-6. Confirm internal-only crates/examples are marked `publish = false`.
-7. Mirror-friendly workflow: use your configured mirror registry for fast iteration dry-runs (for example `--registry ustc` when configured), then run a final crates.io-targeted dry-run (`--registry crates-io`) in release validation.
-
-### Publish ordering
-
-- Publish in dependency order (lower-level crates first).
-- After each publish, validate downstream crates still dry-run cleanly before proceeding.
+Behavior changes require contract-oriented tests. Avoid exact timing assertions when evidence can express the law.
 
 ## Documentation
 
-- All public items require `///` docs.
-- Public APIs that can fail should include `# Errors` sections.
-- Include runnable examples where practical.
-- Keep `docs/design.md`, crate design docs, and behavior/tests consistent.
+- `docs/architecture.md` is authoritative.
+- `README.md` is the user-facing summary.
+- `docs/publish/` owns current release gates.
+- `docs/report/` is historical analysis and execution evidence.
+- Historical benchmark notes remain historical; do not rewrite them as current commands.
 
-## Code Style
+## Commit discipline
 
-- Group imports by standard library, third-party, and crate-local modules.
-- Run `cargo fmt` before commit.
-- Keep lines readable (target ~100 columns unless rustfmt formats differently).
-- Avoid unexplained `#[allow(...)]` attributes and magic numbers.
-
-## Pull Request Expectations
-
-1. Keep PRs scoped and reviewable.
-2. Include tests and docs updates for behavioral/API changes.
-3. Ensure CI passes across all required jobs.
-4. Preserve mechanism-first boundaries; avoid policy leakage into core crates.
-
-## References
-
-- [README.md](../README.md)
-- [docs/design.md](./design.md)
-- [docs/roadmap.md](./roadmap.md)
-- [docs/design/](./design/) (crate-level design docs)
+- Keep code, authoritative docs, and historical reports in separate commits when possible.
+- Inspect staged diffs and run `git diff --cached --check` before committing.
+- Do not commit `.hermes/`, temporary verification scripts, `target/`, or credentials.
+- Do not commit or push unless explicitly requested.

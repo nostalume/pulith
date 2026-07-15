@@ -1,63 +1,42 @@
 # Publish Readiness Matrix
 
-Current source of truth for crates.io publish gating.
+## Active package
 
-## Stage Summary
+| Package | Version | Source state | Quality state | Release state | Blockers |
+| --- | --- | --- | --- | --- | --- |
+| `pulith` | `0.1.0` | single active workspace package | local cutover gates passed; clean-commit CI pending | **NO-GO** | API/SemVer review, archive observed-byte hardening decision, clean crates.io dry run, cross-platform CI |
 
-| Stage | Crates | Gate state | Blocker |
-|---|---|---|---|
-| 1 | `pulith-fs`, `pulith-version`, `pulith-verify`, `pulith-shim` | published | published to crates.io (`pulith-verify` now also at `0.2.0`) |
-| 2 | `pulith-resource`, `pulith-platform`, `pulith-archive` | published | stage published (`pulith-archive` at `0.2.0`) |
-| 3 | `pulith-serde-backend`, `pulith-source` | published | stage published (`0.1.0`) |
-| 4 | `pulith-fetch`, `pulith-lock`, `pulith-store` | published | stage published (`pulith-fetch 0.2.0`, `pulith-lock 0.1.0`, `pulith-store 0.1.0`) |
-| 5 | `pulith-state` | published | stage published (`0.1.0`) |
-| 6 | `pulith-install` | published | stage published (`0.1.0`) |
+## Feature readiness
 
-## Stage 1 Detail
+| Feature family | Minimum combination | Current source status |
+| --- | --- | --- |
+| execution | `sync`, `async`, `runtime-tokio` | compiles |
+| local | `local` | compiles; staged apply tests present |
+| network | `net`, `ureq`, `reqwest` | compiles; sync/async integration tests present |
+| hash | `hash`, `blake3`, `sha2` | compiles; concrete algorithm tests present |
+| archive | `zip`, `tar`, `gzip`, `xz`, `zstd` | compiles; safety/limit tests present; observed-byte limit review remains |
 
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-fs` | `0.1.0` | pass | ready |
-| `pulith-version` | `0.1.0` | pass | ready |
-| `pulith-verify` | `0.2.0` | pass | published |
-| `pulith-shim` | `0.1.0` | pass | ready |
+## Historical packages
 
-## Stage 2 Detail
+The deleted side crates and examples are historical releases only. Their published versions do not imply that the consolidated crate is published or release-ready:
 
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-resource` | `0.1.0` | pass | published |
-| `pulith-platform` | `0.1.0` | pass | published |
-| `pulith-archive` | `0.2.0` | pass | published |
+```text
+pulith-archive
+pulith-fetch
+pulith-fs
+pulith-install
+pulith-lock
+pulith-platform
+pulith-resource
+pulith-serde-backend
+pulith-shim
+pulith-source
+pulith-state
+pulith-store
+pulith-verify
+pulith-version
+```
 
-## Stage 3 Detail
+## Decision rule
 
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-serde-backend` | `0.1.0` | pass | published |
-| `pulith-source` | `0.1.0` | pass | published |
-
-## Stage 4 Detail
-
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-fetch` | `0.2.0` | pass | published |
-| `pulith-lock` | `0.1.0` | pass | published |
-| `pulith-store` | `0.1.0` | pass | published |
-
-## Stage 5 Detail
-
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-state` | `0.1.0` | pass | published |
-
-## Stage 6 Detail
-
-| Crate | Version | Last crates.io dry-run | Status |
-|---|---|---|---|
-| `pulith-install` | `0.1.0` | pass | published |
-
-## Operational Links
-
-- overview: `docs/publish/overview.md`
-- checklist: `docs/publish/checklist.md`
+Change `NO-GO` only after every unchecked item in [`checklist.md`](checklist.md) that applies to the target release has evidence from the release commit.
