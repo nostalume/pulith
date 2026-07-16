@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "net")]
 use crate::net::AcquireError;
 
+/// Errors produced by concrete Pulith behaviors.
+///
+/// This enum is non-exhaustive because new typed behaviors and policy failures may add variants.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum PulithError {
     #[cfg(feature = "net")]
@@ -29,6 +33,10 @@ pub enum PulithError {
         observed: u64,
     },
     ArchivePathConflict(PathBuf),
+    /// Extraction failed and resetting the exclusive workspace also failed.
+    ///
+    /// `extraction` is the primary [`std::error::Error::source`]. The secondary cleanup failure
+    /// remains available through `cleanup` so callers can detect a contaminated workspace.
     ArchiveCleanupFailed {
         workspace: PathBuf,
         extraction: Box<PulithError>,
@@ -103,13 +111,9 @@ impl fmt::Display for PulithError {
             Self::ArchivePathConflict(path) => {
                 write!(f, "archive entries conflict at path: {}", path.display())
             }
-            Self::ArchiveCleanupFailed {
-                workspace,
-                extraction,
-                cleanup,
-            } => write!(
+            Self::ArchiveCleanupFailed { workspace, .. } => write!(
                 f,
-                "archive extraction failed ({extraction}) and cleanup of {} also failed ({cleanup})",
+                "archive extraction and cleanup both failed for {}",
                 workspace.display()
             ),
             Self::UnsupportedArchiveEntry(path) => {
@@ -164,7 +168,7 @@ impl std::error::Error for PulithError {
         match self {
             #[cfg(feature = "net")]
             Self::NetAcquire(error) => Some(error.as_ref()),
-            Self::ArchiveCleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
+            Self::ArchiveCleanupFailed { extraction, .. } => Some(extraction.as_ref()),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }

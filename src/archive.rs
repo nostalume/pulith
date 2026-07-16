@@ -109,6 +109,23 @@ pub struct Tar<C = Plain> {
     _codec: PhantomData<C>,
 }
 
+/// Resource and path policy for archive preparation.
+///
+/// Construct this evolving policy with [`ArchivePolicy::new`] and its builder methods rather than
+/// a struct literal.
+///
+/// ```compile_fail
+/// use pulith::ArchivePolicy;
+///
+/// let _ = ArchivePolicy {
+///     strip_components: 0,
+///     max_entries: None,
+///     max_entry_bytes: None,
+///     max_total_bytes: None,
+///     max_decoded_bytes: None,
+/// };
+/// ```
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchivePolicy {
     pub strip_components: usize,
@@ -197,6 +214,13 @@ impl<A> ArchiveTree<A> {
     }
 }
 
+/// Evidence observed while preparing an archive tree.
+///
+/// `total_bytes` counts materialized regular-file bytes. For TAR families, `decoded_bytes` counts
+/// the decoded container stream, including headers, padding, extensions, and stripped entries.
+/// For ZIP, `decoded_bytes` counts decoded entry material; ZIP container metadata is seek-parsed
+/// rather than emitted through an equivalent decoded stream.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEvidence<A> {
     pub root: PathBuf,
@@ -1006,6 +1030,7 @@ mod local_apply {
 
 #[cfg(all(test, feature = "zip", feature = "local"))]
 mod tests {
+    use std::error::Error as _;
     use std::fs::{self, File};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
@@ -1039,6 +1064,15 @@ mod tests {
         );
 
         let error = combine_archive_failure(&workspace, extraction, Err(cleanup));
+
+        assert_eq!(
+            error.to_string(),
+            "archive extraction and cleanup both failed for extract"
+        );
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("invalid preparation: broken archive")
+        );
 
         assert!(matches!(
             error,
@@ -1535,6 +1569,7 @@ mod tar_tests {
         fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
     fn tar_bytes(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         build(&mut builder);
@@ -1659,6 +1694,111 @@ mod tar_tests {
     }
 
     #[test]
+    fn tar_prepare_rejects_zero_decoded_budget() {
+        let root = temp_root("zero-decoded-budget");
+        let tar_path = root.join("payload.tar");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_tar(&tar_path, |builder| {
+            append_file(builder, "payload.txt", b"x")
+        });
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(0)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual: 1,
+                max: 0,
+            }
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_prepare_accepts_exact_decoded_budget_and_rejects_one_less() {
+        let root = temp_root("exact-decoded-budget");
+        let tar_path = root.join("payload.tar");
+        fs::create_dir_all(&root).unwrap();
+        write_tar(&tar_path, |builder| {
+            append_file(builder, "payload.txt", b"pulith")
+        });
+
+        let measured = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("measure")))
+            .prepare_node(
+                verified_archive(&root, &tar_path, &root.join("target")),
+                ArchiveNeed::default(),
+            )
+            .unwrap()
+            .evidence
+            .current
+            .decoded_bytes;
+
+        ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("exact")))
+            .prepare_node(
+                verified_archive(&root, &tar_path, &root.join("target")),
+                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(measured)),
+            )
+            .unwrap();
+
+        let below_root = root.join("below");
+        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&below_root))
+            .prepare_node(
+                verified_archive(&root, &tar_path, &root.join("target")),
+                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(measured - 1)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual,
+                max,
+            } if actual == measured && max == measured - 1
+        ));
+        assert_eq!(fs::read_dir(&below_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_prepare_enforces_decoded_budget_during_regular_file_copy() {
+        let root = temp_root("regular-copy-decoded-budget");
+        let tar_path = root.join("payload.tar");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_tar(&tar_path, |builder| {
+            append_file(builder, "payload.txt", b"pulith")
+        });
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(512)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual: 513,
+                max: 512,
+            }
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tar_prepare_rejects_entry_limit() {
         let root = temp_root("entry-limit");
         let tar_path = root.join("payload.tar");
@@ -1704,6 +1844,61 @@ mod tar_tests {
         assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_prepare_sanitizes_pax_path_overrides() {
+        for path in ["../escape.txt", "/rooted.txt"] {
+            let root = temp_root("pax-path");
+            let tar_path = root.join("payload.tar");
+            let extract_root = root.join("extract");
+            fs::create_dir_all(&root).unwrap();
+            write_tar(&tar_path, |builder| {
+                builder
+                    .append_pax_extensions([("path", path.as_bytes())])
+                    .unwrap();
+                append_file(builder, "safe.txt", b"nope");
+            });
+
+            let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+                .prepare_node(
+                    verified_archive(&root, &tar_path, &root.join("target")),
+                    ArchiveNeed::default(),
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, PulithError::ArchiveInvalidPath(_)));
+            assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tar_prepare_applies_windows_rules_to_pax_path_overrides() {
+        for path in ["C:\\escape.txt", "NUL.txt", "payload.txt:stream"] {
+            let root = temp_root("pax-windows-path");
+            let tar_path = root.join("payload.tar");
+            let extract_root = root.join("extract");
+            fs::create_dir_all(&root).unwrap();
+            write_tar(&tar_path, |builder| {
+                builder
+                    .append_pax_extensions([("path", path.as_bytes())])
+                    .unwrap();
+                append_file(builder, "safe.txt", b"nope");
+            });
+
+            let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+                .prepare_node(
+                    verified_archive(&root, &tar_path, &root.join("target")),
+                    ArchiveNeed::default(),
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, PulithError::ArchiveInvalidPath(_)));
+            assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -1794,6 +1989,26 @@ mod tar_tests {
                 observed: 4,
             } if path == Path::new("payload.txt")
         ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_prepare_rejects_truncated_terminal_entry_when_stripped() {
+        let root = temp_root("truncated-stripped-entry");
+        let tar_path = root.join("payload.tar");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_truncated_tar(&tar_path);
+
+        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified_archive(&root, &tar_path, &root.join("target")),
+                ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, PulithError::Io { .. }), "{error:?}");
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
