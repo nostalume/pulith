@@ -3,7 +3,9 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::path::Path;
 
-use crate::{Acquired, EvidenceChain, PulithError, Verified, VerifyNode};
+use crate::PulithError;
+#[cfg(feature = "local")]
+use crate::{Acquired, EvidenceChain, Verified, VerifyNode};
 
 pub trait DigestAlgorithm {
     const NAME: &'static str;

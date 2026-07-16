@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::marker::PhantomData;
@@ -8,6 +11,12 @@ use crate::{
 };
 
 type ArchivePrepared<I, E, A> = Prepared<I, ArchiveTree<A>, EvidenceChain<E, ArchiveEvidence<A>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveEntryKind {
+    File,
+    Directory,
+}
 
 #[cfg(feature = "zip")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,6 +48,7 @@ pub struct Tar<C = Plain> {
 pub struct ArchivePolicy {
     pub strip_components: usize,
     pub max_entries: Option<u64>,
+    pub max_entry_bytes: Option<u64>,
     pub max_total_bytes: Option<u64>,
 }
 
@@ -57,6 +67,11 @@ impl ArchivePolicy {
         self
     }
 
+    pub fn max_entry_bytes(mut self, max_entry_bytes: u64) -> Self {
+        self.max_entry_bytes = Some(max_entry_bytes);
+        self
+    }
+
     pub fn max_total_bytes(mut self, max_total_bytes: u64) -> Self {
         self.max_total_bytes = Some(max_total_bytes);
         self
@@ -68,6 +83,7 @@ impl Default for ArchivePolicy {
         Self {
             strip_components: 0,
             max_entries: Some(16_384),
+            max_entry_bytes: Some(4 * 1024 * 1024 * 1024),
             max_total_bytes: Some(4 * 1024 * 1024 * 1024),
         }
     }
@@ -139,18 +155,18 @@ impl<A> ArchiveEvidence<A> {
 ///
 /// Preparing an archive clears this path recursively before extraction. The path must not point
 /// at shared or independently managed content.
-pub struct ExistingExtractRoot {
+pub struct ExtractWorkspace {
     pub root: PathBuf,
 }
 
-impl ExistingExtractRoot {
+impl ExtractWorkspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivePrepare<A, R = ExistingExtractRoot> {
+pub struct ArchivePrepare<A, R = ExtractWorkspace> {
     pub resources: R,
     _archive: PhantomData<A>,
 }
@@ -165,7 +181,7 @@ impl<A, R> ArchivePrepare<A, R> {
 }
 
 #[cfg(feature = "zip")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>> for ArchivePrepare<Zip, ExistingExtractRoot> {
+impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>> for ArchivePrepare<Zip, ExtractWorkspace> {
     type Need = ArchiveNeed<Zip>;
     type Prepared = ArchiveTree<Zip>;
     type Evidence = ArchiveEvidence<Zip>;
@@ -177,25 +193,13 @@ impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>> for ArchivePrepare<Zip, Ex
         node: Verified<I, LocalMaterial, E>,
         need: Self::Need,
     ) -> Result<Self::Output, Self::Error> {
-        if node.material.kind != MaterialKind::File {
-            return Err(PulithError::ArchiveRequiresFile(node.material.path));
-        }
-
-        let root = self.resources.root.clone();
-        reset_extract_root(&root)?;
-        let evidence = extract_zip(&node.material.path, &root, &need.policy)?;
-
-        Ok(Prepared::from_prepare(
-            node.input,
-            ArchiveTree::new(root),
-            EvidenceChain::new(node.evidence, evidence),
-        ))
+        prepare_archive(node, &self.resources.root, need.policy, extract_zip)
     }
 }
 
 #[cfg(feature = "tar")]
 impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Plain>, ExistingExtractRoot>
+    for ArchivePrepare<Tar<Plain>, ExtractWorkspace>
 {
     type Need = ArchiveNeed<Tar<Plain>>;
     type Prepared = ArchiveTree<Tar<Plain>>;
@@ -215,7 +219,7 @@ impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
 
 #[cfg(feature = "gzip")]
 impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Gzip>, ExistingExtractRoot>
+    for ArchivePrepare<Tar<Gzip>, ExtractWorkspace>
 {
     type Need = ArchiveNeed<Tar<Gzip>>;
     type Prepared = ArchiveTree<Tar<Gzip>>;
@@ -234,7 +238,7 @@ impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
 
 #[cfg(feature = "xz")]
 impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Xz>, ExistingExtractRoot>
+    for ArchivePrepare<Tar<Xz>, ExtractWorkspace>
 {
     type Need = ArchiveNeed<Tar<Xz>>;
     type Prepared = ArchiveTree<Tar<Xz>>;
@@ -253,7 +257,7 @@ impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
 
 #[cfg(feature = "zstd")]
 impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Zstd>, ExistingExtractRoot>
+    for ArchivePrepare<Tar<Zstd>, ExtractWorkspace>
 {
     type Need = ArchiveNeed<Tar<Zstd>>;
     type Prepared = ArchiveTree<Tar<Zstd>>;
@@ -282,7 +286,13 @@ fn prepare_archive<I, E, A>(
 
     let root = root.to_path_buf();
     reset_extract_root(&root)?;
-    let evidence = extract(&node.material.path, &root, &policy)?;
+    let evidence = match extract(&node.material.path, &root, &policy) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let _ = reset_extract_root(&root);
+            return Err(error);
+        }
+    };
 
     Ok(Prepared::from_prepare(
         node.input,
@@ -302,6 +312,7 @@ fn extract_zip(
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|err| PulithError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
     let mut evidence = ArchiveEvidence::empty(root);
+    let mut paths = BTreeMap::new();
 
     for index in 0..archive.len() {
         evidence.entries += 1;
@@ -325,34 +336,52 @@ fn extract_zip(
             return Err(PulithError::UnsupportedArchiveEntry(relative));
         }
 
-        if file.is_dir() {
+        let kind = if file.is_dir() {
+            ArchiveEntryKind::Directory
+        } else {
+            ArchiveEntryKind::File
+        };
+        record_archive_path(&mut paths, &relative, kind)?;
+
+        if kind == ArchiveEntryKind::Directory {
             evidence.directories += 1;
             fs::create_dir_all(&target)
                 .map_err(|err| PulithError::io("create archive directory", &target, err))?;
             continue;
         }
 
-        let size = file.size();
-        evidence.files += 1;
-        evidence.total_bytes =
-            evidence
-                .total_bytes
-                .checked_add(size)
-                .ok_or(PulithError::ArchiveLimitExceeded {
-                    limit: "total-bytes",
-                    actual: u64::MAX,
-                    max: policy.max_total_bytes.unwrap_or(u64::MAX),
-                })?;
-        check_limit("total-bytes", evidence.total_bytes, policy.max_total_bytes)?;
+        let declared = file.size();
+        check_limit("entry-bytes", declared, policy.max_entry_bytes)?;
+        let declared_total = evidence.total_bytes.checked_add(declared).ok_or(
+            PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual: u64::MAX,
+                max: policy.max_total_bytes.unwrap_or(u64::MAX),
+            },
+        )?;
+        check_limit("total-bytes", declared_total, policy.max_total_bytes)?;
 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| PulithError::io("create archive file parent", parent, err))?;
         }
-        let mut output = File::create(&target)
-            .map_err(|err| PulithError::io("create archive file", &target, err))?;
-        io::copy(&mut file, &mut output)
-            .map_err(|err| PulithError::io("extract archive file", &target, err))?;
+        let observed = copy_archive_file(
+            &mut file,
+            &target,
+            &relative,
+            declared,
+            evidence.total_bytes,
+            policy.max_entry_bytes,
+            policy.max_total_bytes,
+        )?;
+        evidence.files += 1;
+        evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
+            PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual: u64::MAX,
+                max: policy.max_total_bytes.unwrap_or(u64::MAX),
+            },
+        )?;
     }
 
     Ok(evidence)
@@ -412,6 +441,7 @@ fn extract_tar_reader<A, R: Read>(
 ) -> Result<ArchiveEvidence<A>, PulithError> {
     let mut archive = tar::Archive::new(reader);
     let mut evidence = ArchiveEvidence::empty(root);
+    let mut paths = BTreeMap::new();
     let entries = archive
         .entries()
         .map_err(|err| PulithError::io("read tar archive", root, err))?;
@@ -438,41 +468,173 @@ fn extract_tar_reader<A, R: Read>(
             return Err(PulithError::UnsupportedArchiveEntry(relative));
         }
 
-        if entry_type.is_dir() {
+        let kind = if entry_type.is_dir() {
+            ArchiveEntryKind::Directory
+        } else if entry_type.is_file() {
+            ArchiveEntryKind::File
+        } else {
+            return Err(PulithError::UnsupportedArchiveEntry(relative));
+        };
+        record_archive_path(&mut paths, &relative, kind)?;
+
+        if kind == ArchiveEntryKind::Directory {
             evidence.directories += 1;
             fs::create_dir_all(&target)
                 .map_err(|err| PulithError::io("create archive directory", &target, err))?;
             continue;
         }
 
-        if !entry_type.is_file() {
-            return Err(PulithError::UnsupportedArchiveEntry(relative));
-        }
-
-        let size = entry.header().size().unwrap_or(0);
-        evidence.files += 1;
-        evidence.total_bytes =
-            evidence
-                .total_bytes
-                .checked_add(size)
-                .ok_or(PulithError::ArchiveLimitExceeded {
-                    limit: "total-bytes",
-                    actual: u64::MAX,
-                    max: policy.max_total_bytes.unwrap_or(u64::MAX),
-                })?;
-        check_limit("total-bytes", evidence.total_bytes, policy.max_total_bytes)?;
+        let declared = entry.size();
+        check_limit("entry-bytes", declared, policy.max_entry_bytes)?;
+        let declared_total = evidence.total_bytes.checked_add(declared).ok_or(
+            PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual: u64::MAX,
+                max: policy.max_total_bytes.unwrap_or(u64::MAX),
+            },
+        )?;
+        check_limit("total-bytes", declared_total, policy.max_total_bytes)?;
 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| PulithError::io("create archive file parent", parent, err))?;
         }
-        let mut output = File::create(&target)
-            .map_err(|err| PulithError::io("create archive file", &target, err))?;
-        io::copy(&mut entry, &mut output)
-            .map_err(|err| PulithError::io("extract archive file", &target, err))?;
+        let observed = copy_archive_file(
+            &mut entry,
+            &target,
+            &relative,
+            declared,
+            evidence.total_bytes,
+            policy.max_entry_bytes,
+            policy.max_total_bytes,
+        )?;
+        evidence.files += 1;
+        evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
+            PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual: u64::MAX,
+                max: policy.max_total_bytes.unwrap_or(u64::MAX),
+            },
+        )?;
     }
 
     Ok(evidence)
+}
+
+fn record_archive_path(
+    paths: &mut BTreeMap<PathBuf, ArchiveEntryKind>,
+    path: &Path,
+    kind: ArchiveEntryKind,
+) -> Result<(), PulithError> {
+    let key = archive_collision_key(path);
+    if paths.contains_key(&key) {
+        return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+    }
+
+    for ancestor in key
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        if paths.get(ancestor) == Some(&ArchiveEntryKind::File) {
+            return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+        }
+    }
+
+    if kind == ArchiveEntryKind::File
+        && paths
+            .keys()
+            .any(|existing| existing != &key && existing.starts_with(&key))
+    {
+        return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+    }
+
+    paths.insert(key, kind);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn archive_collision_key(path: &Path) -> PathBuf {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn archive_collision_key(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+fn copy_archive_file<R: Read>(
+    reader: &mut R,
+    target: &Path,
+    relative: &Path,
+    declared: u64,
+    observed_total: u64,
+    max_entry: Option<u64>,
+    max_total: Option<u64>,
+) -> Result<u64, PulithError> {
+    let mut output =
+        File::create(target).map_err(|err| PulithError::io("create archive file", target, err))?;
+    let total_remaining = max_total.map(|max| max.saturating_sub(observed_total));
+    let remaining = match (max_entry, total_remaining) {
+        (Some(entry), Some(total)) => Some(entry.min(total)),
+        (Some(entry), None) => Some(entry),
+        (None, Some(total)) => Some(total),
+        (None, None) => None,
+    };
+    let copied = match remaining {
+        Some(remaining) => io::copy(&mut reader.take(remaining.saturating_add(1)), &mut output),
+        None => io::copy(reader, &mut output),
+    };
+    let observed = match copied {
+        Ok(observed) => observed,
+        Err(error) => {
+            drop(output);
+            let _ = fs::remove_file(target);
+            return Err(PulithError::io("extract archive file", target, error));
+        }
+    };
+
+    if let Some(max) = max_entry
+        && observed > max
+    {
+        drop(output);
+        let _ = fs::remove_file(target);
+        return Err(PulithError::ArchiveLimitExceeded {
+            limit: "entry-bytes",
+            actual: observed,
+            max,
+        });
+    }
+
+    if let Some(max) = max_total {
+        let actual = observed_total.saturating_add(observed);
+        if actual > max {
+            drop(output);
+            let _ = fs::remove_file(target);
+            return Err(PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual,
+                max,
+            });
+        }
+    }
+
+    if observed != declared {
+        drop(output);
+        let _ = fs::remove_file(target);
+        return Err(PulithError::ArchiveSizeMismatch {
+            path: relative.to_path_buf(),
+            declared,
+            observed,
+        });
+    }
+
+    Ok(observed)
 }
 
 fn check_limit(limit: &'static str, actual: u64, max: Option<u64>) -> Result<(), PulithError> {
@@ -509,6 +671,7 @@ fn sanitize_relative(path: &Path, strip_components: usize) -> Result<Option<Path
         match component {
             Component::Normal(part) => {
                 if seen >= strip_components {
+                    validate_archive_component(part)?;
                     relative.push(part);
                 }
                 seen += 1;
@@ -523,6 +686,38 @@ fn sanitize_relative(path: &Path, strip_components: usize) -> Result<Option<Path
     } else {
         Ok(Some(relative))
     }
+}
+
+#[cfg(windows)]
+fn validate_archive_component(component: &OsStr) -> Result<(), PulithError> {
+    let value = component.to_string_lossy();
+    let has_forbidden_character = value
+        .chars()
+        .any(|character| character <= '\u{1f}' || "<>:\"/\\|?*".contains(character));
+    let has_unsafe_suffix = value.ends_with('.') || value.ends_with(' ');
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    let is_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || stem.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+
+    if has_forbidden_character || has_unsafe_suffix || is_device {
+        return Err(PulithError::ArchiveInvalidPath(value.into_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn validate_archive_component(_component: &std::ffi::OsStr) -> Result<(), PulithError> {
+    Ok(())
 }
 
 fn ensure_under_root(root: &Path, target: &Path) -> Result<(), PulithError> {
@@ -662,7 +857,7 @@ mod tests {
 
     use crate::{
         AcquireNode, ApplyNode, ArchiveNeed, ArchivePolicy, ArchivePrepare, CreateOrReplace,
-        ExistingExtractRoot, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
+        ExtractWorkspace, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
         LocalPath, LocalTarget, PrepareNode, PulithError, VerifyNode, Zip,
     };
 
@@ -725,6 +920,33 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn write_zip_with_understated_size(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(
+                "payload.txt",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(b"12345678").unwrap();
+        writer.finish().unwrap();
+
+        let mut bytes = fs::read(path).unwrap();
+        let local = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+            .unwrap();
+        let central = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
+            .unwrap();
+        bytes[local + 22..local + 26].copy_from_slice(&1u32.to_le_bytes());
+        bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+
     fn verified_archive(
         root: &Path,
         zip_path: &Path,
@@ -753,7 +975,7 @@ mod tests {
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
         let verified = verified_archive(&root, &zip_path, &target);
-        let prepared = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 
@@ -778,7 +1000,7 @@ mod tests {
         write_zip(&zip_path, &[("fresh.txt", b"fresh")]);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(&extract_root))
+        ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 
@@ -800,7 +1022,7 @@ mod tests {
         write_zip_with_directory(&zip_path);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
@@ -826,7 +1048,7 @@ mod tests {
         write_zip(&zip_path, &[("a.txt", b"a"), ("b.txt", b"b")]);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().max_entries(1)),
@@ -851,7 +1073,7 @@ mod tests {
         write_zip(&zip_path, &[("../escape.txt", b"nope")]);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap_err();
 
@@ -868,7 +1090,7 @@ mod tests {
         write_zip_with_symlink(&zip_path);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap_err();
 
@@ -884,7 +1106,7 @@ mod tests {
         write_zip(&zip_path, &[("a.txt", b"abcd")]);
 
         let verified = verified_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
@@ -902,6 +1124,126 @@ mod tests {
     }
 
     #[test]
+    fn zip_prepare_enforces_observed_byte_limit() {
+        let root = temp_root("observed-byte-limit");
+        let zip_path = root.join("payload.zip");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_zip_with_understated_size(&zip_path);
+
+        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(4)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchiveLimitExceeded {
+                limit: "total-bytes",
+                actual: 5,
+                max: 4,
+            }
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_prepare_rejects_file_directory_collision() {
+        let root = temp_root("path-collision");
+        let zip_path = root.join("payload.zip");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_zip(&zip_path, &[("foo", b"file"), ("foo/child.txt", b"child")]);
+
+        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(verified, ArchiveNeed::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_prepare_rejects_case_folded_path_collision() {
+        let root = temp_root("case-folded-collision");
+        let zip_path = root.join("payload.zip");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_zip(&zip_path, &[("Foo", b"file"), ("foo/child.txt", b"child")]);
+
+        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(verified, ArchiveNeed::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_prepare_rejects_windows_device_and_stream_paths() {
+        for name in ["NUL.txt", "payload.txt:stream", "trailing."] {
+            let root = temp_root("windows-unsafe-path");
+            let zip_path = root.join("payload.zip");
+            let extract_root = root.join("extract");
+            fs::create_dir_all(&root).unwrap();
+            write_zip(&zip_path, &[(name, b"unsafe")]);
+
+            let verified = verified_archive(&root, &zip_path, &root.join("target"));
+            let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+                .prepare_node(verified, ArchiveNeed::default())
+                .unwrap_err();
+
+            assert!(matches!(err, PulithError::ArchiveInvalidPath(_)), "{name}");
+            assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn zip_prepare_rejects_entry_byte_limit() {
+        let root = temp_root("entry-byte-limit");
+        let zip_path = root.join("payload.zip");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_zip(&zip_path, &[("payload.txt", b"1234")]);
+
+        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(ArchivePolicy::new().max_entry_bytes(3)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchiveLimitExceeded {
+                limit: "entry-bytes",
+                actual: 4,
+                max: 3,
+            }
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn zip_prepare_flows_into_local_apply() {
         let root = temp_root("apply");
         let zip_path = root.join("payload.zip");
@@ -911,7 +1253,7 @@ mod tests {
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
         let verified = verified_archive(&root, &zip_path, &target);
-        let prepared = ArchivePrepare::<Zip>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
         LocalApply::<CreateOrReplace>::new()
@@ -940,7 +1282,7 @@ mod tar_tests {
     use crate::Zstd;
     use crate::{
         AcquireNode, ApplyNode, ArchiveNeed, ArchivePolicy, ArchivePrepare, CreateOrReplace,
-        ExistingExtractRoot, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
+        ExtractWorkspace, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
         LocalPath, LocalTarget, PrepareNode, PulithError, Tar, VerifyNode,
     };
 
@@ -991,6 +1333,18 @@ mod tar_tests {
         let mut builder = tar::Builder::new(file);
         build(&mut builder);
         builder.finish().unwrap();
+    }
+
+    fn write_truncated_tar(path: &Path) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("payload.txt").unwrap();
+        header.set_size(8);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(b"1234");
+        fs::write(path, bytes).unwrap();
     }
 
     fn tar_bytes(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
@@ -1073,7 +1427,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 
@@ -1098,7 +1452,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
@@ -1127,7 +1481,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().max_entries(1)),
@@ -1155,7 +1509,7 @@ mod tar_tests {
         patch_first_tar_path(&tar_path, b"../escape.txt");
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap_err();
 
@@ -1174,7 +1528,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap_err();
 
@@ -1190,7 +1544,7 @@ mod tar_tests {
         write_tar(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
@@ -1208,6 +1562,55 @@ mod tar_tests {
     }
 
     #[test]
+    fn tar_prepare_rejects_duplicate_path() {
+        let root = temp_root("duplicate-path");
+        let tar_path = root.join("payload.tar");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_tar(&tar_path, |builder| {
+            append_file(builder, "payload.txt", b"first");
+            append_file(builder, "payload.txt", b"second");
+        });
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(verified, ArchiveNeed::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchivePathConflict(path) if path == Path::new("payload.txt")
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tar_prepare_rejects_truncated_entry() {
+        let root = temp_root("truncated-entry");
+        let tar_path = root.join("payload.tar");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_truncated_tar(&tar_path);
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(verified, ArchiveNeed::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchiveSizeMismatch {
+                path,
+                declared: 8,
+                observed: 4,
+            } if path == Path::new("payload.txt")
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tar_prepare_flows_into_local_apply() {
         let root = temp_root("apply");
         let tar_path = root.join("payload.tar");
@@ -1219,7 +1622,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &target);
-        let prepared = ArchivePrepare::<Tar>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
         LocalApply::<CreateOrReplace>::new()
@@ -1245,7 +1648,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 
@@ -1269,7 +1672,7 @@ mod tar_tests {
         write_gzip_bytes(&tar_path, &bytes);
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap_err();
 
@@ -1287,7 +1690,7 @@ mod tar_tests {
         write_tar_gzip(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExistingExtractRoot::new(root.join("extract")))
+        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
             .prepare_node(
                 verified,
                 ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
@@ -1317,7 +1720,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &target);
-        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
         LocalApply::<CreateOrReplace>::new()
@@ -1343,7 +1746,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Xz>>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar<Xz>>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 
@@ -1367,7 +1770,7 @@ mod tar_tests {
         });
 
         let verified = verified_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Zstd>>::new(ExistingExtractRoot::new(&extract_root))
+        let prepared = ArchivePrepare::<Tar<Zstd>>::new(ExtractWorkspace::new(&extract_root))
             .prepare_node(verified, ArchiveNeed::default())
             .unwrap();
 

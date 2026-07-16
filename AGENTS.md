@@ -60,9 +60,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 
 - Stage before publishing a final destination.
 - Reject same-file, directory-cycle, traversal, and symlink hazards where promised.
-- `ExistingExtractRoot` is exclusive, destructive scratch; it is not a final destination.
+- `ExtractWorkspace` is exclusive, destructive scratch; it is not a final destination.
 - Archive symlinks, hardlinks, devices, and unsafe paths are rejected by default.
-- Archive limits must eventually be enforced against observed decoded bytes, not metadata alone.
+- Archive limits are enforced against observed decoded bytes, not metadata alone.
 - Never implement ZIP/TAR/DEFLATE/gzip/xz/zstd algorithms in Pulith.
 - Never report failure after successful publication merely because best-effort cleanup failed.
 - Local path safety assumes trusted parent directories; Pulith is not a hostile concurrent-filesystem sandbox.

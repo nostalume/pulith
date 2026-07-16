@@ -49,7 +49,7 @@ pub use archive::Zip;
 pub use archive::Zstd;
 #[cfg(any(feature = "zip", feature = "tar"))]
 pub use archive::{
-    ArchiveEvidence, ArchiveNeed, ArchivePolicy, ArchivePrepare, ArchiveTree, ExistingExtractRoot,
+    ArchiveEvidence, ArchiveNeed, ArchivePolicy, ArchivePrepare, ArchiveTree, ExtractWorkspace,
 };
 #[cfg(feature = "tar")]
 pub use archive::{Plain, Tar};

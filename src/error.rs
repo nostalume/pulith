@@ -23,6 +23,12 @@ pub enum PulithError {
         actual: u64,
         max: u64,
     },
+    ArchiveSizeMismatch {
+        path: PathBuf,
+        declared: u64,
+        observed: u64,
+    },
+    ArchivePathConflict(PathBuf),
     UnsupportedArchiveEntry(PathBuf),
     InvalidPreparation(String),
     ApplyWouldOverwrite(PathBuf),
@@ -79,6 +85,18 @@ impl fmt::Display for PulithError {
             Self::ArchiveInvalidPath(path) => write!(f, "archive entry path is invalid: {path}"),
             Self::ArchiveLimitExceeded { limit, actual, max } => {
                 write!(f, "archive {limit} limit exceeded: {actual} > {max}")
+            }
+            Self::ArchiveSizeMismatch {
+                path,
+                declared,
+                observed,
+            } => write!(
+                f,
+                "archive entry size mismatch for {}: declared {declared}, observed {observed}",
+                path.display()
+            ),
+            Self::ArchivePathConflict(path) => {
+                write!(f, "archive entries conflict at path: {}", path.display())
             }
             Self::UnsupportedArchiveEntry(path) => {
                 write!(f, "archive entry is unsupported: {}", path.display())
