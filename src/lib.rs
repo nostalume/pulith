@@ -3,12 +3,13 @@
 //! Pulith models behavior as an inductive tree of semantic nodes:
 //!
 //! ```text
-//! Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+//! materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+//! forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 //! ```
 //!
-//! Each behavior owns its associated need, evidence, error, and output types. Concrete mechanisms
-//! are attached through feature-gated typed nodes rather than a global context, registry, or hidden
-//! workflow policy.
+//! Each behavior explicitly declares the associated contracts it uses: policy need where required,
+//! plus its evidence, error, and output. Concrete mechanisms are attached through feature-gated
+//! typed nodes rather than a global context, registry, or hidden workflow policy.
 //!
 //! # Capability boundaries
 //!
@@ -22,6 +23,16 @@
 //! publication remains a separate local apply behavior. Network request admission and decoded-body
 //! pacing are separate shared resources. Pacing controls materialization, not socket, TLS, or HTTP
 //! flow-control timing.
+//!
+//! # Current maturity
+//!
+//! The state types are composition vocabulary, not an implicit package-manager implementation.
+//! Pulith currently supplies concrete local/HTTP acquisition, identity or digest verification,
+//! identity or archive preparation, staged local publication, direct local forgetting, and
+//! in-memory remembering. Source discovery, durable lifecycle storage, dependency solving,
+//! multi-target transactions, and reconciliation are not provided; non-acquisition async traits
+//! remain caller-owned extension points until concrete requirements justify behavior and evidence
+//! laws.
 
 pub mod application;
 #[cfg(any(feature = "zip", feature = "tar"))]
@@ -55,8 +66,8 @@ pub use archive::{
 pub use archive::{Plain, Tar};
 pub use behavior::{
     AcquireNode, Acquired, Applied, ApplyNode, AsyncAcquireNode, AsyncApplyNode, AsyncPrepareNode,
-    AsyncRememberNode, AsyncVerifyNode, Chosen, EvidenceChain, NoEvidence, Observed, OfferNode,
-    Offered, PrepareNode, Prepared, RememberNode, Remembered, SelectNode, Verified, VerifyNode,
+    AsyncRememberNode, AsyncVerifyNode, Chosen, EvidenceChain, NoEvidence, PrepareNode, Prepared,
+    RememberNode, Remembered, SelectNode, Verified, VerifyNode,
 };
 pub use error::PulithError;
 pub use evidence::{

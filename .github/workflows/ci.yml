@@ -42,12 +42,21 @@ jobs:
       - name: Check smallest feature combinations
         shell: bash
         run: |
-          for feature in local ureq reqwest blake3 sha2 zip tar gzip xz zstd; do
-            cargo check --no-default-features --features "$feature"
+          for feature in local net ureq reqwest hash blake3 sha2 zip tar gzip xz zstd; do
+            RUSTFLAGS="-D warnings" cargo check --no-default-features --features "$feature"
           done
 
+      - name: Test smallest archive families
+        shell: bash
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features zip
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features tar
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features gzip
+
       - name: Check package contents
-        run: cargo package --no-verify
+        run: |
+          cargo package --locked
+          cargo package --list
 
   test:
     name: Test (${{ matrix.os }})

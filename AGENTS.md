@@ -5,10 +5,13 @@
 Pulith is one feature-gated Rust crate for composing typed artifact behaviors:
 
 ```text
-Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 ```
 
-Each behavior owns its `Need`, `Evidence`, `Error`, and `Output`. Callers compose policy and effects; there is no global `App`, `Context`, registry, or factory.
+Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
+plus its `Evidence`, `Error`, and `Output`. Callers compose policy and effects; there is no global
+`App`, `Context`, registry, or factory.
 
 ## Tech stack
 
@@ -31,11 +34,10 @@ Each behavior owns its `Need`, `Evidence`, `Error`, and `Output`. Callers compos
 ## Feature graph
 
 ```text
-default = local + sync
-runtime-tokio -> async
+default = local
 net -> local
-ureq -> net + sync
-reqwest -> net + runtime-tokio
+ureq -> net
+reqwest -> net + tokio
 blake3 -> hash
 sha2 -> hash
 zip -> local
@@ -49,6 +51,10 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 
 - Design behavior and evidence laws before code.
 - Preserve the typed transition chain and associated types.
+- Treat state types as composition vocabulary, not proof that every transition has a built-in
+  concrete behavior; document implemented and caller-owned boundaries explicitly.
+- Target-only operations such as `Forget` branch directly from intent to apply and must not require
+  a synthetic source, acquisition, verification, or preparation path.
 - Prefer enum/ZST/associated-type identity over strings.
 - Keep sync and async semantics aligned; only execution modality may differ.
 - Keep request admission, concurrency, and decoded-body pacing distinct.
@@ -93,8 +99,10 @@ For a changed feature, also run its smallest combination:
 
 ```bash
 cargo check --no-default-features --features local
+cargo check --no-default-features --features net
 cargo check --no-default-features --features ureq
 cargo check --no-default-features --features reqwest
+cargo check --no-default-features --features hash
 cargo check --no-default-features --features blake3
 cargo check --no-default-features --features sha2
 cargo check --no-default-features --features zip

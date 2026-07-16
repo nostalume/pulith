@@ -1,4 +1,6 @@
+#[cfg(any(feature = "blake3", feature = "sha2"))]
 use std::fs::File;
+#[cfg(any(feature = "blake3", feature = "sha2"))]
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -164,10 +166,12 @@ fn normalize_hex(value: &str) -> String {
         .collect()
 }
 
+#[cfg(any(feature = "blake3", feature = "sha2"))]
 fn open_digest_file(path: &Path) -> Result<File, PulithError> {
     File::open(path).map_err(|err| PulithError::io("open file for digest", path, err))
 }
 
+#[cfg(any(feature = "blake3", feature = "sha2"))]
 fn copy_into_hasher(
     path: &Path,
     reader: &mut impl Read,

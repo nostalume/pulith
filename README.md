@@ -2,11 +2,16 @@
 
 Pulith is a single Rust crate for composing typed artifact behaviors without a hidden package-manager policy layer.
 
+> **Status:** pre-release. Local package verification does not publish a registry artifact, and no
+> release is implied by the `0.1.0` manifest version.
+
 ```text
-Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 ```
 
-Each transition owns an associated `Need`, `Evidence`, `Error`, and `Output`. Callers choose policy and compose concrete effects.
+Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
+plus its `Evidence`, `Error`, and `Output`. Callers choose policy and compose concrete effects.
 
 ## Scope
 
@@ -22,20 +27,36 @@ Each transition owns an associated `Need`, `Evidence`, `Error`, and `Output`. Ca
 
 Pulith uses mature libraries for HTTP, hashing, archive parsing, and compression codecs. It owns the typed behavior, policy, evidence, staging, and publication contracts around those mechanisms.
 
+## Current maturity
+
+The state graph is a composition vocabulary, not a claim that Pulith is already a complete package
+manager. The concrete path currently supplied by this crate is:
+
+| Transition | Concrete behavior today |
+| --- | --- |
+| `Intent -> WithSource -> Chosen` | caller-provided typed source selected by `SelectFirst` |
+| `Chosen -> Acquired` | local material or staged HTTP download |
+| `Acquired -> Verified` | explicit identity pass-through or typed BLAKE3/SHA-256 digest |
+| `Verified -> Prepared` | identity preparation or guarded ZIP/TAR extraction |
+| `Prepared -> Applied` | staged local file/tree publication for create and replace operations |
+| `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
+| `Applied -> Remembered` | `MemoryRemember`, which carries the receipt and evidence in memory only |
+
+The asynchronous transition traits other than acquisition and custom remember behaviors are
+extension vocabulary. Pulith does not currently provide source discovery, dependency solving, a
+durable installation database, multi-target transactions, reconciliation, or system package-manager
+integration. Those require demonstrated callers and explicit storage/rollback laws; they are not
+hidden behind the existing state names.
+
 ## Features
 
 ```text
-default = local + sync
-
-execution:
-  sync
-  async
-  runtime-tokio -> async + tokio
+default = local
 
 network:
   net -> local
-  ureq -> net + sync
-  reqwest -> net + runtime-tokio
+  ureq -> net
+  reqwest -> net + tokio
 
 hashing:
   hash
@@ -54,7 +75,7 @@ There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `
 
 ```toml
 [dependencies]
-pulith = { version = "0.1", features = ["ureq", "blake3", "zip"] }
+pulith = { path = "../pulith", features = ["ureq", "blake3", "zip"] }
 ```
 
 Build an `Intent`, attach a typed source, select it, then pass the node through the concrete behavior implementations required by the caller. There is no global context, plugin registry, or hidden workflow policy.

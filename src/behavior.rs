@@ -16,26 +16,6 @@ impl<A, B> EvidenceChain<A, B> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Offered<I, O> {
-    pub(crate) input: I,
-    pub(crate) offers: O,
-}
-
-impl<I, O> Offered<I, O> {
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn offers(&self) -> &O {
-        &self.offers
-    }
-
-    pub fn into_parts(self) -> (I, O) {
-        (self.input, self.offers)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chosen<I, S> {
     pub(crate) input: I,
     pub(crate) source: S,
@@ -228,39 +208,6 @@ impl<I, R, E> Remembered<I, R, E> {
     pub fn into_parts(self) -> (I, R, E) {
         (self.input, self.receipt, self.evidence)
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Observed<I, R, E = NoEvidence> {
-    pub(crate) input: I,
-    pub(crate) receipt: R,
-    pub(crate) evidence: E,
-}
-
-impl<I, R, E> Observed<I, R, E> {
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn receipt(&self) -> &R {
-        &self.receipt
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-
-    pub fn into_parts(self) -> (I, R, E) {
-        (self.input, self.receipt, self.evidence)
-    }
-}
-
-pub trait OfferNode<N> {
-    type Offers;
-    type Error;
-    type Output;
-
-    fn offer_node(&self, node: N) -> Result<Self::Output, Self::Error>;
 }
 
 pub trait SelectNode<N> {

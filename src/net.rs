@@ -208,6 +208,7 @@ impl std::error::Error for AcquireError {
 }
 
 impl AcquireError {
+    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
     fn local(
         url: Option<&RemoteUrl>,
         action: &'static str,
@@ -222,6 +223,7 @@ impl AcquireError {
         }
     }
 
+    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
     fn transport(
         url: &RemoteUrl,
         phase: TransportPhase,
@@ -780,6 +782,7 @@ impl Validator {
         Self::LastModified(time)
     }
 
+    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
     fn if_range_value(&self) -> String {
         match self {
             Self::Etag(value) => value.clone(),
@@ -2025,6 +2028,7 @@ fn admission_error(
     }
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     let delay = policy
         .base_delay
@@ -2032,6 +2036,7 @@ fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     policy.max_delay.map_or(delay, |max| delay.min(max))
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn planned_retry_delay(
     policy: RetryPolicy,
     retry_index: u32,
@@ -2045,10 +2050,12 @@ fn planned_retry_delay(
     retry_delay(policy, retry_index)
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn should_retry_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -2058,6 +2065,7 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
         .and_then(|retry_at| retry_at.duration_since(now).ok())
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedResume {
     partial_path: PathBuf,
@@ -2065,6 +2073,7 @@ struct PlannedResume {
     validator: Option<Validator>,
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 impl PlannedResume {
     fn into_evidence(self, outcome: ResumeOutcome) -> ResumeEvidence {
         ResumeEvidence {
@@ -2076,6 +2085,7 @@ impl PlannedResume {
     }
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn planned_resume(policy: &ResumePolicy) -> Option<PlannedResume> {
     let (partial_path, validator) = match &policy.mode {
         ResumeMode::RestartOnly => return None,
@@ -2101,6 +2111,7 @@ fn parse_strong_etag(value: &str) -> Option<String> {
     (value.len() >= 2 && value.starts_with('"') && value.ends_with('"')).then(|| value.to_string())
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn selected_response_validator(
     etag: Option<&str>,
     last_modified: Option<&str>,
@@ -2112,6 +2123,7 @@ fn selected_response_validator(
     })
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn parse_content_range(value: &str, expected_start: u64) -> Option<(u64, Option<u64>)> {
     let range = value.trim().strip_prefix("bytes ")?;
     let (span, total) = range.split_once('/')?;

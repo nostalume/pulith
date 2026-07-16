@@ -215,35 +215,36 @@ impl<E> ApplyNode<Prepared<Intent<Item, LocalTarget, CreateOrReplace>, LocalPrep
     }
 }
 
-impl<E> ApplyNode<Prepared<Intent<Item, LocalTarget, Forget>, LocalPrepared, E>>
-    for LocalApply<Forget>
-{
+/// Removes the exact caller-authorized local target without acquiring a source.
+///
+/// Directory targets are removed recursively and symlink targets are removed as links. As with
+/// other local behaviors, parent directories are trusted and hostile concurrent mutation is not
+/// sandboxed.
+impl ApplyNode<Intent<Item, LocalTarget, Forget>> for LocalApply<Forget> {
     type Receipt = Receipt<Forget>;
     type Evidence = ApplyEvidence;
     type Error = PulithError;
-    type Output = Applied<
-        Intent<Item, LocalTarget, Forget>,
-        Receipt<Forget>,
-        EvidenceChain<E, ApplyEvidence>,
-    >;
+    type Output = Applied<Intent<Item, LocalTarget, Forget>, Receipt<Forget>, ApplyEvidence>;
 
     fn apply_node(
         &self,
-        node: Prepared<Intent<Item, LocalTarget, Forget>, LocalPrepared, E>,
+        node: Intent<Item, LocalTarget, Forget>,
     ) -> Result<Self::Output, Self::Error> {
-        if node.input.target.path.exists() {
-            remove_existing(&node.input.target.path)?;
+        match remove_existing(&node.target.path) {
+            Ok(()) => {}
+            Err(PulithError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let target = node.input.target.path.clone();
+        let target = node.target.path.clone();
         let receipt = Receipt {
-            item: node.input.item.name.clone(),
+            item: node.item.name.clone(),
             target: target.clone(),
             op: Forget,
         };
         Ok(Applied::from_apply(
-            node.input,
+            node,
             receipt,
-            EvidenceChain::new(node.evidence, ApplyEvidence::removed(target)),
+            ApplyEvidence::removed(target),
         ))
     }
 }
@@ -553,10 +554,15 @@ fn backup_path(target: &Path) -> PathBuf {
 mod tests {
     use std::fs;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file;
+
     use crate::{
-        AcquireNode, ApplyNode, Create, CreateOrReplace, Identity, IdentityPrepare, IdentityVerify,
-        Intent, Item, LocalAcquire, LocalApply, LocalPath, LocalPlacement, LocalTarget,
-        MemoryRemember, PrepareNode, RememberNode, Replace, VerifyNode,
+        AcquireNode, ApplyNode, Create, CreateOrReplace, Forget, Identity, IdentityPrepare,
+        IdentityVerify, Intent, Item, LocalAcquire, LocalApply, LocalPath, LocalPlacement,
+        LocalTarget, MemoryRemember, PrepareNode, RememberNode, Replace, VerifyNode,
     };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -623,6 +629,81 @@ mod tests {
         assert_eq!(replaced.evidence.current.bytes, 5);
         assert_eq!(replaced.evidence.current.strategy, LocalPlacement::Copied);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forget_applies_directly_without_acquiring_a_source() {
+        let root = temp_root("forget-direct");
+        let target = root.join("target.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, "obsolete").unwrap();
+
+        let intent = Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>();
+        let applied = LocalApply::<Forget>::new().apply_node(intent).unwrap();
+
+        assert!(!target.exists());
+        assert_eq!(applied.receipt.item, "demo");
+        assert_eq!(applied.receipt.target, target);
+        assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forget_is_idempotent_when_target_is_absent() {
+        let root = temp_root("forget-absent");
+        let target = root.join("missing.txt");
+        fs::create_dir_all(&root).unwrap();
+
+        let applied = LocalApply::<Forget>::new()
+            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+            .unwrap();
+
+        assert!(!target.exists());
+        assert_eq!(applied.receipt.target, target);
+        assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forget_removes_dangling_target_symlink() {
+        let root = temp_root("forget-dangling-symlink");
+        let target = root.join("target-link");
+        fs::create_dir_all(&root).unwrap();
+        symlink_file(root.join("missing-source"), &target).unwrap();
+        assert!(!target.exists());
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        LocalApply::<Forget>::new()
+            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+            .unwrap();
+
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forget_removes_existing_directory_target() {
+        let root = temp_root("forget-directory");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested/file.txt"), "obsolete").unwrap();
+
+        LocalApply::<Forget>::new()
+            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+            .unwrap();
+
+        assert!(!target.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
