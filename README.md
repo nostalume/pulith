@@ -10,6 +10,7 @@ behaviors without a hidden package-manager or implementation-specific policy lay
 materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 observe:     LocalTarget -> Inspected -> Reconciled
+             RemoteUrl  -> Inspected
 ```
 
 Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
@@ -25,7 +26,7 @@ plus its `Evidence`, `Error`, and `Output`. Callers choose policy and compose co
 | `local` | Local acquire, prepare, staged apply, inspect, pure reconcile, and in-memory remember |
 | `hash` | Typed digest and exact digest-plus-size descriptor verification |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
-| `net` | HTTP acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
+| `net` | HTTP HEAD inspection plus acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
 
 Pulith uses mature libraries for HTTP, hashing, archive parsing, and compression codecs. It owns the typed behavior, policy, evidence, staging, and publication contracts around those mechanisms.
 
@@ -54,7 +55,7 @@ The behavior vocabulary is not a universal lifecycle. Current and candidate fami
 | Materialization | acquire, verify, prepare | transfer, factual proof, and transformation stay separate |
 | Mutation | apply, forget | explicit target effect; `Forget` does not claim ownership |
 | Memory | remember | durability only when a concrete adapter proves it |
-| Observation | inspect | read-only facts; absence is an observation for `LocalInspect` |
+| Observation | inspect | read-only resource facts; filesystem absence and HTTP status retain resource-specific meaning |
 | Convergence | reconcile | caller expectation plus observation; never repairs or adopts |
 | Future gated families | admit, recover, activate, prune | require a demonstrated authority and adapter before public vocabulary |
 
@@ -65,6 +66,7 @@ Concrete behavior contracts currently admitted to the public surface are:
 | explicit select | caller-attached typed source | `Chosen` source | no provider discovery, trust, or I/O claim |
 | local acquire | chosen `LocalPath`; filesystem adapter | observed source metadata and `LocalMaterial` | missing/unsupported source fails before later transitions |
 | HTTP acquire | request, retry, admission, resume, and pacing policy | per-attempt transfer/resume/wait evidence and staged material | each attempt admitted separately; complete validated stage precedes persistence |
+| HTTP inspect | `RemoteUrl`; adapter-owned HEAD policy | status, declared content length, requested/final URL, method, and per-attempt evidence | HEAD only; every received final status is an observation; no body copy, destination, or GET fallback |
 | identity/descriptor verify | caller expectation or explicit identity pass-through | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
 | identity/archive prepare | preparation Need and exclusive workspace where required | prepared material/tree and observed preparation evidence | final destination remains untouched |
 | local apply | typed create/replace intent and target | receipt plus observed files/directories/bytes/placement | staged publication with an explicit single-target commit boundary |
@@ -104,10 +106,11 @@ manager. The concrete path currently supplied by this crate is:
 | `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
 | `Applied -> Remembered` | `MemoryRemember`, which carries the receipt and evidence in memory only |
 | `LocalTarget -> Inspected` | read-only, no-follow local entry observation with method evidence |
+| `RemoteUrl -> Inspected` | sync `UreqInspect` or async `ReqwestInspect` HEAD observation with redirect and attempt evidence |
 | `Inspected -> Reconciled` | pure comparison against caller-owned local expected state |
 
-Async execution is concrete only for HTTP acquisition through `AsyncAcquireNode` and
-`ReqwestAcquire`; the other transitions currently expose synchronous behavior laws only. Pulith does
+Async execution is concrete for HTTP acquisition through `AsyncAcquireNode`/`ReqwestAcquire` and
+HTTP inspection through `AsyncInspectNode`/`ReqwestInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
 transactions, automatic repair, or system package-manager integration. Those require demonstrated
 callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
@@ -117,6 +120,9 @@ of whether it came from a local path, `ureq`, or `reqwest`. Descriptor equality 
 material matches the supplied expectation. It does not authenticate who supplied that expectation,
 authorize a publisher, or establish provenance; those remain separate caller-owned policy/trust
 behaviors until a concrete adapter justifies them.
+
+`RemoteUrl::parse` reports resource-level `RemoteUrlError`; acquisition explicitly wraps that error
+as `AcquireError::RemoteUrl` rather than making URL validation an acquisition behavior.
 
 ## Features
 
@@ -159,6 +165,10 @@ Build an `Intent`, attach a typed source, select it, then pass the node through 
 - per-entry and total archive limits are enforced against observed materialized bytes, while decoded-container limits also bound TAR metadata, padding, and stripped entries;
 - declared-size mismatches are rejected, and extraction errors report any subsequent workspace-cleanup failure;
 - retry, validator-bound resume, admission, and body-pacing decisions produce attempt evidence;
+- HTTP inspection issues HEAD only, admits every retry separately, records requested/final URLs,
+  treats every received final status as an observation, and never falls back to GET or copies a body;
+- an HTTP inspection `declared_content_length` is response metadata, not observed bytes, an artifact
+  descriptor, validator continuity, provenance, or trust evidence;
 - HTTP partial bytes are recombined only with a strong validator, a terminal `Content-Range`, and an
   observed body length matching that range; weak or conflicting validators are rejected;
 - network `max_bytes` is checked before body pacing and persistence;

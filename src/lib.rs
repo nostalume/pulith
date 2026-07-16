@@ -6,6 +6,7 @@
 //! materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 //! forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 //! observe:     LocalTarget -> Inspected -> Reconciled
+//!              RemoteUrl  -> Inspected
 //! ```
 //!
 //! Each behavior explicitly declares the associated contracts it uses: policy need where required,
@@ -32,7 +33,7 @@
 //! - `blake3` and `sha2` provide typed hash verification.
 //! - `zip`, `tar`, `gzip`, `xz`, and `zstd` use mature format/codec crates while Pulith owns path,
 //!   resource, evidence, scratch, and composition policy.
-//! - `ureq` and `reqwest` provide sync and Tokio-backed async HTTP acquisition.
+//! - `ureq` and `reqwest` provide sync and Tokio-backed async HTTP acquisition and HEAD inspection.
 //!
 //! Archive preparation writes only to an exclusive disposable extraction root; final destination
 //! publication remains a separate local apply behavior. Network request admission and decoded-body
@@ -44,13 +45,14 @@
 //! The state types are composition vocabulary, not an implicit package-manager implementation.
 //! Pulith currently supplies concrete local/HTTP acquisition, identity, digest, or exact
 //! digest-plus-size descriptor verification, identity or archive preparation, staged local
-//! publication, direct local forgetting, in-memory remembering, local inspection, and local
-//! reconciliation. Inspection is read-only; reconciliation consumes caller-owned expected state
+//! publication, direct local forgetting, in-memory remembering, local/HTTP inspection, and local
+//! reconciliation. Inspection is read-only; HTTP inspection reports status and declared response
+//! length without GET fallback or body materialization. Reconciliation consumes caller-owned expected state
 //! and produces only a classification plus evidence. A descriptor proves byte identity with a
 //! supplied expectation; it does not authenticate that expectation. Source discovery, trust
 //! authorization, durable lifecycle storage, dependency solving, multi-target transactions, and
-//! automatic repair are not provided. Async execution is concrete only for HTTP acquisition; the
-//! other transitions currently expose synchronous behavior laws only.
+//! automatic repair are not provided. Async execution is concrete only for HTTP acquisition and
+//! HTTP inspection; the other transitions currently expose synchronous behavior laws only.
 
 pub mod application;
 #[cfg(any(feature = "zip", feature = "tar"))]
@@ -82,6 +84,8 @@ pub use archive::{
 };
 #[cfg(feature = "tar")]
 pub use archive::{Plain, Tar};
+#[cfg(feature = "reqwest")]
+pub use behavior::AsyncInspectNode;
 pub use behavior::{
     AcquireNode, Acquired, Applied, ApplyNode, AsyncAcquireNode, Chosen, EvidenceChain,
     InspectNode, Inspected, NoEvidence, PrepareNode, Prepared, ReconcileNode, Reconciled,
@@ -112,10 +116,12 @@ pub use local::{
 pub use net::{
     AcquireError, AcquirePolicy, AdmissionError, AdmissionMode, AdmissionPermit, AttemptEvidence,
     AttemptOutcome, AttemptRate, BytePacingMode, BytePacingPermit, ByteRate, ByteRatePacer,
-    PacingError, ProtocolError, RateAdmission, RemoteSource, RemoteUrl, ResumeEvidence, ResumeMode,
-    ResumeOutcome, ResumePolicy, RetryPolicy, TransportPhase, UnsafeDestination, Validator,
+    HttpInspectAttemptEvidence, HttpInspectError, HttpInspectEvidence, HttpInspectMethod,
+    HttpInspectPolicy, HttpObservation, PacingError, ProtocolError, RateAdmission, RemoteSource,
+    RemoteUrl, RemoteUrlError, ResumeEvidence, ResumeMode, ResumeOutcome, ResumePolicy,
+    RetryPolicy, TransportPhase, UnsafeDestination, Validator,
 };
 #[cfg(feature = "reqwest")]
-pub use net::{AsyncAdmission, AsyncBytePacer, ReqwestAcquire, ReqwestResource};
+pub use net::{AsyncAdmission, AsyncBytePacer, ReqwestAcquire, ReqwestInspect, ReqwestResource};
 #[cfg(feature = "ureq")]
-pub use net::{SyncAdmission, SyncBytePacer, UreqAcquire, UreqResource};
+pub use net::{SyncAdmission, SyncBytePacer, UreqAcquire, UreqInspect, UreqResource};

@@ -1,3 +1,11 @@
+//! HTTP resource semantics and concrete acquisition/inspection adapters.
+//!
+//! Inspection uses HEAD only. A received final status is an observation rather than an acquisition
+//! failure. Evidence records the requested URL, the post-redirect final URL, method, admission wait,
+//! retry status, and planned delay. `declared_content_length` is response metadata: it is not body
+//! bytes observed by Pulith, artifact identity, validator continuity, provenance, or trust evidence.
+//! Inspection never falls back to GET, copies a response body, stages a file, or publishes a target.
+
 use std::fmt;
 #[cfg(feature = "reqwest")]
 use std::future::Future;
@@ -17,20 +25,34 @@ use std::time::{Duration, SystemTime};
 use governor::clock::Clock;
 
 #[cfg(feature = "ureq")]
-use crate::AcquireNode;
-#[cfg(feature = "reqwest")]
-use crate::AsyncAcquireNode;
+use crate::{AcquireNode, InspectNode};
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
-use crate::{Acquired, Chosen, LocalMaterial, MaterialKind};
+use crate::{Acquired, Chosen, Inspected, LocalMaterial, MaterialKind};
+#[cfg(feature = "reqwest")]
+use crate::{AsyncAcquireNode, AsyncInspectNode};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoteUrlError {
+    Invalid { input: String },
+    UnsupportedScheme { scheme: String },
+}
+
+impl fmt::Display for RemoteUrlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid { input } => write!(f, "invalid remote URL: {input}"),
+            Self::UnsupportedScheme { scheme } => {
+                write!(f, "unsupported remote URL scheme: {scheme}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteUrlError {}
 
 #[derive(Debug)]
 pub enum AcquireError {
-    InvalidUrl {
-        input: String,
-    },
-    UnsupportedScheme {
-        scheme: String,
-    },
+    RemoteUrl(RemoteUrlError),
     HttpStatus {
         url: url::Url,
         status: u16,
@@ -141,10 +163,7 @@ impl From<AdmissionError> for PacingError {
 impl fmt::Display for AcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidUrl { input } => write!(f, "invalid net acquire URL: {input}"),
-            Self::UnsupportedScheme { scheme } => {
-                write!(f, "unsupported net acquire URL scheme: {scheme}")
-            }
+            Self::RemoteUrl(error) => write!(f, "net acquire source error: {error}"),
             Self::HttpStatus { url, status, .. } => {
                 write!(f, "net acquire HTTP status {status}: {url}")
             }
@@ -202,6 +221,7 @@ impl fmt::Display for AcquireError {
 impl std::error::Error for AcquireError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::RemoteUrl(error) => Some(error),
             Self::Local { source, .. } => Some(source),
             _ => None,
         }
@@ -248,17 +268,13 @@ pub struct RemoteUrl {
 }
 
 impl RemoteUrl {
-    #[allow(
-        clippy::result_large_err,
-        reason = "AcquireError intentionally carries complete retry and resume evidence"
-    )]
-    pub fn parse(input: &str) -> Result<Self, AcquireError> {
-        let url = url::Url::parse(input).map_err(|_| AcquireError::InvalidUrl {
+    pub fn parse(input: &str) -> Result<Self, RemoteUrlError> {
+        let url = url::Url::parse(input).map_err(|_| RemoteUrlError::Invalid {
             input: input.to_string(),
         })?;
         match url.scheme() {
             "http" | "https" => Ok(Self { url }),
-            scheme => Err(AcquireError::UnsupportedScheme {
+            scheme => Err(RemoteUrlError::UnsupportedScheme {
                 scheme: scheme.to_string(),
             }),
         }
@@ -274,6 +290,12 @@ impl RemoteUrl {
 
     pub fn into_url(self) -> url::Url {
         self.url
+    }
+}
+
+impl From<RemoteUrlError> for AcquireError {
+    fn from(error: RemoteUrlError) -> Self {
+        Self::RemoteUrl(error)
     }
 }
 
@@ -720,6 +742,117 @@ impl RetryPolicy {
     }
 }
 
+/// Caller-selected execution policy for HTTP HEAD inspection.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HttpInspectPolicy {
+    pub timeout: Option<Duration>,
+    pub retry: RetryPolicy,
+    pub admission: AdmissionMode,
+}
+
+impl HttpInspectPolicy {
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    pub fn shared_admission(mut self) -> Self {
+        self.admission = AdmissionMode::Shared;
+        self
+    }
+}
+
+/// Request mechanism used to produce HTTP inspection evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpInspectMethod {
+    Head,
+}
+
+/// HTTP-specific facts reported by a HEAD response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpObservation {
+    pub status: u16,
+    pub declared_content_length: Option<u64>,
+}
+
+/// Evidence for one HTTP inspection or admission attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpInspectAttemptEvidence {
+    pub attempt: u32,
+    pub status: Option<u16>,
+    pub admission_wait: Option<Duration>,
+    pub planned_delay: Option<Duration>,
+}
+
+#[cfg(any(feature = "reqwest", feature = "ureq"))]
+impl HttpInspectAttemptEvidence {
+    fn new(attempt: u32, status: Option<u16>, admission_wait: Option<Duration>) -> Self {
+        Self {
+            attempt,
+            status,
+            admission_wait,
+            planned_delay: None,
+        }
+    }
+
+    fn with_planned_delay(mut self, planned_delay: Option<Duration>) -> Self {
+        self.planned_delay = planned_delay;
+        self
+    }
+}
+
+/// Evidence for a completed HTTP inspection, including redirect authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpInspectEvidence {
+    pub requested_url: url::Url,
+    pub final_url: url::Url,
+    pub method: HttpInspectMethod,
+    pub attempts: Vec<HttpInspectAttemptEvidence>,
+}
+
+/// Failures that prevented HTTP inspection from receiving a final response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpInspectError {
+    Transport {
+        url: url::Url,
+        message: String,
+        attempts: Vec<HttpInspectAttemptEvidence>,
+    },
+    Admission {
+        url: url::Url,
+        kind: AdmissionError,
+        attempts: Vec<HttpInspectAttemptEvidence>,
+    },
+    Protocol {
+        url: url::Url,
+        message: String,
+        attempts: Vec<HttpInspectAttemptEvidence>,
+    },
+}
+
+impl fmt::Display for HttpInspectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport { url, message, .. } => {
+                write!(f, "HTTP inspection transport error for {url}: {message}")
+            }
+            Self::Admission { url, kind, .. } => {
+                write!(f, "HTTP inspection admission failed for {url}: {kind:?}")
+            }
+            Self::Protocol { url, message, .. } => {
+                write!(f, "HTTP inspection protocol error for {url}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpInspectError {}
+
 /// Controls whether acquisition restarts or resumes from validator-bound bytes.
 ///
 /// Resume without a strong validator is intentionally unavailable:
@@ -1056,6 +1189,169 @@ impl std::fmt::Debug for UreqResource {
         formatter
             .debug_struct("UreqResource")
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "ureq")]
+/// Synchronous HEAD inspection implemented by `ureq`.
+#[derive(Clone, Debug)]
+pub struct UreqInspect {
+    resources: UreqResource,
+    policy: HttpInspectPolicy,
+}
+
+#[cfg(feature = "ureq")]
+impl Default for UreqInspect {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "ureq")]
+impl UreqInspect {
+    pub fn new() -> Self {
+        Self::with_resource(UreqResource::default())
+    }
+
+    pub fn with_resource(resources: UreqResource) -> Self {
+        Self {
+            resources,
+            policy: HttpInspectPolicy::default(),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: HttpInspectPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn resources(&self) -> &UreqResource {
+        &self.resources
+    }
+
+    pub fn policy(&self) -> &HttpInspectPolicy {
+        &self.policy
+    }
+}
+
+#[cfg(feature = "ureq")]
+impl InspectNode<RemoteUrl> for UreqInspect {
+    type Observation = HttpObservation;
+    type Evidence = HttpInspectEvidence;
+    type Error = HttpInspectError;
+    type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
+
+    fn inspect_node(&self, node: RemoteUrl) -> Result<Self::Output, Self::Error> {
+        use ureq::ResponseExt as _;
+
+        let requested_url = node.as_url().clone();
+        let mut attempts = Vec::new();
+        for attempt in 0..=self.policy.retry.max_retries {
+            let admission_wait = match self.policy.admission {
+                AdmissionMode::Unbounded => None,
+                AdmissionMode::Shared => {
+                    let admission = self.resources.admission().ok_or_else(|| {
+                        attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
+                        HttpInspectError::Admission {
+                            url: requested_url.clone(),
+                            kind: AdmissionError::Unavailable,
+                            attempts: attempts.clone(),
+                        }
+                    })?;
+                    match admission.enter() {
+                        Ok(permit) => Some(permit.waited_for()),
+                        Err(kind) => {
+                            attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
+                            return Err(HttpInspectError::Admission {
+                                url: requested_url.clone(),
+                                kind,
+                                attempts,
+                            });
+                        }
+                    }
+                }
+            };
+
+            let mut request_config = self
+                .resources
+                .agent
+                .head(node.as_str())
+                .config()
+                .http_status_as_error(false);
+            if let Some(timeout) = self.policy.timeout {
+                request_config = request_config.timeout_global(Some(timeout));
+            }
+            let response = match request_config.build().call() {
+                Ok(response) => response,
+                Err(error) => {
+                    let will_retry = attempt < self.policy.retry.max_retries;
+                    let planned_delay = will_retry.then(|| retry_delay(self.policy.retry, attempt));
+                    attempts.push(
+                        HttpInspectAttemptEvidence::new(attempt, None, admission_wait)
+                            .with_planned_delay(planned_delay),
+                    );
+                    if let Some(delay) = planned_delay {
+                        (self.resources.delay)(delay);
+                        continue;
+                    }
+                    return Err(HttpInspectError::Transport {
+                        url: requested_url.clone(),
+                        message: error.to_string(),
+                        attempts,
+                    });
+                }
+            };
+
+            let status = response.status().as_u16();
+            let declared_content_length = response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_retry_after(value, SystemTime::now()));
+            let final_url = url::Url::parse(&response.get_uri().to_string()).map_err(|error| {
+                attempts.push(HttpInspectAttemptEvidence::new(
+                    attempt,
+                    Some(status),
+                    admission_wait,
+                ));
+                HttpInspectError::Protocol {
+                    url: requested_url.clone(),
+                    message: error.to_string(),
+                    attempts: attempts.clone(),
+                }
+            })?;
+            let will_retry = should_retry_status(status) && attempt < self.policy.retry.max_retries;
+            let planned_delay =
+                will_retry.then(|| planned_retry_delay(self.policy.retry, attempt, retry_after));
+            attempts.push(
+                HttpInspectAttemptEvidence::new(attempt, Some(status), admission_wait)
+                    .with_planned_delay(planned_delay),
+            );
+            if let Some(delay) = planned_delay {
+                (self.resources.delay)(delay);
+                continue;
+            }
+
+            return Ok(Inspected::from_inspect(
+                node,
+                HttpObservation {
+                    status,
+                    declared_content_length,
+                },
+                HttpInspectEvidence {
+                    requested_url,
+                    final_url,
+                    method: HttpInspectMethod::Head,
+                    attempts,
+                },
+            ));
+        }
+        unreachable!("HTTP inspection retry loop always returns")
     }
 }
 
@@ -1559,6 +1855,173 @@ impl std::fmt::Debug for ReqwestResource {
             .debug_struct("ReqwestResource")
             .finish_non_exhaustive()
     }
+}
+
+#[cfg(feature = "reqwest")]
+/// Tokio-backed asynchronous HEAD inspection implemented by `reqwest`.
+#[derive(Clone, Debug)]
+pub struct ReqwestInspect {
+    resources: ReqwestResource,
+    policy: HttpInspectPolicy,
+}
+
+#[cfg(feature = "reqwest")]
+impl Default for ReqwestInspect {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl ReqwestInspect {
+    pub fn new() -> Self {
+        Self::with_resource(ReqwestResource::default())
+    }
+
+    pub fn with_resource(resources: ReqwestResource) -> Self {
+        Self {
+            resources,
+            policy: HttpInspectPolicy::default(),
+        }
+    }
+
+    pub fn with_policy(mut self, policy: HttpInspectPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn resources(&self) -> &ReqwestResource {
+        &self.resources
+    }
+
+    pub fn policy(&self) -> &HttpInspectPolicy {
+        &self.policy
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl AsyncInspectNode<RemoteUrl> for ReqwestInspect {
+    type Observation = HttpObservation;
+    type Evidence = HttpInspectEvidence;
+    type Error = HttpInspectError;
+    type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
+    type Future<'a>
+        = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + 'a>>
+    where
+        Self: 'a,
+        RemoteUrl: 'a;
+
+    fn inspect_node_async(&self, node: RemoteUrl) -> Self::Future<'_> {
+        Box::pin(inspect_reqwest(
+            self.resources.client.clone(),
+            self.resources.delay.clone(),
+            self.resources.admission.clone(),
+            self.policy.clone(),
+            node,
+        ))
+    }
+}
+
+#[cfg(feature = "reqwest")]
+async fn inspect_reqwest(
+    client: reqwest::Client,
+    delay: AsyncDelay,
+    admission: Option<Arc<dyn AsyncAdmission>>,
+    policy: HttpInspectPolicy,
+    node: RemoteUrl,
+) -> Result<Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>, HttpInspectError> {
+    let requested_url = node.as_url().clone();
+    let mut attempts = Vec::new();
+    for attempt in 0..=policy.retry.max_retries {
+        let admission_wait = match policy.admission {
+            AdmissionMode::Unbounded => None,
+            AdmissionMode::Shared => {
+                let admission = admission.as_ref().ok_or_else(|| {
+                    attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
+                    HttpInspectError::Admission {
+                        url: requested_url.clone(),
+                        kind: AdmissionError::Unavailable,
+                        attempts: attempts.clone(),
+                    }
+                })?;
+                match admission.enter().await {
+                    Ok(permit) => Some(permit.waited_for()),
+                    Err(kind) => {
+                        attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
+                        return Err(HttpInspectError::Admission {
+                            url: requested_url.clone(),
+                            kind,
+                            attempts,
+                        });
+                    }
+                }
+            }
+        };
+
+        let mut request = client.head(node.as_str());
+        if let Some(timeout) = policy.timeout {
+            request = request.timeout(timeout);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let will_retry = attempt < policy.retry.max_retries;
+                let planned_delay = will_retry.then(|| retry_delay(policy.retry, attempt));
+                attempts.push(
+                    HttpInspectAttemptEvidence::new(attempt, None, admission_wait)
+                        .with_planned_delay(planned_delay),
+                );
+                if let Some(wait) = planned_delay {
+                    (delay)(wait).await;
+                    continue;
+                }
+                return Err(HttpInspectError::Transport {
+                    url: requested_url.clone(),
+                    message: error.to_string(),
+                    attempts,
+                });
+            }
+        };
+
+        let status = response.status().as_u16();
+        let declared_content_length = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let final_url = response.url().clone();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        let will_retry = should_retry_status(status) && attempt < policy.retry.max_retries;
+        let planned_delay =
+            will_retry.then(|| planned_retry_delay(policy.retry, attempt, retry_after));
+        attempts.push(
+            HttpInspectAttemptEvidence::new(attempt, Some(status), admission_wait)
+                .with_planned_delay(planned_delay),
+        );
+        if let Some(wait) = planned_delay {
+            (delay)(wait).await;
+            continue;
+        }
+
+        return Ok(Inspected::from_inspect(
+            node,
+            HttpObservation {
+                status,
+                declared_content_length,
+            },
+            HttpInspectEvidence {
+                requested_url,
+                final_url,
+                method: HttpInspectMethod::Head,
+                attempts,
+            },
+        ));
+    }
+    unreachable!("HTTP inspection retry loop always returns")
 }
 
 #[cfg(feature = "reqwest")]
@@ -2469,9 +2932,7 @@ impl StagedDownload<Closed> {
 mod tests {
     use super::*;
     #[cfg(feature = "ureq")]
-    use crate::AcquireNode;
-    #[cfg(feature = "reqwest")]
-    use crate::AsyncAcquireNode;
+    use crate::{AcquireNode, InspectNode};
     #[cfg(all(
         any(feature = "reqwest", feature = "ureq"),
         feature = "hash",
@@ -2481,6 +2942,8 @@ mod tests {
         ApplyNode, ArtifactDescriptor, Blake3, CreateOrReplace, DescriptorVerify, DigestNeed,
         HashVerify, IdentityPrepare, LocalApply, PrepareNode, VerifyNode,
     };
+    #[cfg(feature = "reqwest")]
+    use crate::{AsyncAcquireNode, AsyncInspectNode};
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use crate::{Intent, Item, LocalTarget};
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
@@ -2605,23 +3068,24 @@ mod tests {
     fn remote_url_rejects_unsupported_or_relative_urls() {
         assert!(matches!(
             RemoteUrl::parse("file:///tmp/file"),
-            Err(AcquireError::UnsupportedScheme { .. })
+            Err(RemoteUrlError::UnsupportedScheme { .. })
         ));
         assert!(matches!(
             RemoteUrl::parse("example.com/file"),
-            Err(AcquireError::InvalidUrl { .. })
+            Err(RemoteUrlError::Invalid { .. })
         ));
     }
 
     #[test]
     fn pulith_error_wraps_net_acquire_error_as_source() {
-        let net = AcquireError::UnsupportedScheme {
+        let net = AcquireError::RemoteUrl(RemoteUrlError::UnsupportedScheme {
             scheme: "file".to_string(),
-        };
+        });
         let error = crate::PulithError::from(net);
 
         assert!(matches!(error, crate::PulithError::NetAcquire(_)));
-        assert!(std::error::Error::source(&error).is_some());
+        let acquire = std::error::Error::source(&error).unwrap();
+        assert!(std::error::Error::source(acquire).is_some());
     }
 
     #[test]
@@ -2979,6 +3443,288 @@ mod tests {
         assert!(range.matches_materialized_bytes(5, 8));
         assert!(!range.matches_materialized_bytes(5, 7));
         assert!(!range.matches_materialized_bytes(5, 9));
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_uses_head_and_reports_declared_metadata() {
+        let server = serve_once(200, b"body-not-materialized", &[]);
+        let inspected = UreqInspect::new()
+            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+            .unwrap();
+        let request = server.next_request();
+        server.join();
+
+        assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
+        assert_eq!(inspected.observation().status, 200);
+        assert_eq!(
+            inspected.observation().declared_content_length,
+            Some(b"body-not-materialized".len() as u64)
+        );
+        assert_eq!(inspected.evidence().method, HttpInspectMethod::Head);
+        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(
+            inspected.evidence().requested_url,
+            inspected.evidence().final_url
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_returns_non_success_status_as_observation_without_get_fallback() {
+        let server = serve_once(405, b"method not allowed", &[]);
+        let inspected = UreqInspect::new()
+            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+            .unwrap();
+        let request = server.next_request();
+        server.join();
+
+        assert!(request.starts_with("HEAD "));
+        assert_eq!(inspected.observation().status, 405);
+        assert_eq!(inspected.evidence().attempts.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_retries_status_and_returns_final_observation() {
+        let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
+        let enters = TestArc::new(Mutex::new(0));
+        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
+            waited: Duration::from_millis(5),
+            error: None,
+            enters: TestArc::clone(&enters),
+        }));
+        let policy = HttpInspectPolicy::default()
+            .retry(RetryPolicy {
+                max_retries: 1,
+                base_delay: Duration::ZERO,
+                max_delay: None,
+                respect_retry_after: false,
+            })
+            .shared_admission();
+        let inspected = UreqInspect::with_resource(resources)
+            .with_policy(policy)
+            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+            .unwrap();
+        assert!(server.next_request().starts_with("HEAD "));
+        assert!(server.next_request().starts_with("HEAD "));
+        server.join();
+
+        assert_eq!(inspected.observation().status, 404);
+        assert_eq!(inspected.evidence().attempts.len(), 2);
+        assert_eq!(inspected.evidence().attempts[0].status, Some(503));
+        assert_eq!(inspected.evidence().attempts[1].status, Some(404));
+        assert_eq!(
+            inspected.evidence().attempts[0].admission_wait,
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(*enters.lock().unwrap(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_records_requested_and_final_redirect_urls() {
+        let server = serve_redirect_then(200, b"final");
+        let requested = RemoteUrl::parse(&server.url).unwrap();
+        let inspected = UreqInspect::new().inspect_node(requested.clone()).unwrap();
+        assert!(server.next_request().starts_with("HEAD /artifact.bin "));
+        assert!(server.next_request().starts_with("HEAD /final "));
+        server.join();
+
+        assert_eq!(inspected.evidence().requested_url, requested.into_url());
+        assert!(inspected.evidence().final_url.as_str().ends_with("/final"));
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_surfaces_shared_admission_failure_without_request() {
+        let enters = TestArc::new(Mutex::new(0));
+        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
+            waited: Duration::ZERO,
+            error: Some(AdmissionError::Rejected),
+            enters: TestArc::clone(&enters),
+        }));
+        let inspect = UreqInspect::with_resource(resources)
+            .with_policy(HttpInspectPolicy::default().shared_admission());
+
+        let error = inspect
+            .inspect_node(RemoteUrl::parse("http://127.0.0.1:9/resource").unwrap())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpInspectError::Admission {
+                kind: AdmissionError::Rejected,
+                ..
+            }
+        ));
+        assert_eq!(*enters.lock().unwrap(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_inspect_preserves_transport_attempt_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = UreqInspect::new()
+            .inspect_node(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap())
+            .unwrap_err();
+
+        match error {
+            HttpInspectError::Transport { attempts, .. } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].status, None);
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_uses_head_and_reports_declared_metadata() {
+        let server = serve_once(200, b"body-not-materialized", &[]);
+        let inspected = block_on_reqwest(
+            ReqwestInspect::new().inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+        )
+        .unwrap();
+        let request = server.next_request();
+        server.join();
+
+        assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
+        assert_eq!(inspected.observation().status, 200);
+        assert_eq!(
+            inspected.observation().declared_content_length,
+            Some(b"body-not-materialized".len() as u64)
+        );
+        assert_eq!(inspected.evidence().method, HttpInspectMethod::Head);
+        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(
+            inspected.evidence().requested_url,
+            inspected.evidence().final_url
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_returns_non_success_status_as_observation_without_get_fallback() {
+        let server = serve_once(405, b"method not allowed", &[]);
+        let inspected = block_on_reqwest(
+            ReqwestInspect::new().inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+        )
+        .unwrap();
+        let request = server.next_request();
+        server.join();
+
+        assert!(request.starts_with("HEAD "));
+        assert_eq!(inspected.observation().status, 405);
+        assert_eq!(inspected.evidence().attempts.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_retries_status_and_returns_final_observation() {
+        let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
+        let enters = TestArc::new(Mutex::new(0));
+        let resources =
+            ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
+                waited: Duration::from_millis(5),
+                error: None,
+                enters: TestArc::clone(&enters),
+            }));
+        let policy = HttpInspectPolicy::default()
+            .retry(RetryPolicy {
+                max_retries: 1,
+                base_delay: Duration::ZERO,
+                max_delay: None,
+                respect_retry_after: false,
+            })
+            .shared_admission();
+        let inspected = block_on_reqwest(
+            ReqwestInspect::with_resource(resources)
+                .with_policy(policy)
+                .inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+        )
+        .unwrap();
+        assert!(server.next_request().starts_with("HEAD "));
+        assert!(server.next_request().starts_with("HEAD "));
+        server.join();
+
+        assert_eq!(inspected.observation().status, 404);
+        assert_eq!(inspected.evidence().attempts.len(), 2);
+        assert_eq!(inspected.evidence().attempts[0].status, Some(503));
+        assert_eq!(inspected.evidence().attempts[1].status, Some(404));
+        assert_eq!(
+            inspected.evidence().attempts[0].admission_wait,
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(*enters.lock().unwrap(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_records_requested_and_final_redirect_urls() {
+        let server = serve_redirect_then(200, b"final");
+        let requested = RemoteUrl::parse(&server.url).unwrap();
+        let inspected =
+            block_on_reqwest(ReqwestInspect::new().inspect_node_async(requested.clone())).unwrap();
+        assert!(server.next_request().starts_with("HEAD /artifact.bin "));
+        assert!(server.next_request().starts_with("HEAD /final "));
+        server.join();
+
+        assert_eq!(inspected.evidence().requested_url, requested.into_url());
+        assert!(inspected.evidence().final_url.as_str().ends_with("/final"));
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_surfaces_shared_admission_failure_without_request() {
+        let enters = TestArc::new(Mutex::new(0));
+        let resources =
+            ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
+                waited: Duration::ZERO,
+                error: Some(AdmissionError::Rejected),
+                enters: TestArc::clone(&enters),
+            }));
+        let inspect = ReqwestInspect::with_resource(resources)
+            .with_policy(HttpInspectPolicy::default().shared_admission());
+
+        let error = block_on_reqwest(
+            inspect.inspect_node_async(RemoteUrl::parse("http://127.0.0.1:9/resource").unwrap()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpInspectError::Admission {
+                kind: AdmissionError::Rejected,
+                ..
+            }
+        ));
+        assert_eq!(*enters.lock().unwrap(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_inspect_preserves_transport_attempt_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error =
+            block_on_reqwest(ReqwestInspect::new().inspect_node_async(
+                RemoteUrl::parse(&format!("http://{address}/resource")).unwrap(),
+            ))
+            .unwrap_err();
+
+        match error {
+            HttpInspectError::Transport { attempts, .. } => {
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].status, None);
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4745,6 +5491,32 @@ mod tests {
                 let (stream, _) = listener.accept().unwrap();
                 handle_request(stream, status, body, headers, None, &requests);
             }
+        });
+        TestServer {
+            url: format!("http://{addr}/artifact.bin"),
+            handle,
+            requests: request_rx,
+        }
+    }
+
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    fn serve_redirect_then(status: u16, body: &'static [u8]) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let location = format!("http://{addr}/final");
+            let (first, _) = listener.accept().unwrap();
+            handle_request(
+                first,
+                302,
+                &[],
+                &[("Location", location.as_str())],
+                None,
+                &requests,
+            );
+            let (second, _) = listener.accept().unwrap();
+            handle_request(second, status, body, &[], None, &requests);
         });
         TestServer {
             url: format!("http://{addr}/artifact.bin"),

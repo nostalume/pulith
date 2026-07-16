@@ -1,3 +1,14 @@
+#![cfg_attr(
+    not(feature = "reqwest"),
+    doc = r#"
+`AsyncInspectNode` is admitted only with the concrete `reqwest` adapter:
+
+```compile_fail
+use pulith::behavior::AsyncInspectNode;
+```
+"#
+)]
+
 use std::future::Future;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -308,6 +319,21 @@ pub trait AsyncAcquireNode<N> {
         N: 'a;
 
     fn acquire_node_async(&self, node: N) -> Self::Future<'_>;
+}
+
+/// Asynchronous read-only observation law, admitted only with a concrete async adapter.
+#[cfg(feature = "reqwest")]
+pub trait AsyncInspectNode<N> {
+    type Observation;
+    type Evidence;
+    type Error;
+    type Output;
+    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
+    where
+        Self: 'a,
+        N: 'a;
+
+    fn inspect_node_async(&self, node: N) -> Self::Future<'_>;
 }
 
 pub trait VerifyNode<N> {

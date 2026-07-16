@@ -9,6 +9,7 @@ behaviors. Artifact materialization is one concrete behavior family:
 materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
 observe:     LocalTarget -> Inspected -> Reconciled
+             RemoteUrl  -> Inspected
 ```
 
 Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
@@ -95,6 +96,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 ## Network invariants
 
 - Admit each outbound attempt separately, including retries.
+- HTTP inspection issues HEAD only; it never falls back to GET, copies a body, or publishes a destination.
+- Every received final HTTP inspection status is an observation, including 4xx and exhausted 5xx.
+- HTTP inspection records requested and final URLs; declared content length is metadata, not observed bytes or artifact identity.
 - Enforce `max_bytes` before pacing and staged writes.
 - Persist only after body copy and stage finalization succeed.
 - Record attempt outcome, resume, admission wait, and pacing wait.
