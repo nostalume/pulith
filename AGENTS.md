@@ -2,16 +2,28 @@
 
 ## Purpose
 
-Pulith is one feature-gated Rust crate for composing typed artifact behaviors:
+Pulith is one feature-gated Rust crate ecosystem for composing typed external-resource management
+behaviors. Artifact materialization is one concrete behavior family:
 
 ```text
 materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
+observe:     LocalTarget -> Inspected -> Reconciled
 ```
 
 Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
 plus its `Evidence`, `Error`, and `Output`. Callers compose policy and effects; there is no global
 `App`, `Context`, registry, or factory.
+
+Keep three axes orthogonal:
+
+```text
+behavior law != resource-specific semantics != concrete adapter
+```
+
+Callers own desired state, application identity, trust/admission policy, durable aggregates,
+orchestration, and rollback/retention policy. Do not promote one package-manager, filesystem,
+database, trust, or deployment implementation into Pulith's universal domain model.
 
 ## Tech stack
 
@@ -50,6 +62,8 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 ## Design rules
 
 - Design behavior and evidence laws before code.
+- For every public behavior, document input, `Need` where required, `Evidence`, `Error`, `Output`,
+  effect/failure law, authority owner, resource semantics, and concrete adapter or caller.
 - Preserve the typed transition chain and associated types.
 - Treat state types as composition vocabulary, not proof that every transition has a built-in
   concrete behavior; document implemented and caller-owned boundaries explicitly.
@@ -60,6 +74,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Keep request admission, concurrency, and decoded-body pacing distinct.
 - Use mature crates for codecs and container parsing; Pulith owns policy, evidence, staging, and composition.
 - Delete speculative abstractions and compatibility shells.
+- Keep observation read-only, reconciliation non-mutating, and repair as a separate explicit behavior.
+- Treat evidence as behavior proof, not automatically as a domain event; introduce aggregates and
+  DDD repositories only for demonstrated durable consistency boundaries.
 - No registries, factories, middleware layers, or global singletons without a demonstrated caller.
 
 ## Filesystem and archive invariants

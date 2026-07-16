@@ -210,6 +210,76 @@ impl<I, R, E> Remembered<I, R, E> {
     }
 }
 
+/// Read-only observation of an external resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Inspected<I, O, E = NoEvidence> {
+    pub(crate) input: I,
+    pub(crate) observation: O,
+    pub(crate) evidence: E,
+}
+
+impl<I, O, E> Inspected<I, O, E> {
+    #[allow(dead_code)]
+    pub(crate) fn from_inspect(input: I, observation: O, evidence: E) -> Self {
+        Self {
+            input,
+            observation,
+            evidence,
+        }
+    }
+
+    pub fn input(&self) -> &I {
+        &self.input
+    }
+
+    pub fn observation(&self) -> &O {
+        &self.observation
+    }
+
+    pub fn evidence(&self) -> &E {
+        &self.evidence
+    }
+
+    pub fn into_parts(self) -> (I, O, E) {
+        (self.input, self.observation, self.evidence)
+    }
+}
+
+/// Pure comparison result between caller-supplied expectation and an observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reconciled<I, R, E> {
+    pub(crate) input: I,
+    pub(crate) reconciliation: R,
+    pub(crate) evidence: E,
+}
+
+impl<I, R, E> Reconciled<I, R, E> {
+    #[allow(dead_code)]
+    pub(crate) fn from_reconcile(input: I, reconciliation: R, evidence: E) -> Self {
+        Self {
+            input,
+            reconciliation,
+            evidence,
+        }
+    }
+
+    pub fn input(&self) -> &I {
+        &self.input
+    }
+
+    pub fn reconciliation(&self) -> &R {
+        &self.reconciliation
+    }
+
+    pub fn evidence(&self) -> &E {
+        &self.evidence
+    }
+
+    pub fn into_parts(self) -> (I, R, E) {
+        (self.input, self.reconciliation, self.evidence)
+    }
+}
+
 pub trait SelectNode<N> {
     type Source;
     type Error;
@@ -274,4 +344,24 @@ pub trait RememberNode<N> {
     type Output;
 
     fn remember_node(&self, node: N) -> Result<Self::Output, Self::Error>;
+}
+
+/// Observes an external resource without mutating it or deciding desired state.
+pub trait InspectNode<N> {
+    type Observation;
+    type Evidence;
+    type Error;
+    type Output;
+
+    fn inspect_node(&self, node: N) -> Result<Self::Output, Self::Error>;
+}
+
+/// Compares a typed observation with caller-owned expected state without mutation.
+pub trait ReconcileNode<N> {
+    type Need;
+    type Evidence;
+    type Error;
+    type Output;
+
+    fn reconcile_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
 }

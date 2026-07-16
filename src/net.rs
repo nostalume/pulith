@@ -2749,7 +2749,7 @@ mod tests {
     #[cfg(feature = "ureq")]
     fn sync_byte_rate_pacer_shares_budget_across_calls() {
         let pacer = ByteRatePacer::new(ByteRate::new(
-            NonZeroU32::new(1_000).unwrap(),
+            NonZeroU32::new(10).unwrap(),
             NonZeroU32::new(1).unwrap(),
         ));
 
@@ -2799,7 +2799,7 @@ mod tests {
     fn async_byte_rate_pacer_shares_budget_across_calls() {
         block_on_reqwest(async {
             let pacer = ByteRatePacer::new(ByteRate::new(
-                NonZeroU32::new(1_000).unwrap(),
+                NonZeroU32::new(10).unwrap(),
                 NonZeroU32::new(1).unwrap(),
             ));
 

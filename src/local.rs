@@ -6,9 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     AcquireEvidence, AcquireNode, Acquired, Applied, ApplyEvidence, ApplyNode, Create,
-    CreateOrReplace, EvidenceChain, Forget, Intent, Item, LocalApplyStats, LocalPath, LocalTarget,
-    NoEvidence, PrepareEvidence, PrepareNode, Prepared, PulithError, Receipt, RememberEvidence,
-    RememberNode, Remembered, Replace, SelectNode, Verified, WithSource,
+    CreateOrReplace, EvidenceChain, Forget, InspectNode, Inspected, Intent, Item, LocalApplyStats,
+    LocalPath, LocalTarget, NoEvidence, PrepareEvidence, PrepareNode, Prepared, PulithError,
+    Receipt, ReconcileNode, Reconciled, RememberEvidence, RememberNode, Remembered, Replace,
+    SelectNode, Verified, WithSource,
 };
 
 pub(crate) type LocalApplied<O, E> =
@@ -79,6 +80,186 @@ pub struct LocalPrepared {
 pub enum MaterialKind {
     File,
     Directory,
+}
+
+/// No-follow local filesystem entry classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEntryKind {
+    Missing,
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Read-only facts observed for one [`LocalTarget`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalObservation {
+    Missing,
+    File { bytes: u64 },
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Concrete metadata operation that produced a local observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalInspectMethod {
+    NoFollowMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalInspectEvidence {
+    pub method: LocalInspectMethod,
+}
+
+impl LocalObservation {
+    pub fn kind(&self) -> LocalEntryKind {
+        match self {
+            Self::Missing => LocalEntryKind::Missing,
+            Self::File { .. } => LocalEntryKind::File,
+            Self::Directory => LocalEntryKind::Directory,
+            Self::Symlink => LocalEntryKind::Symlink,
+            Self::Other => LocalEntryKind::Other,
+        }
+    }
+}
+
+/// Caller-owned expected state used by [`LocalReconcile`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalExpectation {
+    Missing,
+    File,
+    FileSize(u64),
+    Directory,
+    Symlink,
+    Other,
+}
+
+impl LocalExpectation {
+    pub fn kind(&self) -> LocalEntryKind {
+        match self {
+            Self::Missing => LocalEntryKind::Missing,
+            Self::File | Self::FileSize(_) => LocalEntryKind::File,
+            Self::Directory => LocalEntryKind::Directory,
+            Self::Symlink => LocalEntryKind::Symlink,
+            Self::Other => LocalEntryKind::Other,
+        }
+    }
+}
+
+/// Difference between caller-owned local expectation and observed state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalReconciliation {
+    Matches,
+    Missing,
+    Unexpected,
+    WrongKind {
+        expected: LocalEntryKind,
+        observed: LocalEntryKind,
+    },
+    Modified {
+        expected_bytes: u64,
+        observed_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalReconcileEvidence {
+    pub expected: LocalExpectation,
+    pub observed: LocalObservation,
+}
+
+/// Read-only, no-follow inspection of one local target.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalInspect;
+
+impl InspectNode<LocalTarget> for LocalInspect {
+    type Observation = LocalObservation;
+    type Evidence = LocalInspectEvidence;
+    type Error = PulithError;
+    type Output = Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>;
+
+    fn inspect_node(&self, node: LocalTarget) -> Result<Self::Output, Self::Error> {
+        let observation = match fs::symlink_metadata(&node.path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    LocalObservation::Symlink
+                } else if file_type.is_file() {
+                    LocalObservation::File {
+                        bytes: metadata.len(),
+                    }
+                } else if file_type.is_dir() {
+                    LocalObservation::Directory
+                } else {
+                    LocalObservation::Other
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => LocalObservation::Missing,
+            Err(error) => return Err(PulithError::io("inspect local target", &node.path, error)),
+        };
+
+        Ok(Inspected::from_inspect(
+            node,
+            observation,
+            LocalInspectEvidence {
+                method: LocalInspectMethod::NoFollowMetadata,
+            },
+        ))
+    }
+}
+
+/// Pure local expected/observed comparison; it never mutates the target.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalReconcile;
+
+impl ReconcileNode<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>>
+    for LocalReconcile
+{
+    type Need = LocalExpectation;
+    type Evidence = EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>;
+    type Error = std::convert::Infallible;
+    type Output = Reconciled<LocalTarget, LocalReconciliation, Self::Evidence>;
+
+    fn reconcile_node(
+        &self,
+        node: Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>,
+        expected: Self::Need,
+    ) -> Result<Self::Output, Self::Error> {
+        let Inspected {
+            input,
+            observation,
+            evidence: inspect_evidence,
+        } = node;
+        let reconciliation = match (&expected, &observation) {
+            (LocalExpectation::Missing, LocalObservation::Missing) => LocalReconciliation::Matches,
+            (LocalExpectation::Missing, _) => LocalReconciliation::Unexpected,
+            (_, LocalObservation::Missing) => LocalReconciliation::Missing,
+            (LocalExpectation::FileSize(expected_bytes), LocalObservation::File { bytes })
+                if expected_bytes != bytes =>
+            {
+                LocalReconciliation::Modified {
+                    expected_bytes: *expected_bytes,
+                    observed_bytes: *bytes,
+                }
+            }
+            _ if expected.kind() == observation.kind() => LocalReconciliation::Matches,
+            _ => LocalReconciliation::WrongKind {
+                expected: expected.kind(),
+                observed: observation.kind(),
+            },
+        };
+        let evidence = EvidenceChain::new(
+            inspect_evidence,
+            LocalReconcileEvidence {
+                expected,
+                observed: observation,
+            },
+        );
+
+        Ok(Reconciled::from_reconcile(input, reconciliation, evidence))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -561,8 +742,10 @@ mod tests {
 
     use crate::{
         AcquireNode, ApplyNode, Create, CreateOrReplace, Forget, Identity, IdentityPrepare,
-        IdentityVerify, Intent, Item, LocalAcquire, LocalApply, LocalPath, LocalPlacement,
-        LocalTarget, MemoryRemember, PrepareNode, RememberNode, Replace, VerifyNode,
+        IdentityVerify, InspectNode, Intent, Item, LocalAcquire, LocalApply, LocalExpectation,
+        LocalInspect, LocalObservation, LocalPath, LocalPlacement, LocalReconcile,
+        LocalReconciliation, LocalTarget, MemoryRemember, PrepareNode, ReconcileNode, RememberNode,
+        Replace, VerifyNode,
     };
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -827,6 +1010,126 @@ mod tests {
         assert!(!target.exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_inspect_reports_missing_file_and_directory_without_mutation() {
+        let root = temp_root("inspect-entry-kinds");
+        let missing = root.join("missing");
+        let file = root.join("file.txt");
+        let directory = root.join("directory");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, "pulith").unwrap();
+
+        let missing = LocalInspect
+            .inspect_node(LocalTarget::new(&missing))
+            .unwrap();
+        let file = LocalInspect.inspect_node(LocalTarget::new(&file)).unwrap();
+        let directory = LocalInspect
+            .inspect_node(LocalTarget::new(&directory))
+            .unwrap();
+
+        assert_eq!(missing.observation(), &LocalObservation::Missing);
+        assert_eq!(file.observation(), &LocalObservation::File { bytes: 6 });
+        assert_eq!(directory.observation(), &LocalObservation::Directory);
+        assert_eq!(
+            file.evidence().method,
+            crate::LocalInspectMethod::NoFollowMetadata
+        );
+        assert_eq!(fs::read_to_string(&file.input().path).unwrap(), "pulith");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_inspect_observes_dangling_symlink_without_following_or_removing_it() {
+        let root = temp_root("inspect-dangling-symlink");
+        let target = root.join("target-link");
+        fs::create_dir_all(&root).unwrap();
+        symlink_file(root.join("missing-source"), &target).unwrap();
+
+        let inspected = LocalInspect
+            .inspect_node(LocalTarget::new(&target))
+            .unwrap();
+
+        assert_eq!(inspected.observation(), &LocalObservation::Symlink);
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_file(target).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_reconcile_classifies_resource_differences_without_mutation() {
+        let root = temp_root("reconcile");
+        let missing = root.join("missing");
+        let file = root.join("file.txt");
+        let directory = root.join("directory");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&file, "pulith").unwrap();
+
+        let matched = reconcile(&file, LocalExpectation::FileSize(6));
+        let missing = reconcile(&missing, LocalExpectation::File);
+        let unexpected = reconcile(&file, LocalExpectation::Missing);
+        let wrong_kind = reconcile(&directory, LocalExpectation::File);
+        let modified = reconcile(&file, LocalExpectation::FileSize(7));
+
+        assert_eq!(matched.reconciliation(), &LocalReconciliation::Matches);
+        assert_eq!(missing.reconciliation(), &LocalReconciliation::Missing);
+        assert_eq!(
+            unexpected.reconciliation(),
+            &LocalReconciliation::Unexpected
+        );
+        assert_eq!(
+            wrong_kind.reconciliation(),
+            &LocalReconciliation::WrongKind {
+                expected: crate::LocalEntryKind::File,
+                observed: crate::LocalEntryKind::Directory,
+            }
+        );
+        assert_eq!(
+            modified.reconciliation(),
+            &LocalReconciliation::Modified {
+                expected_bytes: 7,
+                observed_bytes: 6,
+            }
+        );
+        assert_eq!(
+            matched.evidence().previous.method,
+            crate::LocalInspectMethod::NoFollowMetadata
+        );
+        assert_eq!(
+            matched.evidence().current.expected,
+            LocalExpectation::FileSize(6)
+        );
+        assert_eq!(
+            matched.evidence().current.observed,
+            LocalObservation::File { bytes: 6 }
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn reconcile(
+        path: &std::path::Path,
+        expected: LocalExpectation,
+    ) -> crate::Reconciled<
+        LocalTarget,
+        LocalReconciliation,
+        crate::EvidenceChain<crate::LocalInspectEvidence, crate::LocalReconcileEvidence>,
+    > {
+        LocalReconcile
+            .reconcile_node(
+                LocalInspect.inspect_node(LocalTarget::new(path)).unwrap(),
+                expected,
+            )
+            .unwrap()
     }
 
     #[cfg(unix)]

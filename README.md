@@ -1,6 +1,7 @@
 # pulith
 
-Pulith is a single Rust crate for composing typed artifact behaviors without a hidden package-manager policy layer.
+Pulith is a single-root Rust crate ecosystem for composing typed external-resource management
+behaviors without a hidden package-manager or implementation-specific policy layer.
 
 > **Status:** pre-release. Local package verification does not publish a registry artifact, and no
 > release is implied by the `0.1.0` manifest version.
@@ -8,6 +9,7 @@ Pulith is a single Rust crate for composing typed artifact behaviors without a h
 ```text
 materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
+observe:     LocalTarget -> Inspected -> Reconciled
 ```
 
 Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
@@ -20,12 +22,72 @@ plus its `Evidence`, `Error`, and `Output`. Callers choose policy and compose co
 | `application` | Typed intent, item, target, and operation vocabulary |
 | `behavior` | Transition traits and state nodes |
 | `evidence` | Evidence chains carried across transitions |
-| `local` | Local acquire, prepare, staged apply, and in-memory remember |
+| `local` | Local acquire, prepare, staged apply, inspect, pure reconcile, and in-memory remember |
 | `hash` | Typed digest and exact digest-plus-size descriptor verification |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
 
 Pulith uses mature libraries for HTTP, hashing, archive parsing, and compression codecs. It owns the typed behavior, policy, evidence, staging, and publication contracts around those mechanisms.
+
+## Architecture
+
+Pulith keeps three axes orthogonal:
+
+```text
+behavior law
+    x resource-specific semantics
+        x concrete adapter
+```
+
+A behavior law declares its input, policy `Need` where required, `Evidence`, `Error`, `Output`,
+effect boundary, and failure law. Resource semantics define what those terms mean for a filesystem,
+HTTP representation, archive, digest, trust system, durable store, or another external resource. An
+adapter implements one demonstrated behavior/resource intersection. Callers retain application
+identity, desired state, trust/admission policy, durable aggregates, orchestration, and rollback or
+retention policy.
+
+The behavior vocabulary is not a universal lifecycle. Current and candidate families are:
+
+| Family | Behaviors | Boundary |
+| --- | --- | --- |
+| Choice | attach, select; offer remains caller vocabulary | no acquisition or authorization claim |
+| Materialization | acquire, verify, prepare | transfer, factual proof, and transformation stay separate |
+| Mutation | apply, forget | explicit target effect; `Forget` does not claim ownership |
+| Memory | remember | durability only when a concrete adapter proves it |
+| Observation | inspect | read-only facts; absence is an observation for `LocalInspect` |
+| Convergence | reconcile | caller expectation plus observation; never repairs or adopts |
+| Future gated families | admit, recover, activate, prune | require a demonstrated authority and adapter before public vocabulary |
+
+Concrete behavior contracts currently admitted to the public surface are:
+
+| Behavior | Need / authority | Evidence and output | Effect and failure law |
+| --- | --- | --- | --- |
+| explicit select | caller-attached typed source | `Chosen` source | no provider discovery, trust, or I/O claim |
+| local acquire | chosen `LocalPath`; filesystem adapter | observed source metadata and `LocalMaterial` | missing/unsupported source fails before later transitions |
+| HTTP acquire | request, retry, admission, resume, and pacing policy | per-attempt transfer/resume/wait evidence and staged material | each attempt admitted separately; complete validated stage precedes persistence |
+| identity/descriptor verify | caller expectation or explicit identity pass-through | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
+| identity/archive prepare | preparation Need and exclusive workspace where required | prepared material/tree and observed preparation evidence | final destination remains untouched |
+| local apply | typed create/replace intent and target | receipt plus observed files/directories/bytes/placement | staged publication with an explicit single-target commit boundary |
+| local forget | exact caller-authorized target | removed/no-op apply evidence | direct idempotent removal; no ownership or uninstall claim |
+| memory remember | applied result | receipt and evidence carried in `Remembered` | process-local only; no durability claim |
+| local inspect | `LocalTarget`; local adapter owns observed facts | entry observation plus no-follow method evidence | read-only; `NotFound` is `Missing`, other I/O failures remain errors |
+| local reconcile | caller-owned `LocalExpectation` | preserved inspect evidence, expected/observed evidence, and typed classification | pure comparison; no repair, adoption, deletion, or persistence |
+
+Resource semantics remain bounded and cross through typed anti-corruption mappings:
+
+| Resource context | Owns | Must not be interpreted as |
+| --- | --- | --- |
+| Filesystem | entry kind, no-follow observation, staging, publication | package ownership or durable state |
+| HTTP | representation, validator, ranges, attempts, pacing | artifact identity or publisher trust |
+| Artifact identity | digest algorithm, raw digest, exact byte size | authorization or provenance |
+| Archive | entries, decoded/materialized limits, guarded scratch | final publication |
+| Trust/provenance | external signature, delegation, attestation facts | generic core identity or automatic admission |
+| Durable state | adapter-specific revision, commit, and recovery laws | a mandatory Pulith aggregate |
+
+`Evidence` proves one behavior result; it is not automatically a DDD domain event. A software
+artifact repository is likewise not a DDD `Repository` unless it rehydrates a demonstrated
+aggregate. Pulith defines no universal `Installation`, global repository, registry, or transaction
+manager.
 
 ## Current maturity
 
@@ -41,11 +103,13 @@ manager. The concrete path currently supplied by this crate is:
 | `Prepared -> Applied` | staged local file/tree publication for create and replace operations |
 | `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
 | `Applied -> Remembered` | `MemoryRemember`, which carries the receipt and evidence in memory only |
+| `LocalTarget -> Inspected` | read-only, no-follow local entry observation with method evidence |
+| `Inspected -> Reconciled` | pure comparison against caller-owned local expected state |
 
 Async execution is concrete only for HTTP acquisition through `AsyncAcquireNode` and
 `ReqwestAcquire`; the other transitions currently expose synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
-transactions, reconciliation, or system package-manager integration. Those require demonstrated
+transactions, automatic repair, or system package-manager integration. Those require demonstrated
 callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
 
 `ArtifactDescriptor<A>` identifies one exact raw representation by digest and byte size, independent
@@ -101,6 +165,10 @@ Build an `Intent`, attach a typed source, select it, then pass the node through 
 - request admission and decoded-body pacing are separate shared resources;
 - decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
 - local path safety assumes trusted parent directories, not a hostile concurrent filesystem;
+- local inspection uses `symlink_metadata`, treats `NotFound` as `Missing`, reports dangling
+  symlinks without following them, and performs no mutation;
+- local reconciliation compares caller-owned expectation with an observation and returns only a
+  classification plus evidence; it never repairs, adopts, deletes, or persists state;
 - dependency solving, lifecycle stores, installation policy, and package-manager orchestration are out of scope.
 
 ## Development

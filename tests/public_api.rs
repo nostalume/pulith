@@ -93,3 +93,45 @@ fn public_api_forgets_local_target_directly() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn public_api_inspects_and_reconciles_without_mutating_local_target() {
+    use pulith::{
+        InspectNode, LocalExpectation, LocalInspect, LocalInspectMethod, LocalObservation,
+        LocalReconcile, LocalReconciliation, ReconcileNode,
+    };
+
+    let root = temp_root("inspect-reconcile");
+    let target = root.join("target.txt");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&target, "pulith").unwrap();
+
+    let inspected = LocalInspect
+        .inspect_node(LocalTarget::new(&target))
+        .unwrap();
+    assert_eq!(
+        inspected.observation(),
+        &LocalObservation::File { bytes: 6 }
+    );
+    assert_eq!(
+        inspected.evidence().method,
+        LocalInspectMethod::NoFollowMetadata
+    );
+
+    let reconciled = LocalReconcile
+        .reconcile_node(inspected, LocalExpectation::FileSize(6))
+        .unwrap();
+    assert_eq!(reconciled.reconciliation(), &LocalReconciliation::Matches);
+    assert_eq!(
+        reconciled.evidence().previous.method,
+        LocalInspectMethod::NoFollowMetadata
+    );
+    assert_eq!(
+        reconciled.evidence().current.expected,
+        LocalExpectation::FileSize(6)
+    );
+    assert_eq!(reconciled.input().path, target);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
+
+    fs::remove_dir_all(root).unwrap();
+}
