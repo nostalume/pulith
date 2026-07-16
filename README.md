@@ -63,8 +63,10 @@ Build an `Intent`, attach a typed source, select it, then pass the node through 
 
 - final destination writes are staged before publication where the concrete behavior supports it;
 - archive traversal, symlink, hardlink, and unsupported entry types are rejected by default;
+- archive path collisions are rejected with portable case-folded identity on every platform;
 - archive extraction uses an exclusive destructive `ExtractWorkspace` before final `LocalApply` publication;
-- per-entry and total archive limits are enforced against observed decoded bytes, with declared-size mismatches rejected;
+- per-entry and total archive limits are enforced against observed materialized bytes, while decoded-container limits also bound TAR metadata, padding, and stripped entries;
+- declared-size mismatches are rejected, and extraction errors report any subsequent workspace-cleanup failure;
 - retry, resume, admission, and body-pacing decisions produce attempt evidence;
 - network `max_bytes` is checked before body pacing and persistence;
 - request admission and decoded-body pacing are separate shared resources;

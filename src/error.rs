@@ -29,6 +29,11 @@ pub enum PulithError {
         observed: u64,
     },
     ArchivePathConflict(PathBuf),
+    ArchiveCleanupFailed {
+        workspace: PathBuf,
+        extraction: Box<PulithError>,
+        cleanup: Box<PulithError>,
+    },
     UnsupportedArchiveEntry(PathBuf),
     InvalidPreparation(String),
     ApplyWouldOverwrite(PathBuf),
@@ -98,6 +103,15 @@ impl fmt::Display for PulithError {
             Self::ArchivePathConflict(path) => {
                 write!(f, "archive entries conflict at path: {}", path.display())
             }
+            Self::ArchiveCleanupFailed {
+                workspace,
+                extraction,
+                cleanup,
+            } => write!(
+                f,
+                "archive extraction failed ({extraction}) and cleanup of {} also failed ({cleanup})",
+                workspace.display()
+            ),
             Self::UnsupportedArchiveEntry(path) => {
                 write!(f, "archive entry is unsupported: {}", path.display())
             }
@@ -150,6 +164,7 @@ impl std::error::Error for PulithError {
         match self {
             #[cfg(feature = "net")]
             Self::NetAcquire(error) => Some(error.as_ref()),
+            Self::ArchiveCleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }

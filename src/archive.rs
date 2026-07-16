@@ -18,6 +18,71 @@ enum ArchiveEntryKind {
     Directory,
 }
 
+struct ArchiveCopyLimits {
+    observed_total: u64,
+    max_entry: Option<u64>,
+    max_total: Option<u64>,
+    max_decoded: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DecodedLimitExceeded {
+    actual: u64,
+    max: u64,
+}
+
+impl std::fmt::Display for DecodedLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "decoded archive byte limit exceeded")
+    }
+}
+
+impl std::error::Error for DecodedLimitExceeded {}
+
+#[cfg(feature = "tar")]
+struct DecodedLimitReader<R> {
+    inner: R,
+    observed: u64,
+    max: Option<u64>,
+}
+
+#[cfg(feature = "tar")]
+impl<R> DecodedLimitReader<R> {
+    fn new(inner: R, max: Option<u64>) -> Self {
+        Self {
+            inner,
+            observed: 0,
+            max,
+        }
+    }
+}
+
+#[cfg(feature = "tar")]
+impl<R: Read> Read for DecodedLimitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let capped_len = match self.max {
+            Some(max) => {
+                let remaining = max.saturating_sub(self.observed).saturating_add(1);
+                buffer
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX))
+            }
+            None => buffer.len(),
+        };
+        let read = self.inner.read(&mut buffer[..capped_len])?;
+        self.observed = self.observed.saturating_add(read as u64);
+        if let Some(max) = self.max
+            && self.observed > max
+        {
+            return Err(io::Error::other(DecodedLimitExceeded {
+                actual: self.observed,
+                max,
+            }));
+        }
+        Ok(read)
+    }
+}
+
 #[cfg(feature = "zip")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Zip;
@@ -50,6 +115,7 @@ pub struct ArchivePolicy {
     pub max_entries: Option<u64>,
     pub max_entry_bytes: Option<u64>,
     pub max_total_bytes: Option<u64>,
+    pub max_decoded_bytes: Option<u64>,
 }
 
 impl ArchivePolicy {
@@ -76,6 +142,11 @@ impl ArchivePolicy {
         self.max_total_bytes = Some(max_total_bytes);
         self
     }
+
+    pub fn max_decoded_bytes(mut self, max_decoded_bytes: u64) -> Self {
+        self.max_decoded_bytes = Some(max_decoded_bytes);
+        self
+    }
 }
 
 impl Default for ArchivePolicy {
@@ -85,6 +156,7 @@ impl Default for ArchivePolicy {
             max_entries: Some(16_384),
             max_entry_bytes: Some(4 * 1024 * 1024 * 1024),
             max_total_bytes: Some(4 * 1024 * 1024 * 1024),
+            max_decoded_bytes: Some(8 * 1024 * 1024 * 1024),
         }
     }
 }
@@ -130,6 +202,7 @@ pub struct ArchiveEvidence<A> {
     pub root: PathBuf,
     pub entries: u64,
     pub total_bytes: u64,
+    pub decoded_bytes: u64,
     pub files: u64,
     pub directories: u64,
     pub symlinks: u64,
@@ -142,6 +215,7 @@ impl<A> ArchiveEvidence<A> {
             root: root.into(),
             entries: 0,
             total_bytes: 0,
+            decoded_bytes: 0,
             files: 0,
             directories: 0,
             symlinks: 0,
@@ -289,8 +363,8 @@ fn prepare_archive<I, E, A>(
     let evidence = match extract(&node.material.path, &root, &policy) {
         Ok(evidence) => evidence,
         Err(error) => {
-            let _ = reset_extract_root(&root);
-            return Err(error);
+            let cleanup = reset_extract_root(&root);
+            return Err(combine_archive_failure(&root, error, cleanup));
         }
     };
 
@@ -299,6 +373,21 @@ fn prepare_archive<I, E, A>(
         ArchiveTree::new(root),
         EvidenceChain::new(node.evidence, evidence),
     ))
+}
+
+fn combine_archive_failure(
+    workspace: &Path,
+    extraction: PulithError,
+    cleanup: Result<(), PulithError>,
+) -> PulithError {
+    match cleanup {
+        Ok(()) => extraction,
+        Err(cleanup) => PulithError::ArchiveCleanupFailed {
+            workspace: workspace.to_path_buf(),
+            extraction: Box::new(extraction),
+            cleanup: Box::new(cleanup),
+        },
+    }
 }
 
 #[cfg(feature = "zip")]
@@ -370,9 +459,12 @@ fn extract_zip(
             &target,
             &relative,
             declared,
-            evidence.total_bytes,
-            policy.max_entry_bytes,
-            policy.max_total_bytes,
+            ArchiveCopyLimits {
+                observed_total: evidence.total_bytes,
+                max_entry: policy.max_entry_bytes,
+                max_total: policy.max_total_bytes,
+                max_decoded: policy.max_decoded_bytes,
+            },
         )?;
         evidence.files += 1;
         evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
@@ -382,6 +474,7 @@ fn extract_zip(
                 max: policy.max_total_bytes.unwrap_or(u64::MAX),
             },
         )?;
+        evidence.decoded_bytes = evidence.total_bytes;
     }
 
     Ok(evidence)
@@ -439,21 +532,22 @@ fn extract_tar_reader<A, R: Read>(
     root: &Path,
     policy: &ArchivePolicy,
 ) -> Result<ArchiveEvidence<A>, PulithError> {
+    let reader = DecodedLimitReader::new(reader, policy.max_decoded_bytes);
     let mut archive = tar::Archive::new(reader);
     let mut evidence = ArchiveEvidence::empty(root);
     let mut paths = BTreeMap::new();
     let entries = archive
         .entries()
-        .map_err(|err| PulithError::io("read tar archive", root, err))?;
+        .map_err(|err| archive_io_error("read tar archive", root, err))?;
 
     for entry in entries {
         evidence.entries += 1;
         check_limit("entry-count", evidence.entries, policy.max_entries)?;
 
-        let mut entry = entry.map_err(|err| PulithError::io("read tar entry", root, err))?;
+        let mut entry = entry.map_err(|err| archive_io_error("read tar entry", root, err))?;
         let raw_path = entry
             .path()
-            .map_err(|_| PulithError::ArchiveInvalidPath("invalid tar entry path".into()))?
+            .map_err(|err| archive_io_error("read tar entry path", root, err))?
             .into_owned();
         let Some(relative) = sanitize_relative(&raw_path, policy.strip_components)? else {
             continue;
@@ -504,9 +598,12 @@ fn extract_tar_reader<A, R: Read>(
             &target,
             &relative,
             declared,
-            evidence.total_bytes,
-            policy.max_entry_bytes,
-            policy.max_total_bytes,
+            ArchiveCopyLimits {
+                observed_total: evidence.total_bytes,
+                max_entry: policy.max_entry_bytes,
+                max_total: policy.max_total_bytes,
+                max_decoded: None,
+            },
         )?;
         evidence.files += 1;
         evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
@@ -518,6 +615,12 @@ fn extract_tar_reader<A, R: Read>(
         )?;
     }
 
+    evidence.decoded_bytes = archive.into_inner().observed;
+    check_limit(
+        "decoded-bytes",
+        evidence.decoded_bytes,
+        policy.max_decoded_bytes,
+    )?;
     Ok(evidence)
 }
 
@@ -553,7 +656,6 @@ fn record_archive_path(
     Ok(())
 }
 
-#[cfg(windows)]
 fn archive_collision_key(path: &Path) -> PathBuf {
     path.components()
         .filter_map(|component| match component {
@@ -563,28 +665,32 @@ fn archive_collision_key(path: &Path) -> PathBuf {
         .collect()
 }
 
-#[cfg(not(windows))]
-fn archive_collision_key(path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
 fn copy_archive_file<R: Read>(
     reader: &mut R,
     target: &Path,
     relative: &Path,
     declared: u64,
-    observed_total: u64,
-    max_entry: Option<u64>,
-    max_total: Option<u64>,
+    limits: ArchiveCopyLimits,
 ) -> Result<u64, PulithError> {
+    let ArchiveCopyLimits {
+        observed_total,
+        max_entry,
+        max_total,
+        max_decoded,
+    } = limits;
     let mut output =
         File::create(target).map_err(|err| PulithError::io("create archive file", target, err))?;
     let total_remaining = max_total.map(|max| max.saturating_sub(observed_total));
-    let remaining = match (max_entry, total_remaining) {
-        (Some(entry), Some(total)) => Some(entry.min(total)),
-        (Some(entry), None) => Some(entry),
-        (None, Some(total)) => Some(total),
-        (None, None) => None,
+    let decoded_remaining = max_decoded.map(|max| max.saturating_sub(observed_total));
+    let remaining = match (max_entry, total_remaining, decoded_remaining) {
+        (Some(entry), Some(total), Some(decoded)) => Some(entry.min(total).min(decoded)),
+        (Some(entry), Some(total), None) => Some(entry.min(total)),
+        (Some(entry), None, Some(decoded)) => Some(entry.min(decoded)),
+        (None, Some(total), Some(decoded)) => Some(total.min(decoded)),
+        (Some(entry), None, None) => Some(entry),
+        (None, Some(total), None) => Some(total),
+        (None, None, Some(decoded)) => Some(decoded),
+        (None, None, None) => None,
     };
     let copied = match remaining {
         Some(remaining) => io::copy(&mut reader.take(remaining.saturating_add(1)), &mut output),
@@ -595,7 +701,7 @@ fn copy_archive_file<R: Read>(
         Err(error) => {
             drop(output);
             let _ = fs::remove_file(target);
-            return Err(PulithError::io("extract archive file", target, error));
+            return Err(archive_io_error("extract archive file", target, error));
         }
     };
 
@@ -624,6 +730,19 @@ fn copy_archive_file<R: Read>(
         }
     }
 
+    if let Some(max) = max_decoded {
+        let actual = observed_total.saturating_add(observed);
+        if actual > max {
+            drop(output);
+            let _ = fs::remove_file(target);
+            return Err(PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual,
+                max,
+            });
+        }
+    }
+
     if observed != declared {
         drop(output);
         let _ = fs::remove_file(target);
@@ -635,6 +754,35 @@ fn copy_archive_file<R: Read>(
     }
 
     Ok(observed)
+}
+
+fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> PulithError {
+    if let Some(limit) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<DecodedLimitExceeded>())
+    {
+        return PulithError::ArchiveLimitExceeded {
+            limit: "decoded-bytes",
+            actual: limit.actual,
+            max: limit.max,
+        };
+    }
+
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if let Some(limit) = source.downcast_ref::<DecodedLimitExceeded>() {
+            return PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual: limit.actual,
+                max: limit.max,
+            };
+        }
+        let Some(next) = source.source() else {
+            break;
+        };
+        source = next;
+    }
+    PulithError::io(action, path, error)
 }
 
 fn check_limit(limit: &'static str, actual: u64, max: Option<u64>) -> Result<(), PulithError> {
@@ -701,13 +849,20 @@ fn validate_archive_component(component: &OsStr) -> Result<(), PulithError> {
         .unwrap_or_default()
         .trim_end_matches([' ', '.'])
         .to_ascii_uppercase();
-    let is_device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || stem.strip_prefix("COM").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        })
-        || stem.strip_prefix("LPT").is_some_and(|suffix| {
-            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-        });
+    let is_device = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || stem.strip_prefix("COM").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    }) || stem.strip_prefix("LPT").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    });
 
     if has_forbidden_character || has_unsafe_suffix || is_device {
         return Err(PulithError::ArchiveInvalidPath(value.into_owned()));
@@ -852,8 +1007,10 @@ mod local_apply {
 #[cfg(all(test, feature = "zip", feature = "local"))]
 mod tests {
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
+
+    use super::combine_archive_failure;
 
     use crate::{
         AcquireNode, ApplyNode, ArchiveNeed, ArchivePolicy, ArchivePrepare, CreateOrReplace,
@@ -869,6 +1026,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn archive_failure_preserves_cleanup_error() {
+        let workspace = PathBuf::from("extract");
+        let extraction = PulithError::InvalidPreparation("broken archive".into());
+        let cleanup = PulithError::io(
+            "clear archive root",
+            &workspace,
+            io::Error::new(io::ErrorKind::PermissionDenied, "locked"),
+        );
+
+        let error = combine_archive_failure(&workspace, extraction, Err(cleanup));
+
+        assert!(matches!(
+            error,
+            PulithError::ArchiveCleanupFailed {
+                workspace: path,
+                extraction,
+                cleanup,
+            } if path == workspace
+                && matches!(*extraction, PulithError::InvalidPreparation(_))
+                && matches!(*cleanup, PulithError::Io { .. })
+        ));
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
@@ -1172,7 +1353,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(windows)]
     #[test]
     fn zip_prepare_rejects_case_folded_path_collision() {
         let root = temp_root("case-folded-collision");
@@ -1197,7 +1377,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn zip_prepare_rejects_windows_device_and_stream_paths() {
-        for name in ["NUL.txt", "payload.txt:stream", "trailing."] {
+        for name in [
+            "NUL.txt",
+            "CONIN$",
+            "CONOUT$",
+            "COM¹.txt",
+            "LPT³.txt",
+            "payload.txt:stream",
+            "trailing.",
+        ] {
             let root = temp_root("windows-unsafe-path");
             let zip_path = root.join("payload.zip");
             let extract_root = root.join("extract");
@@ -1704,6 +1892,80 @@ mod tar_tests {
                 ..
             }
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn tar_gzip_prepare_limits_all_decoded_container_bytes() {
+        let root = temp_root("gzip-decoded-limit");
+        let tar_path = root.join("payload.tar.gz");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        let payload = vec![0; 32 * 1024];
+        write_tar_gzip(&tar_path, |builder| {
+            append_file(builder, "stripped/payload.bin", &payload)
+        });
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(
+                    ArchivePolicy::new()
+                        .strip_components(2)
+                        .max_decoded_bytes(1024),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                PulithError::ArchiveLimitExceeded {
+                    limit: "decoded-bytes",
+                    actual: 1025,
+                    max: 1024,
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn tar_gzip_prepare_limits_hidden_pax_bytes() {
+        let root = temp_root("gzip-pax-limit");
+        let tar_path = root.join("payload.tar.gz");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        let extension = vec![b'x'; 32 * 1024];
+        write_tar_gzip(&tar_path, |builder| {
+            builder
+                .append_pax_extensions([("comment", extension.as_slice())])
+                .unwrap();
+            append_file(builder, "payload.txt", b"ok");
+        });
+
+        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
+            .prepare_node(
+                verified,
+                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(1024)),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulithError::ArchiveLimitExceeded {
+                limit: "decoded-bytes",
+                actual: 1025,
+                max: 1024,
+            }
+        ));
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 

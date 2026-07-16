@@ -62,7 +62,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Reject same-file, directory-cycle, traversal, and symlink hazards where promised.
 - `ExtractWorkspace` is exclusive, destructive scratch; it is not a final destination.
 - Archive symlinks, hardlinks, devices, and unsafe paths are rejected by default.
-- Archive limits are enforced against observed decoded bytes, not metadata alone.
+- Archive path collisions use portable case-folded identity rather than the host volume's case-sensitivity.
+- Archive entry/total limits are enforced against observed materialized bytes, not metadata alone; decoded-container limits also bound TAR headers, padding, extensions, and stripped entries.
+- Extraction failures surface cleanup failures instead of silently leaving a contaminated `ExtractWorkspace`.
 - Never implement ZIP/TAR/DEFLATE/gzip/xz/zstd algorithms in Pulith.
 - Never report failure after successful publication merely because best-effort cleanup failed.
 - Local path safety assumes trusted parent directories; Pulith is not a hostile concurrent-filesystem sandbox.
