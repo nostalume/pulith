@@ -42,6 +42,7 @@ jobs:
       - name: Check smallest feature combinations
         shell: bash
         run: |
+          RUSTFLAGS="-D warnings" cargo check --no-default-features
           for feature in local net ureq reqwest hash blake3 sha2 zip tar gzip xz zstd; do
             RUSTFLAGS="-D warnings" cargo check --no-default-features --features "$feature"
           done

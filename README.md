@@ -124,9 +124,9 @@ behaviors until a concrete adapter justifies them.
 default = local
 
 network:
-  net -> local
-  ureq -> net
-  reqwest -> net + tokio
+  net
+  ureq -> net + local
+  reqwest -> net + local + tokio
 
 hashing:
   hash

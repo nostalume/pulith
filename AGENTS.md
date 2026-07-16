@@ -47,9 +47,9 @@ database, trust, or deployment implementation into Pulith's universal domain mod
 
 ```text
 default = local
-net -> local
-ureq -> net
-reqwest -> net + tokio
+net
+ureq -> net + local
+reqwest -> net + local + tokio
 blake3 -> hash
 sha2 -> hash
 zip -> local
