@@ -32,8 +32,8 @@
 //! publication, direct local forgetting, and in-memory remembering. A descriptor proves byte
 //! identity with a supplied expectation; it does not authenticate that expectation. Source
 //! discovery, trust authorization, durable lifecycle storage, dependency solving, multi-target
-//! transactions, and reconciliation are not provided; non-acquisition async traits remain
-//! caller-owned extension points until concrete requirements justify behavior and evidence laws.
+//! transactions, and reconciliation are not provided. Async execution is concrete only for HTTP
+//! acquisition; the other transitions currently expose synchronous behavior laws only.
 
 pub mod application;
 #[cfg(any(feature = "zip", feature = "tar"))]
@@ -66,9 +66,8 @@ pub use archive::{
 #[cfg(feature = "tar")]
 pub use archive::{Plain, Tar};
 pub use behavior::{
-    AcquireNode, Acquired, Applied, ApplyNode, AsyncAcquireNode, AsyncApplyNode, AsyncPrepareNode,
-    AsyncRememberNode, AsyncVerifyNode, Chosen, EvidenceChain, NoEvidence, PrepareNode, Prepared,
-    RememberNode, Remembered, SelectNode, Verified, VerifyNode,
+    AcquireNode, Acquired, Applied, ApplyNode, AsyncAcquireNode, Chosen, EvidenceChain, NoEvidence,
+    PrepareNode, Prepared, RememberNode, Remembered, SelectNode, Verified, VerifyNode,
 };
 pub use error::PulithError;
 pub use evidence::{

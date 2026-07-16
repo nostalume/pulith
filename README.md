@@ -42,11 +42,11 @@ manager. The concrete path currently supplied by this crate is:
 | `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
 | `Applied -> Remembered` | `MemoryRemember`, which carries the receipt and evidence in memory only |
 
-The asynchronous transition traits other than acquisition and custom remember behaviors are
-extension vocabulary. Pulith does not currently provide source discovery, dependency solving, a
-durable installation database, multi-target transactions, reconciliation, or system package-manager
-integration. Those require demonstrated callers and explicit storage/rollback laws; they are not
-hidden behind the existing state names.
+Async execution is concrete only for HTTP acquisition through `AsyncAcquireNode` and
+`ReqwestAcquire`; the other transitions currently expose synchronous behavior laws only. Pulith does
+not provide source discovery, dependency solving, a durable installation database, multi-target
+transactions, reconciliation, or system package-manager integration. Those require demonstrated
+callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
 
 `ArtifactDescriptor<A>` identifies one exact raw representation by digest and byte size, independent
 of whether it came from a local path, `ureq`, or `reqwest`. Descriptor equality proves only that the

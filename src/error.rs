@@ -13,7 +13,6 @@ use crate::net::AcquireError;
 pub enum PulithError {
     #[cfg(feature = "net")]
     NetAcquire(Box<AcquireError>),
-    EmptySourceOffer,
     MissingSource(PathBuf),
     DigestMismatch {
         expected: String,
@@ -85,7 +84,6 @@ impl fmt::Display for PulithError {
         match self {
             #[cfg(feature = "net")]
             Self::NetAcquire(error) => write!(f, "{error}"),
-            Self::EmptySourceOffer => write!(f, "no source was offered"),
             Self::MissingSource(path) => write!(f, "source does not exist: {}", path.display()),
             Self::DigestMismatch { expected, observed } => {
                 write!(

@@ -249,19 +249,6 @@ pub trait VerifyNode<N> {
     fn verify_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait AsyncVerifyNode<N> {
-    type Need;
-    type Evidence;
-    type Error;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
-    where
-        Self: 'a,
-        N: 'a;
-
-    fn verify_node_async(&self, node: N, need: Self::Need) -> Self::Future<'_>;
-}
-
 pub trait PrepareNode<N> {
     type Need;
     type Prepared;
@@ -270,20 +257,6 @@ pub trait PrepareNode<N> {
     type Output;
 
     fn prepare_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
-}
-
-pub trait AsyncPrepareNode<N> {
-    type Need;
-    type Prepared;
-    type Evidence;
-    type Error;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
-    where
-        Self: 'a,
-        N: 'a;
-
-    fn prepare_node_async(&self, node: N, need: Self::Need) -> Self::Future<'_>;
 }
 
 pub trait ApplyNode<N> {
@@ -295,35 +268,10 @@ pub trait ApplyNode<N> {
     fn apply_node(&self, node: N) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait AsyncApplyNode<N> {
-    type Receipt;
-    type Evidence;
-    type Error;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
-    where
-        Self: 'a,
-        N: 'a;
-
-    fn apply_node_async(&self, node: N) -> Self::Future<'_>;
-}
-
 pub trait RememberNode<N> {
     type Evidence;
     type Error;
     type Output;
 
     fn remember_node(&self, node: N) -> Result<Self::Output, Self::Error>;
-}
-
-pub trait AsyncRememberNode<N> {
-    type Evidence;
-    type Error;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
-    where
-        Self: 'a,
-        N: 'a;
-
-    fn remember_node_async(&self, node: N) -> Self::Future<'_>;
 }

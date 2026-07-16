@@ -44,8 +44,6 @@ impl ApplyEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalPlacement {
     Copied,
-    Hardlinked,
-    Mixed,
     Removed,
 }
 
