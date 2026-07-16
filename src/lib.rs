@@ -27,12 +27,13 @@
 //! # Current maturity
 //!
 //! The state types are composition vocabulary, not an implicit package-manager implementation.
-//! Pulith currently supplies concrete local/HTTP acquisition, identity or digest verification,
-//! identity or archive preparation, staged local publication, direct local forgetting, and
-//! in-memory remembering. Source discovery, durable lifecycle storage, dependency solving,
-//! multi-target transactions, and reconciliation are not provided; non-acquisition async traits
-//! remain caller-owned extension points until concrete requirements justify behavior and evidence
-//! laws.
+//! Pulith currently supplies concrete local/HTTP acquisition, identity, digest, or exact
+//! digest-plus-size descriptor verification, identity or archive preparation, staged local
+//! publication, direct local forgetting, and in-memory remembering. A descriptor proves byte
+//! identity with a supplied expectation; it does not authenticate that expectation. Source
+//! discovery, trust authorization, durable lifecycle storage, dependency solving, multi-target
+//! transactions, and reconciliation are not provided; non-acquisition async traits remain
+//! caller-owned extension points until concrete requirements justify behavior and evidence laws.
 
 pub mod application;
 #[cfg(any(feature = "zip", feature = "tar"))]
@@ -80,7 +81,8 @@ pub use hash::Blake3;
 pub use hash::Sha256;
 #[cfg(feature = "hash")]
 pub use hash::{
-    DigestAlgorithm, DigestEvidence, DigestNeed, DigestValue, HashVerify, NoHashResource,
+    ArtifactDescriptor, DescriptorEvidence, DescriptorVerify, DigestAlgorithm, DigestEvidence,
+    DigestNeed, DigestValue, HashVerify, NoHashResource,
 };
 #[cfg(feature = "local")]
 pub use local::{

@@ -53,6 +53,12 @@ jobs:
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features tar
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features gzip
 
+      - name: Test parent feature vocabulary
+        shell: bash
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features net
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features hash
+
       - name: Check package contents
         run: |
           cargo package --locked

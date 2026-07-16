@@ -91,6 +91,7 @@ pub enum TransportPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
     UnexpectedPartialResponse,
+    ResumeValidatorMismatch,
     InvalidContentRange {
         expected_start: u64,
         header: Option<String>,
@@ -208,7 +209,7 @@ impl std::error::Error for AcquireError {
 }
 
 impl AcquireError {
-    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "ureq", feature = "reqwest"))]
     fn local(
         url: Option<&RemoteUrl>,
         action: &'static str,
@@ -223,7 +224,7 @@ impl AcquireError {
         }
     }
 
-    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "ureq", feature = "reqwest"))]
     fn transport(
         url: &RemoteUrl,
         phase: TransportPhase,
@@ -719,6 +720,14 @@ impl RetryPolicy {
     }
 }
 
+/// Controls whether acquisition restarts or resumes from validator-bound bytes.
+///
+/// Resume without a strong validator is intentionally unavailable:
+///
+/// ```compile_fail
+/// use pulith::ResumePolicy;
+/// let _ = ResumePolicy::unvalidated("artifact.part");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResumePolicy {
     pub mode: ResumeMode,
@@ -737,14 +746,6 @@ impl ResumePolicy {
         }
     }
 
-    pub fn unvalidated(partial_path: impl Into<PathBuf>) -> Self {
-        Self {
-            mode: ResumeMode::Unvalidated {
-                partial_path: partial_path.into(),
-            },
-        }
-    }
-
     pub fn if_range(partial_path: impl Into<PathBuf>, validator: Validator) -> Self {
         Self {
             mode: ResumeMode::IfRange {
@@ -758,9 +759,6 @@ impl ResumePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResumeMode {
     RestartOnly,
-    Unvalidated {
-        partial_path: PathBuf,
-    },
     IfRange {
         partial_path: PathBuf,
         validator: Validator,
@@ -768,25 +766,53 @@ pub enum ResumeMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Validator {
-    Etag(String),
-    LastModified(SystemTime),
+pub struct Validator {
+    kind: ValidatorKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ValidatorKind {
+    StrongEtag(String),
+    StrongLastModified(SystemTime),
 }
 
 impl Validator {
+    /// Constructs a validator only from an RFC entity-tag that is syntactically valid and strong.
     pub fn strong_etag(value: impl Into<String>) -> Option<Self> {
-        parse_strong_etag(&value.into()).map(Self::Etag)
+        parse_strong_etag(&value.into()).map(|value| Self {
+            kind: ValidatorKind::StrongEtag(value),
+        })
     }
 
-    pub fn last_modified(time: SystemTime) -> Self {
-        Self::LastModified(time)
+    /// Constructs an RFC strong-date validator and normalizes both dates to HTTP-date seconds.
+    pub fn strong_last_modified(last_modified: SystemTime, date: SystemTime) -> Option<Self> {
+        let last_modified = normalize_http_date(last_modified)?;
+        let date = normalize_http_date(date)?;
+        date.duration_since(last_modified)
+            .ok()
+            .filter(|age| *age >= Duration::from_secs(60))
+            .map(|_| Self {
+                kind: ValidatorKind::StrongLastModified(last_modified),
+            })
     }
 
     #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
     fn if_range_value(&self) -> String {
-        match self {
-            Self::Etag(value) => value.clone(),
-            Self::LastModified(time) => httpdate::fmt_http_date(*time),
+        match &self.kind {
+            ValidatorKind::StrongEtag(value) => value.clone(),
+            ValidatorKind::StrongLastModified(time) => httpdate::fmt_http_date(*time),
+        }
+    }
+
+    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+    fn permits_response(&self, etag: Option<&str>, last_modified: Option<&str>) -> bool {
+        match &self.kind {
+            ValidatorKind::StrongEtag(expected) => etag
+                .map(|value| parse_strong_etag(value).as_ref() == Some(expected))
+                .unwrap_or(true),
+            ValidatorKind::StrongLastModified(expected) => last_modified
+                .map(|value| httpdate::parse_http_date(value).ok().as_ref() == Some(expected))
+                .unwrap_or(true),
         }
     }
 }
@@ -842,7 +868,7 @@ pub struct ResumeEvidence {
     pub outcome: ResumeOutcome,
     pub partial_path: PathBuf,
     pub partial_bytes: u64,
-    pub validator: Option<Validator>,
+    pub validator: Validator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1094,9 +1120,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
             }
             if let Some(resume) = &resume_context {
                 request = request.header("Range", format!("bytes={}-", resume.partial_bytes));
-                if let Some(validator) = &resume.validator {
-                    request = request.header("If-Range", validator.if_range_value());
-                }
+                request = request.header("If-Range", resume.validator.if_range_value());
             }
             let mut request_config = request.config().http_status_as_error(false);
             if let Some(timeout) = source.policy.timeout {
@@ -1144,6 +1168,10 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                 response
                     .headers()
                     .get("last-modified")
+                    .and_then(|value| value.to_str().ok()),
+                response
+                    .headers()
+                    .get("date")
                     .and_then(|value| value.to_str().ok()),
             );
             if status == 416
@@ -1222,24 +1250,43 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                             attempts: attempts.clone(),
                             resume: resume.clone(),
                         })?;
+                let response_etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok());
+                let response_last_modified = response
+                    .headers()
+                    .get("last-modified")
+                    .and_then(|value| value.to_str().ok());
+                if !resume_context
+                    .validator
+                    .permits_response(response_etag, response_last_modified)
+                {
+                    return Err(AcquireError::Protocol {
+                        url: source.url.as_url().clone(),
+                        kind: ProtocolError::ResumeValidatorMismatch,
+                        attempts: attempts.clone(),
+                        resume: resume.clone(),
+                    });
+                }
                 let content_range = response
                     .headers()
                     .get("content-range")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
-                content_range
+                let parsed_range = content_range
                     .as_deref()
                     .and_then(|value| parse_content_range(value, resume_context.partial_bytes))
                     .ok_or_else(|| AcquireError::Protocol {
                         url: source.url.as_url().clone(),
                         kind: ProtocolError::InvalidContentRange {
                             expected_start: resume_context.partial_bytes,
-                            header: content_range,
+                            header: content_range.clone(),
                         },
                         attempts: attempts.clone(),
                         resume: resume.clone(),
                     })?;
-                Some(resume_context.clone())
+                Some((resume_context.clone(), parsed_range, content_range))
             } else {
                 if let Some(resume_context) = resume_context {
                     resume =
@@ -1251,7 +1298,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
             let mut temp = tempfile::NamedTempFile::new_in(&parent).map_err(|err| {
                 AcquireError::local(Some(&source.url), "create download temp file", &parent, err)
             })?;
-            let initial_bytes = if let Some(resume_context) = &append_resume {
+            let initial_bytes = if let Some((resume_context, _, _)) = &append_resume {
                 let mut partial_file =
                     std::fs::File::open(&resume_context.partial_path).map_err(|err| {
                         AcquireError::local(
@@ -1268,8 +1315,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                         temp.path(),
                         err,
                     )
-                })?;
-                resume_context.partial_bytes
+                })?
             } else {
                 0
             };
@@ -1376,6 +1422,20 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                     });
                 }
             };
+            if let Some((resume_context, parsed_range, content_range)) = &append_resume
+                && !parsed_range
+                    .matches_materialized_bytes(resume_context.partial_bytes, copy.bytes)
+            {
+                return Err(AcquireError::Protocol {
+                    url: source.url.as_url().clone(),
+                    kind: ProtocolError::InvalidContentRange {
+                        expected_start: resume_context.partial_bytes,
+                        header: content_range.clone(),
+                    },
+                    attempts,
+                    resume,
+                });
+            }
             temp.as_file_mut().flush().map_err(|err| {
                 AcquireError::local(
                     Some(&source.url),
@@ -1393,7 +1453,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                     err.error,
                 )
             })?;
-            if let Some(resume_context) = append_resume {
+            if let Some((resume_context, _, _)) = append_resume {
                 resume = Some(resume_context.into_evidence(ResumeOutcome::PartialAppended));
             }
 
@@ -1582,9 +1642,7 @@ async fn acquire_reqwest<I>(
                 reqwest::header::RANGE,
                 format!("bytes={}-", resume.partial_bytes),
             );
-            if let Some(validator) = &resume.validator {
-                request = request.header(reqwest::header::IF_RANGE, validator.if_range_value());
-            }
+            request = request.header(reqwest::header::IF_RANGE, resume.validator.if_range_value());
         }
         if let Some(timeout) = source.policy.timeout {
             request = request.timeout(timeout);
@@ -1628,6 +1686,10 @@ async fn acquire_reqwest<I>(
             response
                 .headers()
                 .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok()),
+            response
+                .headers()
+                .get(reqwest::header::DATE)
                 .and_then(|value| value.to_str().ok()),
         );
         if status == 416
@@ -1702,24 +1764,43 @@ async fn acquire_reqwest<I>(
                     attempts: attempts.clone(),
                     resume: resume.clone(),
                 })?;
+            let response_etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok());
+            let response_last_modified = response
+                .headers()
+                .get(reqwest::header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok());
+            if !resume_context
+                .validator
+                .permits_response(response_etag, response_last_modified)
+            {
+                return Err(AcquireError::Protocol {
+                    url: source.url.as_url().clone(),
+                    kind: ProtocolError::ResumeValidatorMismatch,
+                    attempts: attempts.clone(),
+                    resume: resume.clone(),
+                });
+            }
             let content_range = response
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            content_range
+            let parsed_range = content_range
                 .as_deref()
                 .and_then(|value| parse_content_range(value, resume_context.partial_bytes))
                 .ok_or_else(|| AcquireError::Protocol {
                     url: source.url.as_url().clone(),
                     kind: ProtocolError::InvalidContentRange {
                         expected_start: resume_context.partial_bytes,
-                        header: content_range,
+                        header: content_range.clone(),
                     },
                     attempts: attempts.clone(),
                     resume: resume.clone(),
                 })?;
-            Some(resume_context.clone())
+            Some((resume_context.clone(), parsed_range, content_range))
         } else {
             if let Some(resume_context) = resume_context {
                 resume = Some(resume_context.into_evidence(ResumeOutcome::RangeIgnoredRestarted));
@@ -1727,7 +1808,7 @@ async fn acquire_reqwest<I>(
             None
         };
 
-        let mut stage = if let Some(resume_context) = &append_resume {
+        let mut stage = if let Some((resume_context, _, _)) = &append_resume {
             StagedDownload::<Open>::from_partial(&parent, &resume_context.partial_path).await?
         } else {
             StagedDownload::<Open>::new_in(&parent)?
@@ -1844,10 +1925,23 @@ async fn acquire_reqwest<I>(
             }
         }
         let bytes = stage.bytes;
+        if let Some((resume_context, parsed_range, content_range)) = &append_resume
+            && !parsed_range.matches_materialized_bytes(resume_context.partial_bytes, bytes)
+        {
+            return Err(AcquireError::Protocol {
+                url: source.url.as_url().clone(),
+                kind: ProtocolError::InvalidContentRange {
+                    expected_start: resume_context.partial_bytes,
+                    header: content_range.clone(),
+                },
+                attempts,
+                resume,
+            });
+        }
         let pacing_wait = stage.pacing_wait;
         let stage = stage.finish().await?;
         stage.persist(&source.destination)?;
-        if let Some(resume_context) = append_resume {
+        if let Some((resume_context, _, _)) = append_resume {
             resume = Some(resume_context.into_evidence(ResumeOutcome::PartialAppended));
         }
 
@@ -2036,7 +2130,7 @@ fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     policy.max_delay.map_or(delay, |max| delay.min(max))
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
 fn planned_retry_delay(
     policy: RetryPolicy,
     retry_index: u32,
@@ -2065,15 +2159,15 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
         .and_then(|retry_at| retry_at.duration_since(now).ok())
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedResume {
     partial_path: PathBuf,
     partial_bytes: u64,
-    validator: Option<Validator>,
+    validator: Validator,
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
 impl PlannedResume {
     fn into_evidence(self, outcome: ResumeOutcome) -> ResumeEvidence {
         ResumeEvidence {
@@ -2085,15 +2179,14 @@ impl PlannedResume {
     }
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "ureq", feature = "reqwest"))]
 fn planned_resume(policy: &ResumePolicy) -> Option<PlannedResume> {
     let (partial_path, validator) = match &policy.mode {
         ResumeMode::RestartOnly => return None,
-        ResumeMode::Unvalidated { partial_path } => (partial_path.clone(), None),
         ResumeMode::IfRange {
             partial_path,
             validator,
-        } => (partial_path.clone(), Some(validator.clone())),
+        } => (partial_path.clone(), validator.clone()),
     };
     let partial_bytes = std::fs::metadata(&partial_path).ok()?.len();
     (partial_bytes > 0).then_some(PlannedResume {
@@ -2103,28 +2196,66 @@ fn planned_resume(policy: &ResumePolicy) -> Option<PlannedResume> {
     })
 }
 
+fn normalize_http_date(time: SystemTime) -> Option<SystemTime> {
+    const HTTP_DATE_UPPER_BOUND: u64 = 253_402_300_800;
+
+    let seconds = time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    (seconds < HTTP_DATE_UPPER_BOUND).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
 fn parse_strong_etag(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with("W/") || value.starts_with("w/") {
         return None;
     }
-    (value.len() >= 2 && value.starts_with('"') && value.ends_with('"')).then(|| value.to_string())
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'"') || bytes.last() != Some(&b'"') {
+        return None;
+    }
+    bytes[1..bytes.len() - 1]
+        .iter()
+        .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
+        .then(|| value.to_string())
 }
 
 #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn selected_response_validator(
     etag: Option<&str>,
     last_modified: Option<&str>,
+    date: Option<&str>,
 ) -> Option<Validator> {
     etag.and_then(Validator::strong_etag).or_else(|| {
-        last_modified
-            .and_then(|value| httpdate::parse_http_date(value).ok())
-            .map(Validator::LastModified)
+        let last_modified =
+            last_modified.and_then(|value| httpdate::parse_http_date(value).ok())?;
+        let date = date.and_then(|value| httpdate::parse_http_date(value).ok())?;
+        Validator::strong_last_modified(last_modified, date)
     })
 }
 
 #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
-fn parse_content_range(value: &str, expected_start: u64) -> Option<(u64, Option<u64>)> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedContentRange {
+    end: u64,
+    total: u64,
+}
+
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+impl ParsedContentRange {
+    fn matches_materialized_bytes(self, start: u64, materialized_bytes: u64) -> bool {
+        let Some(fragment_bytes) = self
+            .end
+            .checked_sub(start)
+            .and_then(|bytes| bytes.checked_add(1))
+        else {
+            return false;
+        };
+        materialized_bytes.checked_sub(start) == Some(fragment_bytes)
+            && materialized_bytes == self.total
+    }
+}
+
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+fn parse_content_range(value: &str, expected_start: u64) -> Option<ParsedContentRange> {
     let range = value.trim().strip_prefix("bytes ")?;
     let (span, total) = range.split_once('/')?;
     let (start, end) = span.split_once('-')?;
@@ -2133,17 +2264,11 @@ fn parse_content_range(value: &str, expected_start: u64) -> Option<(u64, Option<
     if start != expected_start || end < start {
         return None;
     }
-    let total = if total == "*" {
-        None
-    } else {
-        Some(total.parse::<u64>().ok()?)
-    };
-    if let Some(total) = total
-        && (end >= total || expected_start > total)
-    {
+    let total = total.parse::<u64>().ok()?;
+    if end >= total || expected_start > total || end.checked_add(1) != Some(total) {
         return None;
     }
-    Some((end, total))
+    Some(ParsedContentRange { end, total })
 }
 
 #[cfg(feature = "ureq")]
@@ -2353,15 +2478,25 @@ mod tests {
         feature = "blake3"
     ))]
     use crate::{
-        ApplyNode, Blake3, CreateOrReplace, DigestNeed, HashVerify, IdentityPrepare, LocalApply,
-        PrepareNode, VerifyNode,
+        ApplyNode, ArtifactDescriptor, Blake3, CreateOrReplace, DescriptorVerify, DigestNeed,
+        HashVerify, IdentityPrepare, LocalApply, PrepareNode, VerifyNode,
     };
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use crate::{Intent, Item, LocalTarget};
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::io::Write as TestWrite;
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::io::{BufRead, BufReader};
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::net::{TcpListener, TcpStream};
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::sync::{Arc as TestArc, Mutex, mpsc};
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::thread;
+
+    fn test_validator() -> Validator {
+        Validator::strong_etag("\"abc\"").unwrap()
+    }
 
     #[cfg(feature = "ureq")]
     struct TestSyncAdmission {
@@ -2738,16 +2873,10 @@ mod tests {
     }
 
     #[test]
-    fn resume_policy_modes_encode_restart_unvalidated_and_if_range() {
+    fn resume_policy_encodes_restart_and_if_range() {
         let partial = PathBuf::from("artifact.part");
-        let validator = Validator::Etag("\"abc\"".to_string());
+        let validator = test_validator();
 
-        assert_eq!(
-            ResumePolicy::unvalidated(&partial).mode,
-            ResumeMode::Unvalidated {
-                partial_path: partial.clone()
-            }
-        );
         assert_eq!(
             ResumePolicy::if_range(&partial, validator.clone()).mode,
             ResumeMode::IfRange {
@@ -2759,29 +2888,97 @@ mod tests {
 
     #[test]
     fn strong_etag_parser_rejects_weak_etag() {
-        assert_eq!(
-            Validator::strong_etag("\"abc\""),
-            Some(Validator::Etag("\"abc\"".to_string()))
-        );
+        assert_eq!(Validator::strong_etag("\"abc\""), Some(test_validator()));
         assert_eq!(Validator::strong_etag("W/\"abc\""), None);
     }
 
     #[test]
+    fn strong_etag_parser_rejects_invalid_entity_tag_characters() {
+        assert_eq!(Validator::strong_etag("\"a b\""), None);
+        assert_eq!(Validator::strong_etag("\"a\"b\""), None);
+        assert_eq!(Validator::strong_etag("\"a\u{7f}b\""), None);
+        assert_eq!(Validator::strong_etag("\"a\nb\""), None);
+        assert!(Validator::strong_etag("\"!#~é\"").is_some());
+    }
+
+    #[test]
+    fn strong_last_modified_requires_the_rfc_date_gap() {
+        let last_modified = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            Validator::strong_last_modified(last_modified, last_modified + Duration::from_secs(59)),
+            None
+        );
+        assert!(
+            Validator::strong_last_modified(last_modified, last_modified + Duration::from_secs(60))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn strong_last_modified_normalizes_to_http_date_precision() {
+        let last_modified =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000) + Duration::from_millis(500);
+        let date = last_modified + Duration::from_secs(60);
+        let validator = Validator::strong_last_modified(last_modified, date).unwrap();
+        let encoded = httpdate::fmt_http_date(last_modified);
+
+        assert_eq!(validator.if_range_value(), encoded);
+        assert!(validator.permits_response(None, Some(&encoded)));
+    }
+
+    #[test]
+    fn strong_last_modified_rejects_times_outside_http_date_range() {
+        assert_eq!(
+            Validator::strong_last_modified(
+                SystemTime::UNIX_EPOCH - Duration::from_secs(1),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            ),
+            None
+        );
+        let after_http_date = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800);
+        assert_eq!(
+            Validator::strong_last_modified(after_http_date, after_http_date),
+            None
+        );
+    }
+
+    #[test]
     fn selected_response_validator_prefers_strong_etag_over_last_modified() {
-        let validator =
-            selected_response_validator(Some("\"abc\""), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
-        assert_eq!(validator, Some(Validator::Etag("\"abc\"".to_string())));
-        assert!(matches!(
-            selected_response_validator(None, Some("Wed, 21 Oct 2015 07:28:00 GMT")),
-            Some(Validator::LastModified(_))
-        ));
+        let last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let date = "Wed, 21 Oct 2015 07:30:00 GMT";
+        assert_eq!(
+            selected_response_validator(Some("\"abc\""), Some(last_modified), Some(date)),
+            Some(test_validator())
+        );
+        assert!(selected_response_validator(None, Some(last_modified), Some(date)).is_some());
+        assert_eq!(
+            selected_response_validator(None, Some(last_modified), None),
+            None
+        );
     }
 
     #[test]
     fn content_range_requires_expected_resume_start() {
-        assert_eq!(parse_content_range("bytes 5-9/10", 5), Some((9, Some(10))));
+        assert_eq!(
+            parse_content_range("bytes 5-9/10", 5),
+            Some(ParsedContentRange { end: 9, total: 10 })
+        );
         assert_eq!(parse_content_range("bytes 4-9/10", 5), None);
-        assert_eq!(parse_content_range("bytes 5-9/*", 5), Some((9, None)));
+        assert_eq!(parse_content_range("bytes 5-9/*", 5), None);
+    }
+
+    #[test]
+    fn content_range_requires_a_known_terminal_interval() {
+        assert_eq!(parse_content_range("bytes 5-7/11", 5), None);
+        assert_eq!(parse_content_range("bytes 5-10/*", 5), None);
+    }
+
+    #[test]
+    fn content_range_must_match_observed_fragment_bytes() {
+        let range = parse_content_range("bytes 5-7/8", 5).unwrap();
+        assert!(range.matches_materialized_bytes(5, 8));
+        assert!(!range.matches_materialized_bytes(5, 7));
+        assert!(!range.matches_materialized_bytes(5, 9));
     }
 
     #[test]
@@ -3276,7 +3473,8 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
-        let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
         let chosen = crate::Chosen {
@@ -3306,7 +3504,8 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"stale").unwrap();
-        let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
         let chosen = crate::Chosen {
@@ -3329,13 +3528,50 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
+    fn ureq_resume_416_restarts_once_without_range_headers() {
+        let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("artifact.bin");
+        let partial = temp.path().join("artifact.part");
+        std::fs::write(&partial, b"stale partial").unwrap();
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+        let source =
+            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let chosen = crate::Chosen {
+            input: Intent::new(
+                Item::new("artifact"),
+                LocalTarget::new(temp.path().join("out")),
+            ),
+            source,
+        };
+
+        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let first_request = server.next_request();
+        let second_request = server.next_request();
+        server.join();
+
+        assert!(request_has_header_name(&first_request, "Range"));
+        assert!(request_has_header_name(&first_request, "If-Range"));
+        assert!(!request_has_header_name(&second_request, "Range"));
+        assert!(!request_has_header_name(&second_request, "If-Range"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+        assert_eq!(
+            acquired.evidence.resume.unwrap().outcome,
+            ResumeOutcome::RangeUnsatisfiableRestarted
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
     fn ureq_resume_missing_content_range_rejects_without_persist() {
         let server = serve_sequence(vec![(206, b" world", &[])]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
-        let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
         let chosen = crate::Chosen {
@@ -3362,17 +3598,91 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
+    fn ureq_resume_rejects_body_shorter_than_declared_range() {
+        let server = serve_sequence(vec![(206, b" wo", &[("Content-Range", "bytes 5-10/11")])]);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("artifact.bin");
+        let partial = temp.path().join("artifact.part");
+        std::fs::write(&partial, b"hello").unwrap();
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+        let source =
+            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let chosen = crate::Chosen {
+            input: Intent::new(
+                Item::new("artifact"),
+                LocalTarget::new(temp.path().join("out")),
+            ),
+            source,
+        };
+
+        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        server.join();
+
+        assert!(matches!(
+            error,
+            AcquireError::Protocol {
+                kind: ProtocolError::InvalidContentRange { .. },
+                ..
+            }
+        ));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_resume_rejects_partial_changed_after_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("artifact.bin");
+        let partial = temp.path().join("artifact.part");
+        std::fs::write(&partial, b"hello").unwrap();
+        let partial_to_truncate = partial.clone();
+        let server = serve_once_with_before_response(
+            206,
+            b" world",
+            &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
+            move || std::fs::write(partial_to_truncate, b"hel").unwrap(),
+        );
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+        let source =
+            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let chosen = crate::Chosen {
+            input: Intent::new(
+                Item::new("artifact"),
+                LocalTarget::new(temp.path().join("out")),
+            ),
+            source,
+        };
+
+        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        server.join();
+
+        assert!(matches!(
+            error,
+            AcquireError::Protocol {
+                kind: ProtocolError::InvalidContentRange { .. },
+                ..
+            }
+        ));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"hel");
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
     fn ureq_if_range_resume_sends_range_and_if_range_and_appends_206() {
         let server = serve_sequence(vec![(
             206,
             b" world",
-            &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"next\"")],
+            &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
         )]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
-        let validator = Validator::Etag("\"abc\"".to_string());
+        let validator = test_validator();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
         let source =
@@ -3394,26 +3704,24 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
         let resume = acquired.evidence.resume.unwrap();
         assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
-        assert_eq!(resume.validator, Some(validator));
-        assert_eq!(
-            acquired.evidence.validator,
-            Some(Validator::Etag("\"next\"".to_string()))
-        );
+        assert_eq!(resume.validator, validator);
+        assert_eq!(acquired.evidence.validator, Some(test_validator()));
     }
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_unvalidated_resume_sends_range_without_if_range() {
+    fn ureq_if_range_rejects_conflicting_response_validator() {
         let server = serve_sequence(vec![(
             206,
             b" world",
-            &[("Content-Range", "bytes 5-10/11")],
+            &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"next\"")],
         )]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
-        let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+        let policy =
+            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
         let chosen = crate::Chosen {
@@ -3424,14 +3732,18 @@ mod tests {
             source,
         };
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
-        let request = server.next_request();
+        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
         server.join();
 
-        assert!(request_has_header(&request, "range", "bytes=5-"));
-        assert!(!request_has_header_name(&request, "if-range"));
-        assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
-        assert_eq!(acquired.evidence.resume.unwrap().validator, None);
+        assert!(matches!(
+            error,
+            AcquireError::Protocol {
+                kind: ProtocolError::ResumeValidatorMismatch,
+                ..
+            }
+        ));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
     }
 
     #[test]
@@ -3931,7 +4243,8 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"hello").unwrap();
-            let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
             let chosen = crate::Chosen {
@@ -3959,18 +4272,102 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
+    fn reqwest_resume_rejects_body_shorter_than_declared_range() {
+        block_on_reqwest(async {
+            let server = serve_sequence(vec![(206, b" wo", &[("Content-Range", "bytes 5-10/11")])]);
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("artifact.bin");
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"hello").unwrap();
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+                .policy(policy);
+            let chosen = crate::Chosen {
+                input: Intent::new(
+                    Item::new("artifact"),
+                    LocalTarget::new(temp.path().join("out")),
+                ),
+                source,
+            };
+
+            let error = ReqwestAcquire::new()
+                .acquire_node_async(chosen)
+                .await
+                .unwrap_err();
+            server.join();
+
+            assert!(matches!(
+                error,
+                AcquireError::Protocol {
+                    kind: ProtocolError::InvalidContentRange { .. },
+                    ..
+                }
+            ));
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_resume_rejects_partial_changed_after_request() {
+        block_on_reqwest(async {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("artifact.bin");
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"hello").unwrap();
+            let partial_to_truncate = partial.clone();
+            let server = serve_once_with_before_response(
+                206,
+                b" world",
+                &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
+                move || std::fs::write(partial_to_truncate, b"hel").unwrap(),
+            );
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+                .policy(policy);
+            let chosen = crate::Chosen {
+                input: Intent::new(
+                    Item::new("artifact"),
+                    LocalTarget::new(temp.path().join("out")),
+                ),
+                source,
+            };
+
+            let error = ReqwestAcquire::new()
+                .acquire_node_async(chosen)
+                .await
+                .unwrap_err();
+            server.join();
+
+            assert!(matches!(
+                error,
+                AcquireError::Protocol {
+                    kind: ProtocolError::InvalidContentRange { .. },
+                    ..
+                }
+            ));
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hel");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
     fn reqwest_if_range_resume_sends_range_and_if_range_and_appends_206() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(
                 206,
                 b" world",
-                &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"next\"")],
+                &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
             )]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"hello").unwrap();
-            let validator = Validator::Etag("\"abc\"".to_string());
+            let validator = test_validator();
             let policy = AcquirePolicy::default()
                 .resume(ResumePolicy::if_range(&partial, validator.clone()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
@@ -3995,24 +4392,65 @@ mod tests {
             assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
             let resume = acquired.evidence.resume.unwrap();
             assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
-            assert_eq!(resume.validator, Some(validator));
-            assert_eq!(
-                acquired.evidence.validator,
-                Some(Validator::Etag("\"next\"".to_string()))
-            );
+            assert_eq!(resume.validator, validator);
+            assert_eq!(acquired.evidence.validator, Some(test_validator()));
         });
     }
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_resume_416_restarts_once_without_persisting_partial() {
+    fn reqwest_if_range_rejects_conflicting_response_validator() {
         block_on_reqwest(async {
-            let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
+            let server = serve_sequence(vec![(
+                206,
+                b" world",
+                &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"next\"")],
+            )]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
-            std::fs::write(&partial, b"stale partial").unwrap();
-            let policy = AcquirePolicy::default().resume(ResumePolicy::unvalidated(&partial));
+            std::fs::write(&partial, b"hello").unwrap();
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+                .policy(policy);
+            let chosen = crate::Chosen {
+                input: Intent::new(
+                    Item::new("artifact"),
+                    LocalTarget::new(temp.path().join("out")),
+                ),
+                source,
+            };
+
+            let error = ReqwestAcquire::new()
+                .acquire_node_async(chosen)
+                .await
+                .unwrap_err();
+            server.join();
+
+            assert!(matches!(
+                error,
+                AcquireError::Protocol {
+                    kind: ProtocolError::ResumeValidatorMismatch,
+                    ..
+                }
+            ));
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_resume_200_to_range_restarts_full_with_fresh_stage() {
+        block_on_reqwest(async {
+            let server = serve_sequence(vec![(200, b"fresh", &[])]);
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("artifact.bin");
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"stale").unwrap();
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
             let chosen = crate::Chosen {
@@ -4032,6 +4470,47 @@ mod tests {
             assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
             assert_eq!(
                 acquired.evidence.resume.unwrap().outcome,
+                ResumeOutcome::RangeIgnoredRestarted
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_resume_416_restarts_once_without_persisting_partial() {
+        block_on_reqwest(async {
+            let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("artifact.bin");
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"stale partial").unwrap();
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+                .policy(policy);
+            let chosen = crate::Chosen {
+                input: Intent::new(
+                    Item::new("artifact"),
+                    LocalTarget::new(temp.path().join("out")),
+                ),
+                source,
+            };
+
+            let acquired = ReqwestAcquire::new()
+                .acquire_node_async(chosen)
+                .await
+                .unwrap();
+            let first_request = server.next_request();
+            let second_request = server.next_request();
+            server.join();
+
+            assert!(request_has_header_name(&first_request, "Range"));
+            assert!(request_has_header_name(&first_request, "If-Range"));
+            assert!(!request_has_header_name(&second_request, "Range"));
+            assert!(!request_has_header_name(&second_request, "If-Range"));
+            assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+            assert_eq!(
+                acquired.evidence.resume.unwrap().outcome,
                 ResumeOutcome::RangeUnsatisfiableRestarted
             );
         });
@@ -4039,7 +4518,7 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "reqwest", feature = "hash", feature = "blake3"))]
-    fn reqwest_acquire_flows_into_hash_verify() {
+    fn reqwest_acquire_flows_into_descriptor_verify() {
         block_on_reqwest(async {
             let body = b"reqwest verified bytes";
             let expected = blake3::hash(body).to_hex().to_string();
@@ -4060,8 +4539,11 @@ mod tests {
                 .await
                 .unwrap();
             server.join();
-            let verified = HashVerify::<Blake3>::new()
-                .verify_node(acquired, DigestNeed::new(expected))
+            let verified = DescriptorVerify::<Blake3>::new()
+                .verify_node(
+                    acquired,
+                    ArtifactDescriptor::new(expected, body.len() as u64),
+                )
                 .unwrap();
 
             assert_eq!(verified.material.path, destination);
@@ -4108,7 +4590,7 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "ureq", feature = "hash", feature = "blake3"))]
-    fn net_acquire_flows_into_hash_verify() {
+    fn ureq_acquire_flows_into_descriptor_verify() {
         let body = b"verified bytes";
         let expected = blake3::hash(body).to_hex().to_string();
         let server = serve_once(200, body, &[]);
@@ -4125,8 +4607,11 @@ mod tests {
 
         let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
         server.join();
-        let verified = HashVerify::<Blake3>::new()
-            .verify_node(acquired, DigestNeed::new(expected))
+        let verified = DescriptorVerify::<Blake3>::new()
+            .verify_node(
+                acquired,
+                ArtifactDescriptor::new(expected, body.len() as u64),
+            )
             .unwrap();
 
         assert_eq!(verified.material.path, destination);
@@ -4165,12 +4650,14 @@ mod tests {
         assert_eq!(applied.evidence.current.files, 1);
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     struct TestServer {
         url: String,
         handle: thread::JoinHandle<()>,
         requests: mpsc::Receiver<String>,
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     impl TestServer {
         fn next_request(&self) -> String {
             self.requests.recv().unwrap()
@@ -4190,6 +4677,7 @@ mod tests {
             .block_on(future)
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     fn serve_once(
         status: u16,
         body: &'static [u8],
@@ -4198,6 +4686,7 @@ mod tests {
         serve_sequence(vec![(status, body, headers)])
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     fn request_has_header(request: &str, name: &str, value: &str) -> bool {
         request.lines().any(|line| {
             line.split_once(':')
@@ -4207,7 +4696,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "ureq")]
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     fn request_has_header_name(request: &str, name: &str) -> bool {
         request.lines().any(|line| {
             line.split_once(':')
@@ -4215,8 +4704,38 @@ mod tests {
         })
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     type TestResponse = (u16, &'static [u8], &'static [(&'static str, &'static str)]);
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    fn serve_once_with_before_response(
+        status: u16,
+        body: &'static [u8],
+        headers: &'static [(&'static str, &'static str)],
+        before_response: impl FnOnce() + Send + 'static,
+    ) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_request(
+                stream,
+                status,
+                body,
+                headers,
+                Some(Box::new(before_response)),
+                &requests,
+            );
+        });
+        TestServer {
+            url: format!("http://{addr}/artifact.bin"),
+            handle,
+            requests: request_rx,
+        }
+    }
+
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     fn serve_sequence(responses: Vec<TestResponse>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4224,7 +4743,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for (status, body, headers) in responses {
                 let (stream, _) = listener.accept().unwrap();
-                handle_request(stream, status, body, headers, &requests);
+                handle_request(stream, status, body, headers, None, &requests);
             }
         });
         TestServer {
@@ -4234,11 +4753,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
     fn handle_request(
         mut stream: TcpStream,
         status: u16,
         body: &[u8],
         headers: &[(&str, &str)],
+        before_response: Option<Box<dyn FnOnce() + Send>>,
         requests: &mpsc::Sender<String>,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -4253,6 +4774,9 @@ mod tests {
             }
         }
         requests.send(request).unwrap();
+        if let Some(before_response) = before_response {
+            before_response();
+        }
 
         let reason = match status {
             200 => "OK",

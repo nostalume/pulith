@@ -1,3 +1,5 @@
+#![cfg(feature = "local")]
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +43,35 @@ fn public_api_materializes_and_remembers_local_file() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
     assert_eq!(remembered.receipt().item, "demo");
     assert_eq!(remembered.evidence().current.item, "demo");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(feature = "blake3")]
+fn public_api_verifies_exact_artifact_descriptor() {
+    use pulith::{ArtifactDescriptor, Blake3, DescriptorVerify};
+
+    let root = temp_root("descriptor");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&source, "pulith").unwrap();
+    let digest = blake3::hash(b"pulith").to_hex().to_string();
+
+    let chosen = Intent::new(Item::new("demo"), LocalTarget::new(&target))
+        .with_source(LocalPath::new(&source))
+        .select_first()
+        .unwrap();
+    let acquired = LocalAcquire.acquire_node(chosen).unwrap();
+    let descriptor = ArtifactDescriptor::<Blake3>::new(digest, 6);
+    let verified = DescriptorVerify::<Blake3>::new()
+        .verify_node(acquired, descriptor.clone())
+        .unwrap();
+
+    assert_eq!(verified.evidence().current.expected, descriptor);
+    assert_eq!(verified.evidence().current.observed, descriptor);
+    assert!(!target.exists());
 
     fs::remove_dir_all(root).unwrap();
 }

@@ -19,6 +19,10 @@ pub enum PulithError {
         expected: String,
         observed: String,
     },
+    ArtifactSizeMismatch {
+        expected: u64,
+        observed: u64,
+    },
     UnsupportedDigestMaterial(PathBuf),
     ArchiveRequiresFile(PathBuf),
     ArchiveInvalidPath(String),
@@ -87,6 +91,12 @@ impl fmt::Display for PulithError {
                 write!(
                     f,
                     "digest mismatch: expected {expected}, observed {observed}"
+                )
+            }
+            Self::ArtifactSizeMismatch { expected, observed } => {
+                write!(
+                    f,
+                    "artifact size mismatch: expected {expected}, observed {observed}"
                 )
             }
             Self::UnsupportedDigestMaterial(path) => {

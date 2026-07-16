@@ -21,7 +21,7 @@ plus its `Evidence`, `Error`, and `Output`. Callers choose policy and compose co
 | `behavior` | Transition traits and state nodes |
 | `evidence` | Evidence chains carried across transitions |
 | `local` | Local acquire, prepare, staged apply, and in-memory remember |
-| `hash` | Typed BLAKE3 and SHA-2 verification |
+| `hash` | Typed digest and exact digest-plus-size descriptor verification |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
 
@@ -36,7 +36,7 @@ manager. The concrete path currently supplied by this crate is:
 | --- | --- |
 | `Intent -> WithSource -> Chosen` | caller-provided typed source selected by `SelectFirst` |
 | `Chosen -> Acquired` | local material or staged HTTP download |
-| `Acquired -> Verified` | explicit identity pass-through or typed BLAKE3/SHA-256 digest |
+| `Acquired -> Verified` | explicit identity pass-through, typed digest, or exact digest-plus-size descriptor |
 | `Verified -> Prepared` | identity preparation or guarded ZIP/TAR extraction |
 | `Prepared -> Applied` | staged local file/tree publication for create and replace operations |
 | `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
@@ -47,6 +47,12 @@ extension vocabulary. Pulith does not currently provide source discovery, depend
 durable installation database, multi-target transactions, reconciliation, or system package-manager
 integration. Those require demonstrated callers and explicit storage/rollback laws; they are not
 hidden behind the existing state names.
+
+`ArtifactDescriptor<A>` identifies one exact raw representation by digest and byte size, independent
+of whether it came from a local path, `ureq`, or `reqwest`. Descriptor equality proves only that the
+material matches the supplied expectation. It does not authenticate who supplied that expectation,
+authorize a publisher, or establish provenance; those remain separate caller-owned policy/trust
+behaviors until a concrete adapter justifies them.
 
 ## Features
 
@@ -88,7 +94,9 @@ Build an `Intent`, attach a typed source, select it, then pass the node through 
 - archive extraction uses an exclusive destructive `ExtractWorkspace` before final `LocalApply` publication;
 - per-entry and total archive limits are enforced against observed materialized bytes, while decoded-container limits also bound TAR metadata, padding, and stripped entries;
 - declared-size mismatches are rejected, and extraction errors report any subsequent workspace-cleanup failure;
-- retry, resume, admission, and body-pacing decisions produce attempt evidence;
+- retry, validator-bound resume, admission, and body-pacing decisions produce attempt evidence;
+- HTTP partial bytes are recombined only with a strong validator, a terminal `Content-Range`, and an
+  observed body length matching that range; weak or conflicting validators are rejected;
 - network `max_bytes` is checked before body pacing and persistence;
 - request admission and decoded-body pacing are separate shared resources;
 - decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
