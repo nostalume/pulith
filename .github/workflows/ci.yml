@@ -32,12 +32,22 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --all-features --no-deps
+
+      - name: Check smallest feature combinations
+        shell: bash
+        run: |
+          for feature in local ureq reqwest blake3 sha2 zip tar gzip xz zstd; do
+            cargo check --no-default-features --features "$feature"
+          done
+
+      - name: Check package contents
+        run: cargo package --no-verify
 
   test:
     name: Test (${{ matrix.os }})
@@ -57,7 +67,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --all-features
 
   msrv:
     name: MSRV
@@ -75,22 +85,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo check --workspace --all-features
-
-  cargo-audit:
-    name: Cargo Audit
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run cargo audit action
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo check --all-features
 
   cargo-deny:
     name: Cargo Deny
@@ -123,4 +118,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check duplicate dependency trees
-        run: cargo tree --workspace --all-features -d
+        run: cargo tree --all-features -d

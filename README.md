@@ -2,29 +2,25 @@
 
 Pulith is a single Rust crate for composing typed artifact behaviors without a hidden package-manager policy layer.
 
-Its core state transition is:
-
 ```text
-WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
+Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
 ```
 
 Each transition owns an associated `Need`, `Evidence`, `Error`, and `Output`. Callers choose policy and compose concrete effects.
 
-## Current scope
-
-The active implementation is `crates/pulith`.
+## Scope
 
 | Module | Behavior |
 | --- | --- |
 | `application` | Typed intent, item, target, and operation vocabulary |
 | `behavior` | Transition traits and state nodes |
-| `evidence` | Evidence-chain types carried across transitions |
-| `local` | Local acquire, prepare, staged file/directory apply, and in-memory remember |
+| `evidence` | Evidence chains carried across transitions |
+| `local` | Local acquire, prepare, staged apply, and in-memory remember |
 | `hash` | Typed BLAKE3 and SHA-2 verification |
-| `archive` | ZIP/TAR preparation with traversal, symlink, entry-count, and byte limits |
+| `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
 
-Removed side crates and examples are historical. Their names are not current APIs.
+Pulith uses mature libraries for HTTP, hashing, archive parsing, and compression codecs. It owns the typed behavior, policy, evidence, staging, and publication contracts around those mechanisms.
 
 ## Features
 
@@ -35,9 +31,6 @@ execution:
   sync
   async
   runtime-tokio -> async + tokio
-
-filesystem:
-  local
 
 network:
   net -> local
@@ -52,9 +45,7 @@ hashing:
 archives:
   zip -> local
   tar -> local
-  gzip -> tar
-  xz -> tar
-  zstd -> tar
+  gzip/xz/zstd -> tar
 ```
 
 There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `json` capability feature.
@@ -66,34 +57,30 @@ There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `
 pulith = { version = "0.1", features = ["ureq", "blake3", "zip"] }
 ```
 
-The API is intentionally typed rather than configured through a global context. Build an `Intent`, attach a typed source, select it, then pass the resulting node through the behavior implementations required by the caller.
-
-See [`docs/architecture.md`](docs/architecture.md) for the full contract and feature boundaries.
+Build an `Intent`, attach a typed source, select it, then pass the node through the concrete behavior implementations required by the caller. There is no global context, plugin registry, or hidden workflow policy.
 
 ## Guarantees and limits
 
-- destination writes are staged before publication where the concrete behavior supports it;
-- archive paths and symlink entries are rejected by default;
+- final destination writes are staged before publication where the concrete behavior supports it;
+- archive traversal, symlink, hardlink, and unsupported entry types are rejected by default;
+- archive extraction uses an exclusive destructive scratch root before final `LocalApply` publication;
 - retry, resume, admission, and body-pacing decisions produce attempt evidence;
-- `max_bytes` is checked before body pacing and persistence;
+- network `max_bytes` is checked before body pacing and persistence;
 - request admission and decoded-body pacing are separate shared resources;
-- network pacing controls decoded-body materialization, not kernel/TLS/HTTP flow-control timing;
-- `ExistingExtractRoot` is an exclusive destructive capability: preparation clears it recursively;
-- local path safety assumes trusted parent directories; it is not a hostile concurrent-filesystem sandbox;
-- dependency solving, global rollback, lifecycle stores, installation policy, and package-manager orchestration are out of scope.
+- decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
+- local path safety assumes trusted parent directories, not a hostile concurrent filesystem;
+- dependency solving, lifecycle stores, installation policy, and package-manager orchestration are out of scope.
 
 ## Development
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 ```
 
-Feature-gated behavior must also compile with `--no-default-features` and its smallest public feature combination.
-
-Engineering constraints live in [`docs/AGENT.md`](docs/AGENT.md). Design and execution history lives in `docs/report/` and is non-authoritative unless referenced by the current architecture.
+Feature-gated behavior must also compile with `--no-default-features` and its smallest supported feature combination. Engineering rules and the current tech stack are in [`AGENTS.md`](AGENTS.md).
 
 ## License
 
