@@ -30,7 +30,10 @@
 //! Canonical state construction is not a security boundary. Public records let external adapters
 //! enter and continue the same typed chains as built-in adapters; typed composition prevents shape
 //! and order mismatches, not false attestations. Invariant-bearing resource outputs may restrict
-//! construction separately. Evidence is not automatically a domain event. State nodes are
+//! construction and direct field mutation separately while retaining read-only observation. Open
+//! canonical records can still replace whole resource values. Evidence remains adapter-attested
+//! rather than becoming authentic through field privacy. It is not
+//! automatically a domain event. State nodes are
 //! composition products, not entities or aggregates. Pulith introduces no universal installation,
 //! repository, transaction manager, or package-manager model.
 //!

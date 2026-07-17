@@ -83,6 +83,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Treat canonical evidence as the caller-selected adapter's attestation, not provenance,
   authorization, or an unforgeable capability. State records are open for external composition;
   invariant-bearing resource outputs may restrict construction separately.
+- Keep validated values and invariant-bearing resource identities crate-constructed when built-in
+  behavior relies on them; expose only the read access callers need. Do not close requests,
+  policies, canonical records, or evidence merely to simulate authenticity.
 - Do not treat evidence automatically as a domain event; introduce aggregates and DDD repositories
   only for demonstrated durable consistency boundaries.
 - No registries, factories, middleware layers, or global singletons without a demonstrated caller.
@@ -94,6 +97,10 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
   it on drop. Do not make staged custody cloneable.
 - Reject same-file, directory-cycle, traversal, and symlink hazards where promised.
 - `ExtractWorkspace` is exclusive, destructive scratch; it is not a final destination.
+- `ArchiveTree` is crate-constructed and exposes its prepared root by shared reference; callers
+  cannot fabricate one from an arbitrary path or write the root field directly. Open canonical
+  records may still replace whole resource values; this is not a permanent input/evidence binding,
+  immutable scratch, or concurrency-safe filesystem capability.
 - Archive symlinks, hardlinks, devices, and unsafe paths are rejected by default.
 - Archive path collisions use portable case-folded identity rather than the host volume's case-sensitivity.
 - Archive entry/total limits are enforced against observed materialized bytes, not metadata alone; decoded-container limits also bound TAR headers, padding, extensions, and stripped entries.

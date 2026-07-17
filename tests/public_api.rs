@@ -1,6 +1,8 @@
 #![cfg(feature = "local")]
 
 use std::fs;
+#[cfg(any(feature = "zip", feature = "tar"))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -121,4 +123,15 @@ fn public_api_inspects_and_reconciles_without_mutating_local_target() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(any(feature = "zip", feature = "tar"))]
+fn archive_root<A>(tree: &pulith::archive::ArchiveTree<A>) -> &Path {
+    tree.root()
+}
+
+#[test]
+#[cfg(any(feature = "zip", feature = "tar"))]
+fn archive_tree_exposes_root_by_shared_reference() {
+    let _ = archive_root::<()> as fn(&pulith::archive::ArchiveTree<()>) -> &Path;
 }

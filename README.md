@@ -93,6 +93,13 @@ repository is likewise not a DDD `Repository` unless it rehydrates a demonstrate
 aggregate. Pulith defines no universal `Installation`, global repository, registry, or transaction
 manager.
 
+Openness is boundary-specific rather than universal. `ArchiveTree` is crate-constructed and exposes
+its prepared root by shared reference: callers cannot fabricate one from an arbitrary path or write
+its private root directly. It remains a replaceable value inside open canonical records, not a
+permanent input/evidence binding, immutable workspace, hostile-filesystem capability, or
+unforgeable proof. Requests, policies, canonical records, and adapter evidence remain open where
+caller authority and external composition require it.
+
 This pre-release cutover intentionally replaces canonical-state constructors and read-only
 accessors with ordinary record literals and field access. Callers should use `.input`, `.material`,
 `.prepared`, `.observation`, `.reconciliation`, and `.evidence` directly; no compatibility methods

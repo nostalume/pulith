@@ -180,9 +180,25 @@ impl Default for ArchivePolicy {
     }
 }
 
+/// A prepared archive tree whose root is established by Pulith.
+///
+/// External code may inspect the root but cannot construct this type from an arbitrary path or
+/// assign its root field directly. `ArchiveTree` remains an ordinary cloneable value: an open
+/// canonical state may replace it with another tree produced by Pulith. This boundary does not bind
+/// a tree permanently to one input or evidence record, make workspace contents immutable, or
+/// protect them from hostile concurrent filesystem mutation.
+///
+/// ```compile_fail
+/// use std::path::PathBuf;
+/// use pulith::archive::ArchiveTree;
+///
+/// fn assign_root_directly(tree: &mut ArchiveTree<()>, other: PathBuf) {
+///     tree.root = other;
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveTree<A> {
-    pub root: PathBuf,
+    root: PathBuf,
     _archive: PhantomData<A>,
 }
 
@@ -192,6 +208,11 @@ impl<A> ArchiveTree<A> {
             root: root.into(),
             _archive: PhantomData,
         }
+    }
+
+    /// Returns the prepared tree root by shared reference.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
 
@@ -1067,7 +1088,7 @@ mod tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
-        assert_eq!(prepared.prepared.root, extract_root);
+        assert_eq!(prepared.prepared.root(), extract_root.as_path());
         assert_eq!(prepared.evidence.current.entries, 1);
         assert_eq!(prepared.evidence.current.files, 1);
         assert_eq!(
@@ -1100,7 +1121,7 @@ mod tests {
 
         assert!(!staged_path.exists());
         assert_eq!(
-            fs::read(prepared.prepared.root.join("tool.txt")).unwrap(),
+            fs::read(prepared.prepared.root().join("tool.txt")).unwrap(),
             b"pulith"
         );
         fs::remove_dir_all(root).unwrap();
