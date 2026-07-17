@@ -80,13 +80,18 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Use mature crates for codecs and container parsing; Pulith owns policy, evidence, staging, and composition.
 - Delete speculative abstractions and compatibility shells.
 - Keep observation read-only, reconciliation non-mutating, and repair as a separate explicit behavior.
-- Treat evidence as behavior proof, not automatically as a domain event; introduce aggregates and
-  DDD repositories only for demonstrated durable consistency boundaries.
+- Treat canonical evidence as the caller-selected adapter's attestation, not provenance,
+  authorization, or an unforgeable capability. State records are open for external composition;
+  invariant-bearing resource outputs may restrict construction separately.
+- Do not treat evidence automatically as a domain event; introduce aggregates and DDD repositories
+  only for demonstrated durable consistency boundaries.
 - No registries, factories, middleware layers, or global singletons without a demonstrated caller.
 
 ## Filesystem and archive invariants
 
 - Stage before publishing a final destination.
+- `LocalMaterial::File` and `Directory` are caller-owned; `StagedFile` owns a `TempPath` and removes
+  it on drop. Do not make staged custody cloneable.
 - Reject same-file, directory-cycle, traversal, and symlink hazards where promised.
 - `ExtractWorkspace` is exclusive, destructive scratch; it is not a final destination.
 - Archive symlinks, hardlinks, devices, and unsafe paths are rejected by default.
@@ -104,7 +109,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Every received final HTTP inspection status is an observation, including 4xx and exhausted 5xx.
 - HTTP inspection records requested and final URLs; declared content length is metadata, not observed bytes or artifact identity.
 - Enforce `max_bytes` before pacing and staged writes.
-- Persist only after body copy and stage finalization succeed.
+- HTTP Acquire returns adapter-owned staged material and never publishes `Materialize.target` or
+  creates its parent. Only Apply publishes the final target.
+- Resume partial paths remain caller-owned and are never removed implicitly.
 - Record attempt outcome, resume, admission wait, and pacing wait.
 - Attempt rate is not concurrency.
 - Decoded-body pacing is not socket-level bandwidth control.

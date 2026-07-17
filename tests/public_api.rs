@@ -41,8 +41,8 @@ fn public_api_materializes_local_file_without_synthetic_transitions() {
     let applied = LocalApply.apply(acquired).unwrap();
 
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
-    assert_eq!(applied.input().item, AppId("demo"));
-    assert_eq!(applied.evidence().current.strategy, LocalPlacement::Copied);
+    assert_eq!(applied.input.item, AppId("demo"));
+    assert_eq!(applied.evidence.current.strategy, LocalPlacement::Copied);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -71,11 +71,11 @@ fn public_api_verifies_then_applies_exact_artifact() {
     let verified = HashVerify::<Blake3>::new()
         .verify(acquired, expected.clone())
         .unwrap();
-    assert_eq!(verified.evidence().current.expected, expected);
+    assert_eq!(verified.evidence.current.expected, expected);
 
     let applied = LocalApply.apply(verified).unwrap();
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
-    assert_eq!(applied.input().item, "demo");
+    assert_eq!(applied.input.item, "demo");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -92,8 +92,8 @@ fn public_api_forgets_local_target_directly() {
         .unwrap();
 
     assert!(!target.exists());
-    assert_eq!(applied.input().target.path, target);
-    assert_eq!(applied.evidence().strategy, LocalPlacement::Removed);
+    assert_eq!(applied.input.target.path, target);
+    assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -106,21 +106,18 @@ fn public_api_inspects_and_reconciles_without_mutating_local_target() {
     fs::write(&target, "pulith").unwrap();
 
     let inspected = LocalInspect.inspect(LocalTarget::new(&target)).unwrap();
-    assert_eq!(
-        inspected.observation(),
-        &LocalObservation::File { bytes: 6 }
-    );
-    assert_eq!(inspected.evidence(), &pulith::local::LocalInspectEvidence);
+    assert_eq!(inspected.observation, LocalObservation::File { bytes: 6 });
+    assert_eq!(inspected.evidence, pulith::local::LocalInspectEvidence);
 
     let reconciled = LocalReconcile
         .reconcile(inspected, LocalExpectation::FileSize(6))
         .unwrap();
-    assert_eq!(reconciled.reconciliation(), &LocalReconciliation::Matches);
+    assert_eq!(reconciled.reconciliation, LocalReconciliation::Matches);
     assert_eq!(
-        reconciled.evidence().current.expected,
+        reconciled.evidence.current.expected,
         LocalExpectation::FileSize(6)
     );
-    assert_eq!(reconciled.input().path, target);
+    assert_eq!(reconciled.input.path, target);
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
     fs::remove_dir_all(root).unwrap();

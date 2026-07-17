@@ -13,6 +13,7 @@ use std::io;
 #[cfg(feature = "ureq")]
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
+#[cfg(any(feature = "reqwest", feature = "ureq"))]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "reqwest")]
@@ -25,7 +26,7 @@ use std::time::{Duration, SystemTime};
 use governor::clock::Clock;
 
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
-use crate::local::{LocalMaterial, MaterialKind};
+use crate::local::LocalMaterial;
 #[cfg(feature = "ureq")]
 use crate::{Acquire, Inspect};
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
@@ -89,10 +90,6 @@ pub enum AcquireError {
         path: PathBuf,
         source: io::Error,
     },
-    UnsafeDestination {
-        path: PathBuf,
-        kind: UnsafeDestination,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,12 +106,6 @@ pub enum ProtocolError {
         expected_start: u64,
         header: Option<String>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnsafeDestination {
-    Symlink,
-    NonFile,
 }
 
 impl fmt::Display for AcquireError {
@@ -156,13 +147,6 @@ impl fmt::Display for AcquireError {
                 write!(
                     f,
                     "net acquire failed to {action} {}: {source}",
-                    path.display()
-                )
-            }
-            Self::UnsafeDestination { path, kind } => {
-                write!(
-                    f,
-                    "net acquire destination is unsafe ({kind:?}): {}",
                     path.display()
                 )
             }
@@ -723,18 +707,17 @@ impl Validator {
     }
 }
 
+/// HTTP source identity and acquisition policy; it carries no publication destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteSource {
     pub(crate) url: RemoteUrl,
-    pub(crate) destination: PathBuf,
     pub(crate) policy: AcquirePolicy,
 }
 
 impl RemoteSource {
-    pub fn new(url: RemoteUrl, destination: impl Into<PathBuf>) -> Self {
+    pub fn new(url: RemoteUrl) -> Self {
         Self {
             url,
-            destination: destination.into(),
             policy: AcquirePolicy::default(),
         }
     }
@@ -747,16 +730,12 @@ impl RemoteSource {
     pub fn url(&self) -> &RemoteUrl {
         &self.url
     }
-
-    pub fn destination(&self) -> &Path {
-        &self.destination
-    }
 }
 
+/// Observed HTTP acquisition facts, excluding the ephemeral stage owned by the output material.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpAcquireEvidence {
     pub url: url::Url,
-    pub final_path: PathBuf,
     pub status: u16,
     pub bytes: u64,
     pub content_length: Option<u64>,
@@ -1052,18 +1031,18 @@ impl Inspect<RemoteUrl> for UreqInspect {
                 continue;
             }
 
-            return Ok(Inspected::from_inspect(
-                node,
-                HttpObservation {
+            return Ok(Inspected {
+                input: node,
+                observation: HttpObservation {
                     status,
                     declared_content_length,
                 },
-                HttpInspectEvidence {
+                evidence: HttpInspectEvidence {
                     requested_url,
                     final_url,
                     attempts,
                 },
-            ));
+            });
         }
         unreachable!("HTTP inspection retry loop always returns")
     }
@@ -1089,11 +1068,6 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
 
     fn acquire(&self, node: Materialize<I, RemoteSource, T>) -> Result<Self::Output, Self::Error> {
         let source = node.source.clone();
-        let parent = destination_parent(&source.destination)?;
-        std::fs::create_dir_all(&parent).map_err(|err| {
-            AcquireError::local(Some(&source.url), "create download parent", &parent, err)
-        })?;
-        reject_existing_unsafe_destination(&source.destination)?;
 
         let mut attempts = Vec::new();
         let mut resume = None;
@@ -1293,8 +1267,13 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                 None
             };
 
-            let mut temp = tempfile::NamedTempFile::new_in(&parent).map_err(|err| {
-                AcquireError::local(Some(&source.url), "create download temp file", &parent, err)
+            let mut temp = tempfile::NamedTempFile::new().map_err(|err| {
+                AcquireError::local(
+                    Some(&source.url),
+                    "create download temp file",
+                    std::env::temp_dir(),
+                    err,
+                )
             })?;
             let initial_bytes = if let Some((resume_context, _, _)) = &append_resume {
                 let mut partial_file =
@@ -1326,14 +1305,15 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                 active_pacer,
             ) {
                 Ok(copy) => copy,
-                Err(BodyCopyError::Transport(message)) => {
+                Err(BodyCopyError::Transport { message, bytes }) => {
                     let will_retry = attempt < source.policy.retry.max_retries;
                     let planned_delay =
                         will_retry.then(|| retry_delay(source.policy.retry, attempt));
                     attempts.push(
-                        AttemptEvidence::response(
+                        AttemptEvidence::transfer(
                             attempt,
                             status,
+                            bytes,
                             content_length,
                             admission_wait,
                             AttemptOutcome::RetryableNetworkError,
@@ -1352,10 +1332,11 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                         resume,
                     ));
                 }
-                Err(BodyCopyError::LimitExceeded { max, actual }) => {
-                    attempts.push(AttemptEvidence::response(
+                Err(BodyCopyError::LimitExceeded { max, actual, bytes }) => {
+                    attempts.push(AttemptEvidence::transfer(
                         attempt,
                         status,
+                        bytes,
                         content_length,
                         admission_wait,
                         AttemptOutcome::LimitExceeded,
@@ -1373,10 +1354,12 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                     action,
                     path,
                     source: io_error,
+                    bytes,
                 }) => {
-                    attempts.push(AttemptEvidence::response(
+                    attempts.push(AttemptEvidence::transfer(
                         attempt,
                         status,
+                        bytes,
                         content_length,
                         admission_wait,
                         AttemptOutcome::LocalFailure,
@@ -1412,14 +1395,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                 )
             })?;
 
-            temp.persist(&source.destination).map_err(|err| {
-                AcquireError::local(
-                    Some(&source.url),
-                    "persist downloaded file",
-                    &source.destination,
-                    err.error,
-                )
-            })?;
+            let staged_path = temp.into_temp_path();
             if let Some((resume_context, _, _)) = append_resume {
                 resume = Some(resume_context.into_evidence(ResumeOutcome::PartialAppended));
             }
@@ -1435,15 +1411,11 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                 )
                 .with_pacing_wait(copy.pacing_wait),
             );
-            return Ok(Acquired::from_acquire(
-                node,
-                LocalMaterial {
-                    path: source.destination.clone(),
-                    kind: MaterialKind::File,
-                },
-                HttpAcquireEvidence {
+            return Ok(Acquired {
+                input: node,
+                material: LocalMaterial::StagedFile { path: staged_path },
+                evidence: HttpAcquireEvidence {
                     url: source.url.into_url(),
-                    final_path: source.destination,
                     status,
                     bytes: copy.bytes,
                     content_length,
@@ -1451,7 +1423,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
                     resume,
                     validator: response_validator,
                 },
-            ));
+            });
         }
         unreachable!("retry loop always returns")
     }
@@ -1622,18 +1594,18 @@ async fn inspect_reqwest(
             continue;
         }
 
-        return Ok(Inspected::from_inspect(
-            node,
-            HttpObservation {
+        return Ok(Inspected {
+            input: node,
+            observation: HttpObservation {
                 status,
                 declared_content_length,
             },
-            HttpInspectEvidence {
+            evidence: HttpInspectEvidence {
                 requested_url,
                 final_url,
                 attempts,
             },
-        ));
+        });
     }
     unreachable!("HTTP inspection retry loop always returns")
 }
@@ -1683,11 +1655,6 @@ async fn acquire_reqwest<I, T>(
     AcquireError,
 > {
     let source = node.source.clone();
-    let parent = destination_parent(&source.destination)?;
-    std::fs::create_dir_all(&parent).map_err(|err| {
-        AcquireError::local(Some(&source.url), "create download parent", &parent, err)
-    })?;
-    reject_existing_unsafe_destination(&source.destination)?;
 
     let mut attempts = Vec::new();
     let mut resume = None;
@@ -1881,9 +1848,9 @@ async fn acquire_reqwest<I, T>(
         };
 
         let mut stage = if let Some((resume_context, _, _)) = &append_resume {
-            StagedDownload::<Open>::from_partial(&parent, &resume_context.partial_path).await?
+            StagedDownload::<Open>::from_partial(&resume_context.partial_path).await?
         } else {
-            StagedDownload::<Open>::new_in(&parent)?
+            StagedDownload::<Open>::new()?
         };
         let active_pacer = byte_pacer.as_ref();
         while let Some(chunk) = match response.chunk().await {
@@ -1976,7 +1943,7 @@ async fn acquire_reqwest<I, T>(
         }
         let pacing_wait = stage.pacing_wait;
         let stage = stage.finish().await?;
-        stage.persist(&source.destination)?;
+        let staged_path = stage.into_temp_path();
         if let Some((resume_context, _, _)) = append_resume {
             resume = Some(resume_context.into_evidence(ResumeOutcome::PartialAppended));
         }
@@ -1992,15 +1959,11 @@ async fn acquire_reqwest<I, T>(
             )
             .with_pacing_wait(pacing_wait),
         );
-        return Ok(Acquired::from_acquire(
-            node,
-            LocalMaterial {
-                path: source.destination.clone(),
-                kind: MaterialKind::File,
-            },
-            HttpAcquireEvidence {
+        return Ok(Acquired {
+            input: node,
+            material: LocalMaterial::StagedFile { path: staged_path },
+            evidence: HttpAcquireEvidence {
                 url: source.url.into_url(),
-                final_path: source.destination,
                 status,
                 bytes,
                 content_length,
@@ -2008,55 +1971,9 @@ async fn acquire_reqwest<I, T>(
                 resume,
                 validator: response_validator,
             },
-        ));
+        });
     }
     unreachable!("retry loop always returns")
-}
-
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
-#[allow(
-    clippy::result_large_err,
-    reason = "AcquireError intentionally carries complete retry and resume evidence"
-)]
-fn destination_parent(destination: &Path) -> Result<PathBuf, AcquireError> {
-    match destination.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => Ok(parent.to_path_buf()),
-        Some(_) | None => std::env::current_dir().map_err(|err| {
-            AcquireError::local(None, "resolve current directory", Path::new("."), err)
-        }),
-    }
-}
-
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
-#[allow(
-    clippy::result_large_err,
-    reason = "AcquireError intentionally carries complete retry and resume evidence"
-)]
-fn reject_existing_unsafe_destination(destination: &Path) -> Result<(), AcquireError> {
-    match std::fs::symlink_metadata(destination) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() || !file_type.is_file() {
-                let kind = if file_type.is_symlink() {
-                    UnsafeDestination::Symlink
-                } else {
-                    UnsafeDestination::NonFile
-                };
-                return Err(AcquireError::UnsafeDestination {
-                    path: destination.to_path_buf(),
-                    kind,
-                });
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(AcquireError::local(
-            None,
-            "read download destination metadata",
-            destination,
-            err,
-        )),
-    }
 }
 
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
@@ -2229,15 +2146,20 @@ struct BodyCopyProgress {
 
 #[cfg(feature = "ureq")]
 enum BodyCopyError {
-    Transport(String),
+    Transport {
+        message: String,
+        bytes: u64,
+    },
     LimitExceeded {
         max: u64,
         actual: u64,
+        bytes: u64,
     },
     Local {
         action: &'static str,
         path: PathBuf,
         source: io::Error,
+        bytes: u64,
     },
 }
 
@@ -2255,7 +2177,10 @@ fn copy_response_body(
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|err| BodyCopyError::Transport(err.to_string()))?;
+            .map_err(|err| BodyCopyError::Transport {
+                message: err.to_string(),
+                bytes,
+            })?;
         if read == 0 {
             return Ok(BodyCopyProgress { bytes, pacing_wait });
         }
@@ -2263,7 +2188,7 @@ fn copy_response_body(
         if let Some(max) = max_bytes
             && actual > max
         {
-            return Err(BodyCopyError::LimitExceeded { max, actual });
+            return Err(BodyCopyError::LimitExceeded { max, actual, bytes });
         }
         if let Some(pacer) = pacer {
             pacing_wait += pacer.before_chunk_sync(read as u64);
@@ -2274,6 +2199,7 @@ fn copy_response_body(
                 action: "write download temp file",
                 path: PathBuf::from("<temp>"),
                 source: err,
+                bytes,
             })?;
         bytes = actual;
     }
@@ -2314,9 +2240,10 @@ impl StagedDownload<Open> {
         clippy::result_large_err,
         reason = "AcquireError intentionally carries complete retry and resume evidence"
     )]
-    fn new_in(parent: &Path) -> Result<Self, AcquireError> {
-        let temp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|err| AcquireError::local(None, "create download temp file", parent, err))?;
+    fn new() -> Result<Self, AcquireError> {
+        let temp = tempfile::NamedTempFile::new().map_err(|err| {
+            AcquireError::local(None, "create download temp file", std::env::temp_dir(), err)
+        })?;
         let file = tokio::fs::File::from_std(temp.reopen().map_err(|err| {
             AcquireError::local(None, "reopen download temp file", temp.path(), err)
         })?);
@@ -2328,9 +2255,10 @@ impl StagedDownload<Open> {
         })
     }
 
-    async fn from_partial(parent: &Path, partial_path: &Path) -> Result<Self, AcquireError> {
-        let temp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|err| AcquireError::local(None, "create download temp file", parent, err))?;
+    async fn from_partial(partial_path: &Path) -> Result<Self, AcquireError> {
+        let temp = tempfile::NamedTempFile::new().map_err(|err| {
+            AcquireError::local(None, "create download temp file", std::env::temp_dir(), err)
+        })?;
         let bytes = std::fs::copy(partial_path, temp.path())
             .map_err(|err| AcquireError::local(None, "copy partial download", temp.path(), err))?;
         let file = tokio::fs::OpenOptions::new()
@@ -2394,15 +2322,8 @@ impl StagedDownload<Open> {
 
 #[cfg(feature = "reqwest")]
 impl StagedDownload<Closed> {
-    #[allow(
-        clippy::result_large_err,
-        reason = "AcquireError intentionally carries complete retry and resume evidence"
-    )]
-    fn persist(self, destination: &Path) -> Result<(), AcquireError> {
-        self.temp.persist(destination).map_err(|err| {
-            AcquireError::local(None, "persist downloaded file", destination, err.error)
-        })?;
-        Ok(())
+    fn into_temp_path(self) -> tempfile::TempPath {
+        self.temp.into_temp_path()
     }
 }
 
@@ -2504,12 +2425,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_source_preserves_destination_and_default_policy() {
-        let source = RemoteSource::new(
-            RemoteUrl::parse("https://example.com/file").unwrap(),
-            "artifact.bin",
-        );
-        assert_eq!(source.destination, PathBuf::from("artifact.bin"));
+    fn remote_source_preserves_url_and_default_policy() {
+        let url = RemoteUrl::parse("https://example.com/file").unwrap();
+        let source = RemoteSource::new(url.clone());
+        assert_eq!(source.url, url);
         assert_eq!(source.policy, AcquirePolicy::default());
     }
 
@@ -2851,15 +2770,15 @@ mod tests {
         server.join();
 
         assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
-        assert_eq!(inspected.observation().status, 200);
+        assert_eq!(inspected.observation.status, 200);
         assert_eq!(
-            inspected.observation().declared_content_length,
+            inspected.observation.declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(inspected.evidence.attempts.len(), 1);
         assert_eq!(
-            inspected.evidence().requested_url,
-            inspected.evidence().final_url
+            inspected.evidence.requested_url,
+            inspected.evidence.final_url
         );
     }
 
@@ -2874,8 +2793,8 @@ mod tests {
         server.join();
 
         assert!(request.starts_with("HEAD "));
-        assert_eq!(inspected.observation().status, 405);
-        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(inspected.observation.status, 405);
+        assert_eq!(inspected.evidence.attempts.len(), 1);
     }
 
     #[test]
@@ -2898,16 +2817,16 @@ mod tests {
         assert!(server.next_request().starts_with("HEAD "));
         server.join();
 
-        assert_eq!(inspected.observation().status, 404);
-        assert_eq!(inspected.evidence().attempts.len(), 2);
-        assert_eq!(inspected.evidence().attempts[0].status, Some(503));
-        assert_eq!(inspected.evidence().attempts[1].status, Some(404));
+        assert_eq!(inspected.observation.status, 404);
+        assert_eq!(inspected.evidence.attempts.len(), 2);
+        assert_eq!(inspected.evidence.attempts[0].status, Some(503));
+        assert_eq!(inspected.evidence.attempts[1].status, Some(404));
         assert_eq!(
-            inspected.evidence().attempts[0].admission_wait,
+            inspected.evidence.attempts[0].admission_wait,
             Some(Duration::ZERO)
         );
         assert_eq!(
-            inspected.evidence().attempts[1].admission_wait,
+            inspected.evidence.attempts[1].admission_wait,
             Some(Duration::ZERO)
         );
     }
@@ -2922,8 +2841,8 @@ mod tests {
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
 
-        assert_eq!(inspected.evidence().requested_url, requested.into_url());
-        assert!(inspected.evidence().final_url.as_str().ends_with("/final"));
+        assert_eq!(inspected.evidence.requested_url, requested.into_url());
+        assert!(inspected.evidence.final_url.as_str().ends_with("/final"));
     }
 
     #[test]
@@ -2958,15 +2877,15 @@ mod tests {
         server.join();
 
         assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
-        assert_eq!(inspected.observation().status, 200);
+        assert_eq!(inspected.observation.status, 200);
         assert_eq!(
-            inspected.observation().declared_content_length,
+            inspected.observation.declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(inspected.evidence.attempts.len(), 1);
         assert_eq!(
-            inspected.evidence().requested_url,
-            inspected.evidence().final_url
+            inspected.evidence.requested_url,
+            inspected.evidence.final_url
         );
     }
 
@@ -2982,8 +2901,8 @@ mod tests {
         server.join();
 
         assert!(request.starts_with("HEAD "));
-        assert_eq!(inspected.observation().status, 405);
-        assert_eq!(inspected.evidence().attempts.len(), 1);
+        assert_eq!(inspected.observation.status, 405);
+        assert_eq!(inspected.evidence.attempts.len(), 1);
     }
 
     #[test]
@@ -3009,16 +2928,16 @@ mod tests {
         assert!(server.next_request().starts_with("HEAD "));
         server.join();
 
-        assert_eq!(inspected.observation().status, 404);
-        assert_eq!(inspected.evidence().attempts.len(), 2);
-        assert_eq!(inspected.evidence().attempts[0].status, Some(503));
-        assert_eq!(inspected.evidence().attempts[1].status, Some(404));
+        assert_eq!(inspected.observation.status, 404);
+        assert_eq!(inspected.evidence.attempts.len(), 2);
+        assert_eq!(inspected.evidence.attempts[0].status, Some(503));
+        assert_eq!(inspected.evidence.attempts[1].status, Some(404));
         assert_eq!(
-            inspected.evidence().attempts[0].admission_wait,
+            inspected.evidence.attempts[0].admission_wait,
             Some(Duration::ZERO)
         );
         assert_eq!(
-            inspected.evidence().attempts[1].admission_wait,
+            inspected.evidence.attempts[1].admission_wait,
             Some(Duration::ZERO)
         );
     }
@@ -3034,8 +2953,8 @@ mod tests {
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
 
-        assert_eq!(inspected.evidence().requested_url, requested.into_url());
-        assert!(inspected.evidence().final_url.as_str().ends_with("/final"));
+        assert_eq!(inspected.evidence.requested_url, requested.into_url());
+        assert!(inspected.evidence.final_url.as_str().ends_with("/final"));
     }
 
     #[test]
@@ -3066,16 +2985,17 @@ mod tests {
         let body = b"downloaded bytes";
         let server = serve_once(200, body, &[]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(acquired.material.kind, MaterialKind::File);
-        assert_eq!(acquired.material.path, destination);
-        assert_eq!(std::fs::read(&acquired.material.path).unwrap(), body);
+        assert!(matches!(
+            &acquired.material,
+            LocalMaterial::StagedFile { .. }
+        ));
+        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), body);
         assert_eq!(acquired.evidence.status, 200);
         assert_eq!(acquired.evidence.bytes, body.len() as u64);
         assert_eq!(acquired.evidence.content_length, Some(body.len() as u64));
@@ -3083,13 +3003,66 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_acquire_rejects_non_success_status_without_touching_destination() {
+    fn ureq_acquire_does_not_publish_materialize_target() {
+        let server = serve_once(200, b"replacement", &[]);
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.bin");
+        std::fs::write(&target, b"original").unwrap();
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+        let acquired = UreqAcquire::default()
+            .acquire(materialize(source, &target))
+            .unwrap();
+        server.join();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        drop(acquired);
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_acquire_does_not_create_target_parent() {
+        let server = serve_once(200, b"staged", &[]);
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("absent/target.bin");
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+        let acquired = UreqAcquire::default()
+            .acquire(materialize(source, &target))
+            .unwrap();
+        server.join();
+
+        assert!(!target.parent().unwrap().exists());
+        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"staged");
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_acquired_material_is_removed_when_abandoned() {
+        let server = serve_once(200, b"temporary", &[]);
+        let temp = tempfile::tempdir().unwrap();
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+        let acquired = UreqAcquire::default()
+            .acquire(materialize(source, temp.path().join("target.bin")))
+            .unwrap();
+        server.join();
+        let staged_path = acquired.material.path().to_path_buf();
+        assert!(staged_path.exists());
+        drop(acquired);
+
+        assert!(!staged_path.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
+    fn ureq_acquire_rejects_non_success_status_without_touching_target() {
         let server = serve_once(404, b"not found", &[]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         std::fs::write(&destination, b"old").unwrap();
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-        let chosen = materialize(source, temp.path().join("out"));
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+        let chosen = materialize(source, &destination);
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
@@ -3107,14 +3080,13 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_acquire_enforces_max_bytes_before_persist() {
+    fn ureq_acquire_enforces_max_bytes_without_publishing_target() {
         let server = serve_once(200, b"too large", &[]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let policy = AcquirePolicy::default().max_bytes(3);
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
+        let chosen = materialize(source, &destination);
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
@@ -3125,17 +3097,40 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
+    fn ureq_resume_limit_evidence_records_materialized_partial_bytes() {
+        let server = serve_once(206, b" world", &[("Content-Range", "bytes 5-10/11")]);
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("artifact.part");
+        std::fs::write(&partial, b"hello").unwrap();
+        let policy = AcquirePolicy::default()
+            .max_bytes(8)
+            .resume(ResumePolicy::if_range(&partial, test_validator()));
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
+
+        let error = UreqAcquire::default()
+            .acquire(materialize(source, temp.path().join("out")))
+            .unwrap_err();
+        server.join();
+
+        let attempts = match error {
+            AcquireError::LimitExceeded { attempts, .. } => attempts,
+            other => panic!("expected limit error, got {other:?}"),
+        };
+        assert_eq!(attempts.last().unwrap().bytes, 5);
+        assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
+    }
+
+    #[test]
+    #[cfg(feature = "ureq")]
     fn ureq_retries_retryable_status_and_records_attempts() {
         let server = serve_sequence(vec![
             (503, b"busy", &[("Retry-After", "2")]),
             (200, b"ok", &[]),
         ]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
         let policy =
             AcquirePolicy::default().retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let sleeps = TestArc::new(Mutex::new(Vec::new()));
         let resources = UreqResource::default().with_delay({
             let sleeps = TestArc::clone(&sleeps);
@@ -3146,7 +3141,7 @@ mod tests {
         let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"ok");
+        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"ok");
         assert_eq!(*sleeps.lock().unwrap(), vec![Duration::from_secs(2)]);
         assert_eq!(acquired.evidence.attempts.len(), 2);
         assert_eq!(acquired.evidence.attempts[0].status, Some(503));
@@ -3165,8 +3160,7 @@ mod tests {
     fn ureq_concrete_byte_rate_pacer_downloads() {
         let server = serve_once(200, b"concrete paced", &[]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
             .policy(AcquirePolicy::default());
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(1_000_000).unwrap(),
@@ -3178,7 +3172,10 @@ mod tests {
         let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"concrete paced");
+        assert_eq!(
+            std::fs::read(acquired.material.path()).unwrap(),
+            b"concrete paced"
+        );
         assert_eq!(acquired.evidence.attempts[0].pacing_wait, Duration::ZERO);
         assert_eq!(
             acquired.evidence.attempts[0].outcome,
@@ -3191,8 +3188,7 @@ mod tests {
     fn ureq_concrete_rate_admission_downloads() {
         let server = serve_once(200, b"rate admitted", &[]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
             .policy(AcquirePolicy::default());
         let admission = RateAdmission::new(AttemptRate::new(
             NonZeroU32::new(1_000).unwrap(),
@@ -3204,7 +3200,10 @@ mod tests {
         let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"rate admitted");
+        assert_eq!(
+            std::fs::read(acquired.material.path()).unwrap(),
+            b"rate admitted"
+        );
         assert_eq!(
             acquired.evidence.attempts[0].admission_wait,
             Some(Duration::ZERO)
@@ -3224,19 +3223,21 @@ mod tests {
             &[("Content-Range", "bytes 5-10/11")],
         )]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
+        assert_eq!(
+            std::fs::read(acquired.material.path()).unwrap(),
+            b"hello world"
+        );
+        assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
         assert_eq!(acquired.evidence.bytes, 11);
         assert_eq!(
             acquired.evidence.resume.unwrap().outcome,
@@ -3249,19 +3250,18 @@ mod tests {
     fn ureq_resume_200_to_range_restarts_full_with_fresh_stage() {
         let server = serve_sequence(vec![(200, b"fresh", &[])]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"stale").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
         assert_eq!(
             acquired.evidence.resume.unwrap().outcome,
             ResumeOutcome::RangeIgnoredRestarted
@@ -3273,13 +3273,11 @@ mod tests {
     fn ureq_resume_416_restarts_once_without_range_headers() {
         let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"stale partial").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
@@ -3291,7 +3289,8 @@ mod tests {
         assert!(request_has_header_name(&first_request, "If-Range"));
         assert!(!request_has_header_name(&second_request, "Range"));
         assert!(!request_has_header_name(&second_request, "If-Range"));
-        assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(&partial).unwrap(), b"stale partial");
         assert_eq!(
             acquired.evidence.resume.unwrap().outcome,
             ResumeOutcome::RangeUnsatisfiableRestarted
@@ -3300,7 +3299,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_resume_missing_content_range_rejects_without_persist() {
+    fn ureq_resume_missing_content_range_rejects_without_publishing_target() {
         let server = serve_sequence(vec![(206, b" world", &[])]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
@@ -3308,8 +3307,7 @@ mod tests {
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
@@ -3336,8 +3334,7 @@ mod tests {
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
@@ -3370,8 +3367,7 @@ mod tests {
         );
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
@@ -3397,14 +3393,12 @@ mod tests {
             &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
         )]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let validator = test_validator();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
@@ -3413,7 +3407,10 @@ mod tests {
 
         assert!(request_has_header(&request, "range", "bytes=5-"));
         assert!(request_has_header(&request, "if-range", "\"abc\""));
-        assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
+        assert_eq!(
+            std::fs::read(acquired.material.path()).unwrap(),
+            b"hello world"
+        );
         let resume = acquired.evidence.resume.unwrap();
         assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
         assert_eq!(resume.validator, validator);
@@ -3434,8 +3431,7 @@ mod tests {
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
         let error = UreqAcquire::default().acquire(chosen).unwrap_err();
@@ -3459,8 +3455,7 @@ mod tests {
             let body = b"async downloaded bytes";
             let server = serve_once(200, body, &[]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3469,9 +3464,11 @@ mod tests {
                 .unwrap();
             server.join();
 
-            assert_eq!(acquired.material.kind, MaterialKind::File);
-            assert_eq!(acquired.material.path, destination);
-            assert_eq!(std::fs::read(&acquired.material.path).unwrap(), body);
+            assert!(matches!(
+                &acquired.material,
+                LocalMaterial::StagedFile { .. }
+            ));
+            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), body);
             assert_eq!(acquired.evidence.status, 200);
             assert_eq!(acquired.evidence.bytes, body.len() as u64);
             assert_eq!(acquired.evidence.content_length, Some(body.len() as u64));
@@ -3480,14 +3477,76 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_acquire_rejects_non_success_status_without_touching_destination() {
+    fn reqwest_acquire_does_not_publish_materialize_target() {
+        block_on_reqwest(async {
+            let server = serve_once(200, b"replacement", &[]);
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target.bin");
+            std::fs::write(&target, b"original").unwrap();
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(materialize(source, &target))
+                .await
+                .unwrap();
+            server.join();
+
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+            drop(acquired);
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_acquire_does_not_create_target_parent() {
+        block_on_reqwest(async {
+            let server = serve_once(200, b"staged", &[]);
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("absent/target.bin");
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(materialize(source, &target))
+                .await
+                .unwrap();
+            server.join();
+
+            assert!(!target.parent().unwrap().exists());
+            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"staged");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_acquired_material_is_removed_when_abandoned() {
+        block_on_reqwest(async {
+            let server = serve_once(200, b"temporary", &[]);
+            let temp = tempfile::tempdir().unwrap();
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(materialize(source, temp.path().join("target.bin")))
+                .await
+                .unwrap();
+            server.join();
+            let staged_path = acquired.material.path().to_path_buf();
+            assert!(staged_path.exists());
+            drop(acquired);
+
+            assert!(!staged_path.exists());
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_acquire_rejects_non_success_status_without_touching_target() {
         block_on_reqwest(async {
             let server = serve_once(404, b"not found", &[]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             std::fs::write(&destination, b"old").unwrap();
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-            let chosen = materialize(source, temp.path().join("out"));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
+            let chosen = materialize(source, &destination);
 
             let error = ReqwestAcquire::default()
                 .acquire_async(chosen)
@@ -3509,15 +3568,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_acquire_enforces_max_bytes_before_persist() {
+    fn reqwest_acquire_enforces_max_bytes_without_publishing_target() {
         block_on_reqwest(async {
             let server = serve_once(200, b"too large", &[]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let policy = AcquirePolicy::default().max_bytes(3);
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
+            let chosen = materialize(source, &destination);
 
             let error = ReqwestAcquire::default()
                 .acquire_async(chosen)
@@ -3532,6 +3590,34 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
+    fn reqwest_resume_limit_evidence_records_materialized_partial_bytes() {
+        block_on_reqwest(async {
+            let server = serve_once(206, b" world", &[("Content-Range", "bytes 5-10/11")]);
+            let temp = tempfile::tempdir().unwrap();
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"hello").unwrap();
+            let policy = AcquirePolicy::default()
+                .max_bytes(8)
+                .resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
+
+            let error = ReqwestAcquire::default()
+                .acquire_async(materialize(source, temp.path().join("out")))
+                .await
+                .unwrap_err();
+            server.join();
+
+            let attempts = match error {
+                AcquireError::LimitExceeded { attempts, .. } => attempts,
+                other => panic!("expected limit error, got {other:?}"),
+            };
+            assert_eq!(attempts.last().unwrap().bytes, 5);
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
     fn reqwest_retries_retryable_status_and_records_attempts() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![
@@ -3539,11 +3625,9 @@ mod tests {
                 (200, b"ok", &[]),
             ]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
             let policy = AcquirePolicy::default()
                 .retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let sleeps = TestArc::new(Mutex::new(Vec::new()));
             let resources = ReqwestResource::default().with_delay({
                 let sleeps = TestArc::clone(&sleeps);
@@ -3560,7 +3644,7 @@ mod tests {
                 .unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(&destination).unwrap(), b"ok");
+            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"ok");
             assert_eq!(*sleeps.lock().unwrap(), vec![Duration::from_secs(2)]);
             assert_eq!(acquired.evidence.attempts.len(), 2);
             assert_eq!(acquired.evidence.attempts[0].status, Some(503));
@@ -3581,8 +3665,7 @@ mod tests {
         block_on_reqwest(async {
             let server = serve_once(200, b"async concrete paced", &[]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
                 .policy(AcquirePolicy::default());
             let pacer = ByteRatePacer::new(ByteRate::new(
                 NonZeroU32::new(1_000_000).unwrap(),
@@ -3598,7 +3681,7 @@ mod tests {
             server.join();
 
             assert_eq!(
-                std::fs::read(&destination).unwrap(),
+                std::fs::read(acquired.material.path()).unwrap(),
                 b"async concrete paced"
             );
             assert_eq!(acquired.evidence.attempts[0].pacing_wait, Duration::ZERO);
@@ -3615,8 +3698,7 @@ mod tests {
         block_on_reqwest(async {
             let server = serve_once(200, b"async rate admitted", &[]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
                 .policy(AcquirePolicy::default());
             let admission = RateAdmission::new(AttemptRate::new(
                 NonZeroU32::new(1_000).unwrap(),
@@ -3631,7 +3713,10 @@ mod tests {
                 .unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(&destination).unwrap(), b"async rate admitted");
+            assert_eq!(
+                std::fs::read(acquired.material.path()).unwrap(),
+                b"async rate admitted"
+            );
             assert_eq!(
                 acquired.evidence.attempts[0].admission_wait,
                 Some(Duration::ZERO)
@@ -3653,13 +3738,11 @@ mod tests {
                 &[("Content-Range", "bytes 5-10/11")],
             )]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"hello").unwrap();
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3668,12 +3751,47 @@ mod tests {
                 .unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
+            assert_eq!(
+                std::fs::read(acquired.material.path()).unwrap(),
+                b"hello world"
+            );
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
             assert_eq!(acquired.evidence.bytes, 11);
             assert_eq!(
                 acquired.evidence.resume.unwrap().outcome,
                 ResumeOutcome::PartialAppended
             );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "reqwest")]
+    fn reqwest_resume_missing_content_range_rejects_without_publishing_target() {
+        block_on_reqwest(async {
+            let server = serve_sequence(vec![(206, b" world", &[])]);
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("artifact.bin");
+            let partial = temp.path().join("artifact.part");
+            std::fs::write(&partial, b"hello").unwrap();
+            let policy =
+                AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
+
+            let error = ReqwestAcquire::default()
+                .acquire_async(materialize(source, &target))
+                .await
+                .unwrap_err();
+            server.join();
+
+            assert!(matches!(
+                error,
+                AcquireError::Protocol {
+                    kind: ProtocolError::InvalidContentRange { .. },
+                    ..
+                }
+            ));
+            assert!(!target.exists());
+            assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
         });
     }
 
@@ -3688,8 +3806,7 @@ mod tests {
             std::fs::write(&partial, b"hello").unwrap();
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let error = ReqwestAcquire::default()
@@ -3727,8 +3844,7 @@ mod tests {
             );
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let error = ReqwestAcquire::default()
@@ -3759,14 +3875,12 @@ mod tests {
                 &[("Content-Range", "bytes 5-10/11"), ("ETag", "\"abc\"")],
             )]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"hello").unwrap();
             let validator = test_validator();
             let policy = AcquirePolicy::default()
                 .resume(ResumePolicy::if_range(&partial, validator.clone()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3778,7 +3892,10 @@ mod tests {
 
             assert!(request_has_header(&request, "range", "bytes=5-"));
             assert!(request_has_header(&request, "if-range", "\"abc\""));
-            assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
+            assert_eq!(
+                std::fs::read(acquired.material.path()).unwrap(),
+                b"hello world"
+            );
             let resume = acquired.evidence.resume.unwrap();
             assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
             assert_eq!(resume.validator, validator);
@@ -3801,8 +3918,7 @@ mod tests {
             std::fs::write(&partial, b"hello").unwrap();
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let error = ReqwestAcquire::default()
@@ -3829,13 +3945,11 @@ mod tests {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(200, b"fresh", &[])]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"stale").unwrap();
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3844,7 +3958,8 @@ mod tests {
                 .unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
             assert_eq!(
                 acquired.evidence.resume.unwrap().outcome,
                 ResumeOutcome::RangeIgnoredRestarted
@@ -3854,17 +3969,15 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_resume_416_restarts_once_without_persisting_partial() {
+    fn reqwest_resume_416_restarts_once_without_modifying_partial() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
             let partial = temp.path().join("artifact.part");
             std::fs::write(&partial, b"stale partial").unwrap();
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(policy);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3879,7 +3992,8 @@ mod tests {
             assert!(request_has_header_name(&first_request, "If-Range"));
             assert!(!request_has_header_name(&second_request, "Range"));
             assert!(!request_has_header_name(&second_request, "If-Range"));
-            assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(&partial).unwrap(), b"stale partial");
             assert_eq!(
                 acquired.evidence.resume.unwrap().outcome,
                 ResumeOutcome::RangeUnsatisfiableRestarted
@@ -3895,8 +4009,7 @@ mod tests {
             let expected = blake3::hash(body).to_hex().to_string();
             let server = serve_once(200, body, &[]);
             let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, temp.path().join("out"));
 
             let acquired = ReqwestAcquire::default()
@@ -3911,7 +4024,10 @@ mod tests {
                 )
                 .unwrap();
 
-            assert_eq!(verified.material.path, destination);
+            assert!(matches!(
+                verified.material,
+                LocalMaterial::StagedFile { .. }
+            ));
         });
     }
 
@@ -3923,9 +4039,8 @@ mod tests {
             let expected = blake3::hash(body).to_hex().to_string();
             let server = serve_once(200, body, &[]);
             let temp = tempfile::tempdir().unwrap();
-            let cache_path = temp.path().join("cache.bin");
             let final_path = temp.path().join("final.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &cache_path);
+            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, &final_path);
 
             let acquired = ReqwestAcquire::default()
@@ -3950,8 +4065,7 @@ mod tests {
         let expected = blake3::hash(body).to_hex().to_string();
         let server = serve_once(200, body, &[]);
         let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, temp.path().join("out"));
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();
@@ -3963,19 +4077,21 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(verified.material.path, destination);
+        assert!(matches!(
+            verified.material,
+            LocalMaterial::StagedFile { .. }
+        ));
     }
 
     #[test]
     #[cfg(all(feature = "ureq", feature = "hash", feature = "blake3"))]
-    fn net_acquire_flows_into_local_apply_after_verify() {
+    fn ureq_acquire_flows_into_local_apply_after_verify() {
         let body = b"apply bytes";
         let expected = blake3::hash(body).to_hex().to_string();
         let server = serve_once(200, body, &[]);
         let temp = tempfile::tempdir().unwrap();
-        let cache_path = temp.path().join("cache.bin");
         let final_path = temp.path().join("final.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &cache_path);
+        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, &final_path);
 
         let acquired = UreqAcquire::default().acquire(chosen).unwrap();

@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
 use crate::evidence::ApplyEvidence;
-use crate::local::{LocalApply, LocalMaterial, LocalTarget, MaterialKind};
+use crate::local::{LocalApply, LocalMaterial, LocalTarget};
 use crate::{
     Acquired, Applied, Apply, EvidenceChain, Materialize, Prepare, Prepared, PulithError, Verified,
 };
@@ -269,9 +269,8 @@ impl<I, S, E, A> Apply<Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, 
     ) -> Result<Self::Output, Self::Error> {
         crate::local::apply_material(
             node.input,
-            LocalMaterial {
+            LocalMaterial::Directory {
                 path: node.prepared.root,
-                kind: MaterialKind::Directory,
             },
             node.evidence,
         )
@@ -345,13 +344,13 @@ fn prepare_archive<I, E, A>(
     policy: ArchivePolicy,
     extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence<A>, PulithError>,
 ) -> Result<ArchivePrepared<I, E, A>, PulithError> {
-    if material.kind != MaterialKind::File {
-        return Err(PulithError::ArchiveRequiresFile(material.path));
+    if let LocalMaterial::Directory { path } = &material {
+        return Err(PulithError::ArchiveRequiresFile(path.clone()));
     }
 
     let root = root.to_path_buf();
     reset_extract_root(&root)?;
-    let evidence = match extract(&material.path, &root, &policy) {
+    let evidence = match extract(material.path(), &root, &policy) {
         Ok(evidence) => evidence,
         Err(error) => {
             let cleanup = reset_extract_root(&root);
@@ -359,11 +358,14 @@ fn prepare_archive<I, E, A>(
         }
     };
 
-    Ok(Prepared::from_prepare(
+    Ok(Prepared {
         input,
-        ArchiveTree::new(root),
-        EvidenceChain::new(previous_evidence, evidence),
-    ))
+        prepared: ArchiveTree::new(root),
+        evidence: EvidenceChain {
+            previous: previous_evidence,
+            current: evidence,
+        },
+    })
 }
 
 fn combine_archive_failure(
@@ -1073,6 +1075,61 @@ mod tests {
             "pulith"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_prepare_releases_staged_archive_after_success() {
+        let root = temp_root("staged-archive-success");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        write_zip(staged.path(), &[("tool.txt", b"pulith")]);
+        let staged_path = staged.path().to_path_buf();
+        let node = Acquired {
+            input: (),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+            .prepare(node, ArchivePolicy::default())
+            .unwrap();
+
+        assert!(!staged_path.exists());
+        assert_eq!(
+            fs::read(prepared.prepared.root.join("tool.txt")).unwrap(),
+            b"pulith"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_prepare_releases_staged_archive_after_failure() {
+        let root = temp_root("staged-archive-failure");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"not a zip").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = Acquired {
+            input: (),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        assert!(
+            ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
+                .prepare(node, ArchivePolicy::default())
+                .is_err()
+        );
+
+        assert!(!staged_path.exists());
+        assert!(extract_root.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

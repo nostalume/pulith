@@ -135,19 +135,22 @@ fn verify_digest<I, E, A: DigestAlgorithm>(
     node: Acquired<I, crate::local::LocalMaterial, E>,
     expected: DigestValue<A>,
 ) -> Result<DigestVerified<I, E, A>, PulithError> {
-    require_regular_digest_file(&node.material.path)?;
-    let observed = DigestValue::<A>::new(A::digest_file(&node.material.path)?);
+    require_regular_digest_file(node.material.path())?;
+    let observed = DigestValue::<A>::new(A::digest_file(node.material.path())?);
     if observed.as_str() != expected.as_str() {
         return Err(PulithError::DigestMismatch {
             expected: expected.into_string(),
             observed: observed.into_string(),
         });
     }
-    Ok(Verified::from_verify(
-        node.input,
-        node.material,
-        EvidenceChain::new(node.evidence, DigestEvidence { expected, observed }),
-    ))
+    Ok(Verified {
+        input: node.input,
+        material: node.material,
+        evidence: EvidenceChain {
+            previous: node.evidence,
+            current: DigestEvidence { expected, observed },
+        },
+    })
 }
 
 #[cfg(feature = "local")]
@@ -155,7 +158,7 @@ fn verify_descriptor<I, E, A: DigestAlgorithm>(
     node: Acquired<I, crate::local::LocalMaterial, E>,
     expected: ArtifactDescriptor<A>,
 ) -> Result<DescriptorVerified<I, E, A>, PulithError> {
-    let metadata = require_regular_digest_file(&node.material.path)?;
+    let metadata = require_regular_digest_file(node.material.path())?;
     let metadata_size = metadata.len();
     if metadata_size != expected.size {
         return Err(PulithError::ArtifactSizeMismatch {
@@ -164,7 +167,7 @@ fn verify_descriptor<I, E, A: DigestAlgorithm>(
         });
     }
 
-    let (observed_digest, observed_size) = A::digest_file_with_size(&node.material.path)?;
+    let (observed_digest, observed_size) = A::digest_file_with_size(node.material.path())?;
     if observed_size != expected.size {
         return Err(PulithError::ArtifactSizeMismatch {
             expected: expected.size,
@@ -179,11 +182,14 @@ fn verify_descriptor<I, E, A: DigestAlgorithm>(
         });
     }
 
-    Ok(Verified::from_verify(
-        node.input,
-        node.material,
-        EvidenceChain::new(node.evidence, DescriptorEvidence { expected, observed }),
-    ))
+    Ok(Verified {
+        input: node.input,
+        material: node.material,
+        evidence: EvidenceChain {
+            previous: node.evidence,
+            current: DescriptorEvidence { expected, observed },
+        },
+    })
 }
 
 #[cfg(feature = "local")]
@@ -412,6 +418,64 @@ mod tests {
 
         assert!(matches!(error, crate::PulithError::DigestMismatch { .. }));
         assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "blake3")]
+    #[test]
+    fn staged_digest_mismatch_releases_material_custody() {
+        use super::{Blake3, DigestValue};
+
+        let root = temp_root("staged-digest-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"pulith").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = Acquired {
+            input: (),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        let error = HashVerify::<Blake3>::new()
+            .verify(node, DigestValue::<Blake3>::new("00".repeat(32)))
+            .unwrap_err();
+
+        assert!(matches!(error, crate::PulithError::DigestMismatch { .. }));
+        assert!(!staged_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "blake3")]
+    #[test]
+    fn successful_staged_verification_retains_custody_until_state_drop() {
+        use super::{Blake3, DigestValue};
+
+        let root = temp_root("staged-digest-success");
+        fs::create_dir_all(&root).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"pulith").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = Acquired {
+            input: (),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        let verified = HashVerify::<Blake3>::new()
+            .verify(
+                node,
+                DigestValue::<Blake3>::new(blake3::hash(b"pulith").to_hex().to_string()),
+            )
+            .unwrap();
+
+        assert!(staged_path.exists());
+        drop(verified);
+        assert!(!staged_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

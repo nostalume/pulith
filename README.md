@@ -17,8 +17,8 @@ RemoteUrl  --> Inspected
 ```
 
 Each behavior passes policy `Need` as a trait type parameter where required and declares associated
-`Error` and `Output` contracts. The typed output carries its evidence. Callers choose policy and
-compose concrete effects.
+`Error` and `Output` contracts. Canonical outputs are open adapter-attested records: callers choose
+the adapter, decide whether to trust its evidence, and compose concrete effects.
 
 ## Scope
 
@@ -65,7 +65,7 @@ Concrete behavior contracts currently admitted to the public surface are:
 | Behavior | Need / authority | Evidence and output | Effect and failure law |
 | --- | --- | --- | --- |
 | local acquire | `Materialize<_, LocalPath, _>`; filesystem adapter | source path and `LocalMaterial` classification | a missing source fails acquisition; unsupported entry types are rejected before publication by downstream concrete behavior |
-| HTTP acquire | request/retry/resume/limit policy plus adapter-owned admission and pacing resources | per-attempt transfer/resume/wait evidence and staged material | each attempt is admitted separately when admission is configured; complete validated stage precedes persistence |
+| HTTP acquire | `RemoteSource` URL/policy plus adapter-owned admission and pacing resources | per-attempt transfer/resume/wait evidence and RAII-owned staged material | each attempt is admitted separately; acquire never publishes `Materialize.target`, and dropping the state removes its stage |
 | HTTP inspect | `RemoteUrl`; adapter-owned HEAD policy | status, declared content length, requested/final URL, and per-attempt evidence | HEAD only; every received final status is an observation; no body copy, destination, or GET fallback |
 | digest/descriptor verify | caller-supplied digest or exact descriptor | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
 | archive prepare | `ArchivePolicy` and exclusive workspace | prepared tree and observed extraction evidence | final destination remains untouched |
@@ -85,10 +85,18 @@ Resource semantics remain bounded and cross through typed anti-corruption mappin
 | Trust/provenance | external signature, delegation, attestation facts | generic core identity or automatic admission |
 | Durable state | adapter-specific revision, commit, and recovery laws | a mandatory Pulith aggregate |
 
-`Evidence` proves one behavior result; it is not automatically a DDD domain event. A software
-artifact repository is likewise not a DDD `Repository` unless it rehydrates a demonstrated
+Canonical states are public records so external adapters can enter and continue the same typed
+chain as built-in adapters. Their evidence is the selected adapter's attestation, not provenance,
+authorization, or an unforgeable capability. Invariant-bearing resource outputs may still restrict
+construction independently. Evidence is not automatically a DDD domain event. A software artifact
+repository is likewise not a DDD `Repository` unless it rehydrates a demonstrated
 aggregate. Pulith defines no universal `Installation`, global repository, registry, or transaction
 manager.
+
+This pre-release cutover intentionally replaces canonical-state constructors and read-only
+accessors with ordinary record literals and field access. Callers should use `.input`, `.material`,
+`.prepared`, `.observation`, `.reconciliation`, and `.evidence` directly; no compatibility methods
+or aliases are retained.
 
 ## Current maturity
 
@@ -153,6 +161,11 @@ pulith = { path = "../pulith", features = ["ureq", "blake3", "zip"] }
 
 Construct a `Materialize` request after the caller has selected a source, then compose only the concrete acquire, optional verify/prepare, and apply behaviors the request needs. Use `Forget` for a direct target-only removal. There is no global context, plugin registry, or hidden workflow policy.
 
+HTTP sources are constructed as `RemoteSource::new(url)`. Acquisition returns
+`LocalMaterial::StagedFile`; it does not accept a second destination. `LocalMaterial::File` and
+`Directory` remain caller-owned, while dropping `StagedFile` removes the adapter-owned stage. A
+caller that wants a durable cache composes `LocalApply` with that cache path as the one target.
+
 ## Guarantees and limits
 
 - final destination writes are staged before publication where the concrete behavior supports it;
@@ -168,7 +181,9 @@ Construct a `Materialize` request after the caller has selected a source, then c
   descriptor, validator continuity, provenance, or trust evidence;
 - HTTP partial bytes are recombined only with a strong validator, a terminal `Content-Range`, and an
   observed body length matching that range; weak or conflicting validators are rejected;
-- network `max_bytes` is checked before body pacing and persistence;
+- network `max_bytes` is checked before body pacing and staged writes;
+- HTTP acquire never creates or publishes the final target or its parent; only apply has that authority;
+- caller-owned local sources and resume partial files are never removed implicitly;
 - request admission and decoded-body pacing are separate shared resources;
 - decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
 - local path safety assumes trusted parent directories, not a hostile concurrent filesystem;

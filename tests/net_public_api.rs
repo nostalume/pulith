@@ -35,3 +35,27 @@ fn public_reqwest_inspect_implements_async_inspection_contract() {
 
     assert_async_inspect(&ReqwestInspect::default());
 }
+
+#[cfg(all(feature = "ureq", feature = "local"))]
+#[test]
+fn public_ureq_acquire_implements_destination_free_contract() {
+    use pulith::local::LocalTarget;
+    use pulith::net::{RemoteSource, UreqAcquire};
+    use pulith::{Acquire, Materialize};
+
+    fn assert_acquire<T: Acquire<Materialize<(), RemoteSource, LocalTarget>>>(_: &T) {}
+
+    assert_acquire(&UreqAcquire::default());
+}
+
+#[cfg(all(feature = "reqwest", feature = "local"))]
+#[test]
+fn public_reqwest_acquire_implements_destination_free_contract() {
+    use pulith::local::LocalTarget;
+    use pulith::net::{RemoteSource, ReqwestAcquire};
+    use pulith::{AsyncAcquire, Materialize};
+
+    fn assert_async_acquire<T: AsyncAcquire<Materialize<(), RemoteSource, LocalTarget>>>(_: &T) {}
+
+    assert_async_acquire(&ReqwestAcquire::default());
+}

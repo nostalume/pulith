@@ -9,191 +9,86 @@ use pulith::behavior::AsyncInspect;
 "#
 )]
 
+//! Open behavior contracts and canonical adapter-attested state records.
+//!
+//! Callers establish evidence trust by selecting an adapter. Public state construction enables
+//! third-party adapters to enter and continue canonical chains; it is not a provenance,
+//! authorization, or authenticity boundary. Resource-specific outputs may enforce their own
+//! construction invariants independently.
+
 use std::future::Future;
 
+/// Evidence preserved from an upstream transition and produced by the current transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceChain<A, B> {
+    /// Evidence preserved from the preceding transition.
     pub previous: A,
+    /// Evidence produced by the current transition.
     pub current: B,
 }
 
-impl<A, B> EvidenceChain<A, B> {
-    pub fn new(previous: A, current: B) -> Self {
-        Self { previous, current }
-    }
-}
-
+/// Adapter-attested result of acquisition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Acquired<I, M, E> {
-    pub(crate) input: I,
-    pub(crate) material: M,
-    pub(crate) evidence: E,
+    /// Request or state consumed by acquisition.
+    pub input: I,
+    /// Acquired material, including any custody carried by its type.
+    pub material: M,
+    /// Acquisition adapter's attestation.
+    pub evidence: E,
 }
 
-impl<I, M, E> Acquired<I, M, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_acquire(input: I, material: M, evidence: E) -> Self {
-        Self {
-            input,
-            material,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn material(&self) -> &M {
-        &self.material
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-}
-
+/// Adapter-attested result of verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verified<I, M, E> {
-    pub(crate) input: I,
-    pub(crate) material: M,
-    pub(crate) evidence: E,
+    /// Original request or upstream state identity.
+    pub input: I,
+    /// Material whose custody continues through verification.
+    pub material: M,
+    /// Preserved and current verification evidence.
+    pub evidence: E,
 }
 
-impl<I, M, E> Verified<I, M, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_verify(input: I, material: M, evidence: E) -> Self {
-        Self {
-            input,
-            material,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn material(&self) -> &M {
-        &self.material
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-}
-
+/// Adapter-attested result of preparation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Prepared<I, P, E> {
-    pub(crate) input: I,
-    pub(crate) prepared: P,
-    pub(crate) evidence: E,
+    /// Original request or upstream state identity.
+    pub input: I,
+    /// Prepared resource-specific output.
+    pub prepared: P,
+    /// Preserved and current preparation evidence.
+    pub evidence: E,
 }
 
-impl<I, P, E> Prepared<I, P, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_prepare(input: I, prepared: P, evidence: E) -> Self {
-        Self {
-            input,
-            prepared,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn prepared(&self) -> &P {
-        &self.prepared
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-}
-
+/// Adapter-attested result of application.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Applied<I, E> {
-    pub(crate) input: I,
-    pub(crate) evidence: E,
+    /// Request or state whose target effect was applied.
+    pub input: I,
+    /// Preserved and current application evidence.
+    pub evidence: E,
 }
 
-impl<I, E> Applied<I, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_apply(input: I, evidence: E) -> Self {
-        Self { input, evidence }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-}
-
-/// Read-only observation of an external resource.
+/// Adapter-attested read-only observation of an external resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inspected<I, O, E> {
-    pub(crate) input: I,
-    pub(crate) observation: O,
-    pub(crate) evidence: E,
-}
-
-impl<I, O, E> Inspected<I, O, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_inspect(input: I, observation: O, evidence: E) -> Self {
-        Self {
-            input,
-            observation,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn observation(&self) -> &O {
-        &self.observation
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
+    /// Resource inspected without mutation.
+    pub input: I,
+    /// Resource-specific observed facts.
+    pub observation: O,
+    /// Inspection adapter's attestation.
+    pub evidence: E,
 }
 
 /// Pure comparison result between caller-supplied expectation and an observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reconciled<I, R, E> {
-    pub(crate) input: I,
-    pub(crate) reconciliation: R,
-    pub(crate) evidence: E,
-}
-
-impl<I, R, E> Reconciled<I, R, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_reconcile(input: I, reconciliation: R, evidence: E) -> Self {
-        Self {
-            input,
-            reconciliation,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn reconciliation(&self) -> &R {
-        &self.reconciliation
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
+    /// Inspected resource identity.
+    pub input: I,
+    /// Pure expected-versus-observed classification.
+    pub reconciliation: R,
+    /// Preserved and current reconciliation evidence.
+    pub evidence: E,
 }
 
 /// Acquires resource-specific material for a caller-owned input `N`.

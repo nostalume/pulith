@@ -13,7 +13,8 @@
 //! ```
 //!
 //! Each behavior passes policy need as a trait type parameter where required and declares associated
-//! error and output contracts. The typed output carries its evidence. Concrete mechanisms are
+//! error and output contracts. Canonical outputs are open adapter-attested records: callers select
+//! the adapter and establish whether its evidence is trusted. Concrete mechanisms are
 //! attached through feature-gated typed nodes rather than a global context, registry, or hidden
 //! workflow policy.
 //!
@@ -26,7 +27,10 @@
 //! universal workflow. Callers own desired state, application identity, trust/admission policy,
 //! durable aggregates, orchestration, and rollback or retention policy.
 //!
-//! Evidence proves one behavior result; it is not automatically a domain event. State nodes are
+//! Canonical state construction is not a security boundary. Public records let external adapters
+//! enter and continue the same typed chains as built-in adapters; typed composition prevents shape
+//! and order mismatches, not false attestations. Invariant-bearing resource outputs may restrict
+//! construction separately. Evidence is not automatically a domain event. State nodes are
 //! composition products, not entities or aggregates. Pulith introduces no universal installation,
 //! repository, transaction manager, or package-manager model.
 //!
@@ -43,6 +47,12 @@
 //! publication remains a separate local apply behavior. Network request admission and decoded-body
 //! pacing are separate shared resources. Pacing controls materialization, not socket, TLS, or HTTP
 //! flow-control timing.
+//!
+//! HTTP acquisition returns adapter-owned staged material and never publishes `Materialize.target`
+//! or creates its parent. Staged custody continues through verification, is transformed into
+//! prepared custody when preparation succeeds, or continues to apply directly. Dropping the owning
+//! state removes disposable custody. Caller-owned local sources and resume partials are not cleaned
+//! implicitly; only apply owns final-target publication.
 //!
 //! # Current maturity
 //!

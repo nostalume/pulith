@@ -44,32 +44,58 @@ impl<I, T> Acquire<Materialize<I, LocalPath, T>> for LocalAcquire {
         if !path.exists() {
             return Err(PulithError::MissingSource(path));
         }
-        let kind = if path.is_dir() {
-            MaterialKind::Directory
+        let material = if path.is_dir() {
+            LocalMaterial::Directory { path: path.clone() }
         } else {
-            MaterialKind::File
+            LocalMaterial::File { path: path.clone() }
         };
-        Ok(Acquired::from_acquire(
-            node,
-            LocalMaterial {
-                path: path.clone(),
-                kind,
-            },
-            LocalAcquireEvidence { path },
-        ))
+        Ok(Acquired {
+            input: node,
+            material,
+            evidence: LocalAcquireEvidence { path },
+        })
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalMaterial {
-    pub path: PathBuf,
-    pub kind: MaterialKind,
+/// Local material with explicit caller-owned or adapter-owned custody.
+///
+/// `File` and `Directory` paths survive drop. `StagedFile` owns its temporary path and removes it
+/// when the material or any canonical state carrying it is dropped.
+#[derive(Debug)]
+pub enum LocalMaterial {
+    /// A caller-owned regular-file path. Dropping the value does not remove the file.
+    File { path: PathBuf },
+    /// A caller-owned directory path. Dropping the value does not remove the tree.
+    Directory { path: PathBuf },
+    /// An adapter-owned temporary file. Dropping the value removes the stage.
+    StagedFile { path: tempfile::TempPath },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaterialKind {
-    File,
-    Directory,
+impl PartialEq for LocalMaterial {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::File { path: left }, Self::File { path: right })
+                | (Self::Directory { path: left }, Self::Directory { path: right })
+                if left == right
+        ) || matches!(
+            (self, other),
+            (Self::StagedFile { path: left }, Self::StagedFile { path: right })
+                if <tempfile::TempPath as AsRef<Path>>::as_ref(left)
+                    == <tempfile::TempPath as AsRef<Path>>::as_ref(right)
+        )
+    }
+}
+
+impl Eq for LocalMaterial {}
+
+impl LocalMaterial {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::File { path } | Self::Directory { path } => path,
+            Self::StagedFile { path } => path.as_ref(),
+        }
+    }
 }
 
 /// No-follow local filesystem entry classification.
@@ -181,11 +207,11 @@ impl Inspect<LocalTarget> for LocalInspect {
             Err(error) => return Err(PulithError::io("inspect local target", &node.path, error)),
         };
 
-        Ok(Inspected::from_inspect(
-            node,
+        Ok(Inspected {
+            input: node,
             observation,
-            LocalInspectEvidence,
-        ))
+            evidence: LocalInspectEvidence,
+        })
     }
 }
 
@@ -193,19 +219,16 @@ impl Inspect<LocalTarget> for LocalInspect {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalReconcile;
 
-impl Reconcile<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>, LocalExpectation>
+impl<E> Reconcile<Inspected<LocalTarget, LocalObservation, E>, LocalExpectation>
     for LocalReconcile
 {
     type Error = std::convert::Infallible;
-    type Output = Reconciled<
-        LocalTarget,
-        LocalReconciliation,
-        EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>,
-    >;
+    type Output =
+        Reconciled<LocalTarget, LocalReconciliation, EvidenceChain<E, LocalReconcileEvidence>>;
 
     fn reconcile(
         &self,
-        node: Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>,
+        node: Inspected<LocalTarget, LocalObservation, E>,
         expected: LocalExpectation,
     ) -> Result<Self::Output, Self::Error> {
         let Inspected {
@@ -231,15 +254,19 @@ impl Reconcile<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>, L
                 observed: observation.kind(),
             },
         };
-        let evidence = EvidenceChain::new(
-            inspect_evidence,
-            LocalReconcileEvidence {
+        let evidence = EvidenceChain {
+            previous: inspect_evidence,
+            current: LocalReconcileEvidence {
                 expected,
                 observed: observation,
             },
-        );
+        };
 
-        Ok(Reconciled::from_reconcile(input, reconciliation, evidence))
+        Ok(Reconciled {
+            input,
+            reconciliation,
+            evidence,
+        })
     }
 }
 
@@ -284,7 +311,10 @@ impl<I> Apply<Forget<I, LocalTarget>> for LocalApply {
             Err(PulithError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        Ok(Applied::from_apply(node, ApplyEvidence::removed()))
+        Ok(Applied {
+            input: node,
+            evidence: ApplyEvidence::removed(),
+        })
     }
 }
 
@@ -316,16 +346,20 @@ pub(crate) fn apply_material<I, S, E>(
         }
         MaterializeMode::CreateOrReplace => PublishMode::CreateOrReplace,
     };
-    reject_unsupported_entry(&material.path)?;
-    reject_same_source_target(&material.path, &target)?;
-    let stats = match material.kind {
-        MaterialKind::File => publish_file(&material.path, &target, mode)?,
-        MaterialKind::Directory => publish_directory(&material.path, &target, mode)?,
+    reject_unsupported_entry(material.path())?;
+    reject_same_source_target(material.path(), &target)?;
+    let stats = match &material {
+        LocalMaterial::File { path } => publish_file(path, &target, mode)?,
+        LocalMaterial::Directory { path } => publish_directory(path, &target, mode)?,
+        LocalMaterial::StagedFile { path } => publish_file(path.as_ref(), &target, mode)?,
     };
-    Ok(Applied::from_apply(
+    Ok(Applied {
         input,
-        EvidenceChain::new(evidence, ApplyEvidence::new(stats)),
-    ))
+        evidence: EvidenceChain {
+            previous: evidence,
+            current: ApplyEvidence::new(stats),
+        },
+    })
 }
 
 fn publish_file(
@@ -605,6 +639,94 @@ mod tests {
     }
 
     #[test]
+    fn staged_file_apply_publishes_and_releases_custody() {
+        let root = temp_root("staged-file-apply");
+        let target = root.join("target.bin");
+        fs::create_dir_all(&root).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"staged").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = crate::Acquired {
+            input: Materialize::new(
+                "demo",
+                LocalPath::new(&staged_path),
+                LocalTarget::new(&target),
+                MaterializeMode::Create,
+            ),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        LocalApply.apply(node).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"staged");
+        assert!(!staged_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_file_apply_failure_releases_custody_without_touching_target() {
+        let root = temp_root("staged-file-apply-fail");
+        let target = root.join("target.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&target, b"original").unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"replacement").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = crate::Acquired {
+            input: Materialize::new(
+                "demo",
+                LocalPath::new(&staged_path),
+                LocalTarget::new(&target),
+                MaterializeMode::Create,
+            ),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        assert!(LocalApply.apply(node).is_err());
+
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(!staged_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_file_publication_io_failure_releases_custody() {
+        let root = temp_root("staged-file-publication-fail");
+        let blocked_parent = root.join("blocked");
+        let target = blocked_parent.join("target.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&blocked_parent, b"existing parent file").unwrap();
+        let staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        fs::write(staged.path(), b"staged").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let node = crate::Acquired {
+            input: Materialize::new(
+                "demo",
+                LocalPath::new(&staged_path),
+                LocalTarget::new(&target),
+                MaterializeMode::Create,
+            ),
+            material: LocalMaterial::StagedFile {
+                path: staged.into_temp_path(),
+            },
+            evidence: (),
+        };
+
+        assert!(LocalApply.apply(node).is_err());
+
+        assert_eq!(fs::read(&blocked_parent).unwrap(), b"existing parent file");
+        assert!(!target.exists());
+        assert!(!staged_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn create_and_replace_are_explicit_apply_laws() {
         let root = temp_root("tree-apply");
         let source = root.join("source.txt");
@@ -737,10 +859,7 @@ mod tests {
                 LocalTarget::new(&target),
                 MaterializeMode::Replace,
             ),
-            material: LocalMaterial {
-                path: source,
-                kind: MaterialKind::File,
-            },
+            material: LocalMaterial::File { path: source },
             evidence: LocalAcquireEvidence {
                 path: target.clone(),
             },
@@ -846,11 +965,11 @@ mod tests {
         let file = LocalInspect.inspect(LocalTarget::new(&file)).unwrap();
         let directory = LocalInspect.inspect(LocalTarget::new(&directory)).unwrap();
 
-        assert_eq!(missing.observation(), &LocalObservation::Missing);
-        assert_eq!(file.observation(), &LocalObservation::File { bytes: 6 });
-        assert_eq!(directory.observation(), &LocalObservation::Directory);
-        assert_eq!(file.evidence(), &LocalInspectEvidence);
-        assert_eq!(fs::read_to_string(&file.input().path).unwrap(), "pulith");
+        assert_eq!(missing.observation, LocalObservation::Missing);
+        assert_eq!(file.observation, LocalObservation::File { bytes: 6 });
+        assert_eq!(directory.observation, LocalObservation::Directory);
+        assert_eq!(file.evidence, LocalInspectEvidence);
+        assert_eq!(fs::read_to_string(&file.input.path).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -864,7 +983,7 @@ mod tests {
 
         let inspected = LocalInspect.inspect(LocalTarget::new(&target)).unwrap();
 
-        assert_eq!(inspected.observation(), &LocalObservation::Symlink);
+        assert_eq!(inspected.observation, LocalObservation::Symlink);
         assert!(
             fs::symlink_metadata(&target)
                 .unwrap()
@@ -891,33 +1010,30 @@ mod tests {
         let wrong_kind = reconcile(&directory, LocalExpectation::File);
         let modified = reconcile(&file, LocalExpectation::FileSize(7));
 
-        assert_eq!(matched.reconciliation(), &LocalReconciliation::Matches);
-        assert_eq!(missing.reconciliation(), &LocalReconciliation::Missing);
+        assert_eq!(matched.reconciliation, LocalReconciliation::Matches);
+        assert_eq!(missing.reconciliation, LocalReconciliation::Missing);
+        assert_eq!(unexpected.reconciliation, LocalReconciliation::Unexpected);
         assert_eq!(
-            unexpected.reconciliation(),
-            &LocalReconciliation::Unexpected
-        );
-        assert_eq!(
-            wrong_kind.reconciliation(),
-            &LocalReconciliation::WrongKind {
+            wrong_kind.reconciliation,
+            LocalReconciliation::WrongKind {
                 expected: LocalEntryKind::File,
                 observed: LocalEntryKind::Directory,
             }
         );
         assert_eq!(
-            modified.reconciliation(),
-            &LocalReconciliation::Modified {
+            modified.reconciliation,
+            LocalReconciliation::Modified {
                 expected_bytes: 7,
                 observed_bytes: 6,
             }
         );
-        assert_eq!(matched.evidence().previous, LocalInspectEvidence);
+        assert_eq!(matched.evidence.previous, LocalInspectEvidence);
         assert_eq!(
-            matched.evidence().current.expected,
+            matched.evidence.current.expected,
             LocalExpectation::FileSize(6)
         );
         assert_eq!(
-            matched.evidence().current.observed,
+            matched.evidence.current.observed,
             LocalObservation::File { bytes: 6 }
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
