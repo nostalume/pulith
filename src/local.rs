@@ -1,50 +1,46 @@
 use std::fs::{self, File};
 use std::io;
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::evidence::LocalApplyStats;
+pub use crate::evidence::{ApplyEvidence, LocalAcquireEvidence, LocalPlacement};
 use crate::{
-    AcquireEvidence, AcquireNode, Acquired, Applied, ApplyEvidence, ApplyNode, Create,
-    CreateOrReplace, EvidenceChain, Forget, InspectNode, Inspected, Intent, Item, LocalApplyStats,
-    LocalPath, LocalTarget, NoEvidence, PrepareEvidence, PrepareNode, Prepared, PulithError,
-    Receipt, ReconcileNode, Reconciled, RememberEvidence, RememberNode, Remembered, Replace,
-    SelectNode, Verified, WithSource,
+    Acquire, Acquired, Applied, Apply, EvidenceChain, Forget, Inspect, Inspected, Materialize,
+    MaterializeMode, PulithError, Reconcile, Reconciled, Verified,
 };
 
-pub(crate) type LocalApplied<O, E> =
-    Applied<Intent<Item, LocalTarget, O>, Receipt<O>, EvidenceChain<E, ApplyEvidence>>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPath {
+    pub path: PathBuf,
+}
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SelectFirst;
-
-impl<I, S> WithSource<I, S> {
-    pub fn select_first(self) -> Result<crate::Chosen<I, S>, PulithError> {
-        SelectFirst.select_node(self)
+impl LocalPath {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 }
 
-impl<I, S> SelectNode<WithSource<I, S>> for SelectFirst {
-    type Source = S;
-    type Error = PulithError;
-    type Output = crate::Chosen<I, S>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalTarget {
+    pub path: PathBuf,
+}
 
-    fn select_node(&self, node: WithSource<I, S>) -> Result<Self::Output, Self::Error> {
-        Ok(crate::Chosen::from_selected(node.input, node.source))
+impl LocalTarget {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalAcquire;
 
-impl<I> AcquireNode<crate::Chosen<I, LocalPath>> for LocalAcquire {
-    type Material = LocalMaterial;
-    type Evidence = AcquireEvidence;
+impl<I, T> Acquire<Materialize<I, LocalPath, T>> for LocalAcquire {
     type Error = PulithError;
-    type Output = Acquired<I, LocalMaterial, AcquireEvidence>;
+    type Output = Acquired<Materialize<I, LocalPath, T>, LocalMaterial, LocalAcquireEvidence>;
 
-    fn acquire_node(&self, node: crate::Chosen<I, LocalPath>) -> Result<Self::Output, Self::Error> {
-        let path = node.source.path;
+    fn acquire(&self, node: Materialize<I, LocalPath, T>) -> Result<Self::Output, Self::Error> {
+        let path = node.source.path.clone();
         if !path.exists() {
             return Err(PulithError::MissingSource(path));
         }
@@ -54,24 +50,18 @@ impl<I> AcquireNode<crate::Chosen<I, LocalPath>> for LocalAcquire {
             MaterialKind::File
         };
         Ok(Acquired::from_acquire(
-            node.input,
+            node,
             LocalMaterial {
                 path: path.clone(),
                 kind,
             },
-            AcquireEvidence { path },
+            LocalAcquireEvidence { path },
         ))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalMaterial {
-    pub path: PathBuf,
-    pub kind: MaterialKind,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalPrepared {
     pub path: PathBuf,
     pub kind: MaterialKind,
 }
@@ -102,16 +92,9 @@ pub enum LocalObservation {
     Other,
 }
 
-/// Concrete metadata operation that produced a local observation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalInspectMethod {
-    NoFollowMetadata,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalInspectEvidence {
-    pub method: LocalInspectMethod,
-}
+/// Evidence that no-follow metadata produced the local observation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalInspectEvidence;
 
 impl LocalObservation {
     pub fn kind(&self) -> LocalEntryKind {
@@ -174,13 +157,11 @@ pub struct LocalReconcileEvidence {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalInspect;
 
-impl InspectNode<LocalTarget> for LocalInspect {
-    type Observation = LocalObservation;
-    type Evidence = LocalInspectEvidence;
+impl Inspect<LocalTarget> for LocalInspect {
     type Error = PulithError;
     type Output = Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>;
 
-    fn inspect_node(&self, node: LocalTarget) -> Result<Self::Output, Self::Error> {
+    fn inspect(&self, node: LocalTarget) -> Result<Self::Output, Self::Error> {
         let observation = match fs::symlink_metadata(&node.path) {
             Ok(metadata) => {
                 let file_type = metadata.file_type();
@@ -203,9 +184,7 @@ impl InspectNode<LocalTarget> for LocalInspect {
         Ok(Inspected::from_inspect(
             node,
             observation,
-            LocalInspectEvidence {
-                method: LocalInspectMethod::NoFollowMetadata,
-            },
+            LocalInspectEvidence,
         ))
     }
 }
@@ -214,18 +193,20 @@ impl InspectNode<LocalTarget> for LocalInspect {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalReconcile;
 
-impl ReconcileNode<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>>
+impl Reconcile<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>, LocalExpectation>
     for LocalReconcile
 {
-    type Need = LocalExpectation;
-    type Evidence = EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>;
     type Error = std::convert::Infallible;
-    type Output = Reconciled<LocalTarget, LocalReconciliation, Self::Evidence>;
+    type Output = Reconciled<
+        LocalTarget,
+        LocalReconciliation,
+        EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>,
+    >;
 
-    fn reconcile_node(
+    fn reconcile(
         &self,
         node: Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>,
-        expected: Self::Need,
+        expected: LocalExpectation,
     ) -> Result<Self::Output, Self::Error> {
         let Inspected {
             input,
@@ -262,171 +243,48 @@ impl ReconcileNode<Inspected<LocalTarget, LocalObservation, LocalInspectEvidence
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Identity;
-
 #[derive(Clone, Copy, Debug, Default)]
-pub struct IdentityVerify;
+pub struct LocalApply;
 
-impl<I, E> crate::VerifyNode<Acquired<I, LocalMaterial, E>> for IdentityVerify {
-    type Need = Identity;
-    type Evidence = NoEvidence;
+type LocalApplied<I, S, E> =
+    Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+
+impl<I, S, E> Apply<Acquired<Materialize<I, S, LocalTarget>, LocalMaterial, E>> for LocalApply {
     type Error = PulithError;
-    type Output = Verified<I, LocalMaterial, E>;
+    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
 
-    fn verify_node(
+    fn apply(
         &self,
-        node: Acquired<I, LocalMaterial, E>,
-        _need: Self::Need,
+        node: Acquired<Materialize<I, S, LocalTarget>, LocalMaterial, E>,
     ) -> Result<Self::Output, Self::Error> {
-        Ok(Verified::from_verify(
-            node.input,
-            node.material,
-            node.evidence,
-        ))
+        apply_material(node.input, node.material, node.evidence)
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IdentityPrepare;
-
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>> for IdentityPrepare {
-    type Need = Identity;
-    type Prepared = LocalPrepared;
-    type Evidence = PrepareEvidence;
+impl<I, S, E> Apply<Verified<Materialize<I, S, LocalTarget>, LocalMaterial, E>> for LocalApply {
     type Error = PulithError;
-    type Output = Prepared<I, LocalPrepared, EvidenceChain<E, PrepareEvidence>>;
+    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
 
-    fn prepare_node(
+    fn apply(
         &self,
-        node: Verified<I, LocalMaterial, E>,
-        _need: Self::Need,
+        node: Verified<Materialize<I, S, LocalTarget>, LocalMaterial, E>,
     ) -> Result<Self::Output, Self::Error> {
-        let prepared = LocalPrepared {
-            path: node.material.path.clone(),
-            kind: node.material.kind,
-        };
-        Ok(Prepared::from_prepare(
-            node.input,
-            prepared,
-            EvidenceChain::new(
-                node.evidence,
-                PrepareEvidence {
-                    path: node.material.path,
-                },
-            ),
-        ))
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LocalApply<O> {
-    _op: PhantomData<O>,
-}
-
-impl<O> LocalApply<O> {
-    pub fn new() -> Self {
-        Self { _op: PhantomData }
-    }
-}
-
-impl<E> ApplyNode<Prepared<Intent<Item, LocalTarget, Create>, LocalPrepared, E>>
-    for LocalApply<Create>
-{
-    type Receipt = Receipt<Create>;
-    type Evidence = ApplyEvidence;
-    type Error = PulithError;
-    type Output = Applied<
-        Intent<Item, LocalTarget, Create>,
-        Receipt<Create>,
-        EvidenceChain<E, ApplyEvidence>,
-    >;
-
-    fn apply_node(
-        &self,
-        node: Prepared<Intent<Item, LocalTarget, Create>, LocalPrepared, E>,
-    ) -> Result<Self::Output, Self::Error> {
-        if node.input.target.path.exists() {
-            return Err(PulithError::ApplyWouldOverwrite(node.input.target.path));
-        }
-        apply_staged(node, Create, PublishMode::Create)
-    }
-}
-
-impl<E> ApplyNode<Prepared<Intent<Item, LocalTarget, Replace>, LocalPrepared, E>>
-    for LocalApply<Replace>
-{
-    type Receipt = Receipt<Replace>;
-    type Evidence = ApplyEvidence;
-    type Error = PulithError;
-    type Output = Applied<
-        Intent<Item, LocalTarget, Replace>,
-        Receipt<Replace>,
-        EvidenceChain<E, ApplyEvidence>,
-    >;
-
-    fn apply_node(
-        &self,
-        node: Prepared<Intent<Item, LocalTarget, Replace>, LocalPrepared, E>,
-    ) -> Result<Self::Output, Self::Error> {
-        if !node.input.target.path.exists() {
-            return Err(PulithError::ApplyMissingTarget(node.input.target.path));
-        }
-        apply_staged(node, Replace, PublishMode::Replace)
-    }
-}
-
-impl<E> ApplyNode<Prepared<Intent<Item, LocalTarget, CreateOrReplace>, LocalPrepared, E>>
-    for LocalApply<CreateOrReplace>
-{
-    type Receipt = Receipt<CreateOrReplace>;
-    type Evidence = ApplyEvidence;
-    type Error = PulithError;
-    type Output = Applied<
-        Intent<Item, LocalTarget, CreateOrReplace>,
-        Receipt<CreateOrReplace>,
-        EvidenceChain<E, ApplyEvidence>,
-    >;
-
-    fn apply_node(
-        &self,
-        node: Prepared<Intent<Item, LocalTarget, CreateOrReplace>, LocalPrepared, E>,
-    ) -> Result<Self::Output, Self::Error> {
-        apply_staged(node, CreateOrReplace, PublishMode::CreateOrReplace)
+        apply_material(node.input, node.material, node.evidence)
     }
 }
 
 /// Removes the exact caller-authorized local target without acquiring a source.
-///
-/// Directory targets are removed recursively and symlink targets are removed as links. As with
-/// other local behaviors, parent directories are trusted and hostile concurrent mutation is not
-/// sandboxed.
-impl ApplyNode<Intent<Item, LocalTarget, Forget>> for LocalApply<Forget> {
-    type Receipt = Receipt<Forget>;
-    type Evidence = ApplyEvidence;
+impl<I> Apply<Forget<I, LocalTarget>> for LocalApply {
     type Error = PulithError;
-    type Output = Applied<Intent<Item, LocalTarget, Forget>, Receipt<Forget>, ApplyEvidence>;
+    type Output = Applied<Forget<I, LocalTarget>, ApplyEvidence>;
 
-    fn apply_node(
-        &self,
-        node: Intent<Item, LocalTarget, Forget>,
-    ) -> Result<Self::Output, Self::Error> {
+    fn apply(&self, node: Forget<I, LocalTarget>) -> Result<Self::Output, Self::Error> {
         match remove_existing(&node.target.path) {
             Ok(()) => {}
             Err(PulithError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let target = node.target.path.clone();
-        let receipt = Receipt {
-            item: node.item.name.clone(),
-            target: target.clone(),
-            op: Forget,
-        };
-        Ok(Applied::from_apply(
-            node,
-            receipt,
-            ApplyEvidence::removed(target),
-        ))
+        Ok(Applied::from_apply(node, ApplyEvidence::removed()))
     }
 }
 
@@ -437,63 +295,37 @@ enum PublishMode {
     CreateOrReplace,
 }
 
-fn apply_staged<O, E>(
-    node: Prepared<Intent<Item, LocalTarget, O>, LocalPrepared, E>,
-    op: O,
-    mode: PublishMode,
-) -> Result<LocalApplied<O, E>, PulithError> {
-    let target = node.input.target.path.clone();
-    reject_unsupported_entry(&node.prepared.path)?;
-    reject_same_source_target(&node.prepared.path, &target)?;
-
-    let stats = match node.prepared.kind {
-        MaterialKind::File => publish_file(&node.prepared.path, &target, mode)?,
-        MaterialKind::Directory => publish_directory(&node.prepared.path, &target, mode)?,
+pub(crate) fn apply_material<I, S, E>(
+    input: Materialize<I, S, LocalTarget>,
+    material: LocalMaterial,
+    evidence: E,
+) -> Result<LocalApplied<I, S, E>, PulithError> {
+    let target = input.target.path.clone();
+    let mode = match input.mode {
+        MaterializeMode::Create => {
+            if target.exists() {
+                return Err(PulithError::ApplyWouldOverwrite(target));
+            }
+            PublishMode::Create
+        }
+        MaterializeMode::Replace => {
+            if !target.exists() {
+                return Err(PulithError::ApplyMissingTarget(target));
+            }
+            PublishMode::Replace
+        }
+        MaterializeMode::CreateOrReplace => PublishMode::CreateOrReplace,
     };
-
-    let receipt = Receipt {
-        item: node.input.item.name.clone(),
-        target: target.clone(),
-        op,
+    reject_unsupported_entry(&material.path)?;
+    reject_same_source_target(&material.path, &target)?;
+    let stats = match material.kind {
+        MaterialKind::File => publish_file(&material.path, &target, mode)?,
+        MaterialKind::Directory => publish_directory(&material.path, &target, mode)?,
     };
     Ok(Applied::from_apply(
-        node.input,
-        receipt,
-        EvidenceChain::new(node.evidence, ApplyEvidence::new(target, stats)),
+        input,
+        EvidenceChain::new(evidence, ApplyEvidence::new(stats)),
     ))
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct MemoryRemember;
-
-impl<I, R, E> RememberNode<Applied<I, R, E>> for MemoryRemember
-where
-    R: RememberedItem,
-{
-    type Evidence = RememberEvidence;
-    type Error = PulithError;
-    type Output = Remembered<I, R, EvidenceChain<E, RememberEvidence>>;
-
-    fn remember_node(&self, node: Applied<I, R, E>) -> Result<Self::Output, Self::Error> {
-        let evidence = RememberEvidence {
-            item: node.receipt.item_name().to_string(),
-        };
-        Ok(Remembered::from_remember(
-            node.input,
-            node.receipt,
-            EvidenceChain::new(node.evidence, evidence),
-        ))
-    }
-}
-
-pub trait RememberedItem {
-    fn item_name(&self) -> &str;
-}
-
-impl<O> RememberedItem for Receipt<O> {
-    fn item_name(&self) -> &str {
-        &self.item
-    }
 }
 
 fn publish_file(
@@ -740,13 +572,8 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file;
 
-    use crate::{
-        AcquireNode, ApplyNode, Create, CreateOrReplace, Forget, Identity, IdentityPrepare,
-        IdentityVerify, InspectNode, Intent, Item, LocalAcquire, LocalApply, LocalExpectation,
-        LocalInspect, LocalObservation, LocalPath, LocalPlacement, LocalReconcile,
-        LocalReconciliation, LocalTarget, MemoryRemember, PrepareNode, ReconcileNode, RememberNode,
-        Replace, VerifyNode,
-    };
+    use super::*;
+    use crate::{Acquire, Apply, Forget, Inspect, Materialize, MaterializeMode, Reconcile};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -766,27 +593,19 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "pulith").unwrap();
 
-        let chosen = Intent::new(Item::new("demo"), LocalTarget::new(&target))
-            .with_source(LocalPath::new(&source))
-            .select_first()
+        let applied = LocalApply
+            .apply(acquire(MaterializeMode::CreateOrReplace, &source, &target))
             .unwrap();
-        let acquired = LocalAcquire.acquire_node(chosen).unwrap();
-        let verified = IdentityVerify.verify_node(acquired, Identity).unwrap();
-        let prepared = IdentityPrepare.prepare_node(verified, Identity).unwrap();
-        let applied = LocalApply::<CreateOrReplace>::new()
-            .apply_node(prepared)
-            .unwrap();
-        let remembered = MemoryRemember.remember_node(applied).unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
-        assert_eq!(remembered.receipt.item, "demo");
-        assert_eq!(remembered.evidence.current.item, "demo");
+        assert_eq!(applied.input.item, "demo");
+        assert_eq!(applied.evidence.current.strategy, LocalPlacement::Copied);
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn create_and_replace_are_typed_apply_laws() {
+    fn create_and_replace_are_explicit_apply_laws() {
         let root = temp_root("tree-apply");
         let source = root.join("source.txt");
         let target = root.join("target.txt");
@@ -794,17 +613,15 @@ mod tests {
         fs::write(&source, "first").unwrap();
         fs::write(&target, "existing").unwrap();
 
-        let create_prepared = prepare::<Create>(&source, &target);
         assert!(
-            LocalApply::<Create>::new()
-                .apply_node(create_prepared)
+            LocalApply
+                .apply(acquire(MaterializeMode::Create, &source, &target))
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
 
-        let replace_prepared = prepare::<Replace>(&source, &target);
-        let replaced = LocalApply::<Replace>::new()
-            .apply_node(replace_prepared)
+        let replaced = LocalApply
+            .apply(acquire(MaterializeMode::Replace, &source, &target))
             .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "first");
         assert_eq!(replaced.evidence.current.files, 1);
@@ -822,12 +639,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&target, "obsolete").unwrap();
 
-        let intent = Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>();
-        let applied = LocalApply::<Forget>::new().apply_node(intent).unwrap();
+        let applied = LocalApply
+            .apply(Forget::new("demo", LocalTarget::new(&target)))
+            .unwrap();
 
         assert!(!target.exists());
-        assert_eq!(applied.receipt.item, "demo");
-        assert_eq!(applied.receipt.target, target);
+        assert_eq!(applied.input.item, "demo");
+        assert_eq!(applied.input.target.path, target);
         assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
         fs::remove_dir_all(root).unwrap();
@@ -839,12 +657,12 @@ mod tests {
         let target = root.join("missing.txt");
         fs::create_dir_all(&root).unwrap();
 
-        let applied = LocalApply::<Forget>::new()
-            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+        let applied = LocalApply
+            .apply(Forget::new("demo", LocalTarget::new(&target)))
             .unwrap();
 
         assert!(!target.exists());
-        assert_eq!(applied.receipt.target, target);
+        assert_eq!(applied.input.target.path, target);
         assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
         fs::remove_dir_all(root).unwrap();
@@ -864,8 +682,8 @@ mod tests {
                 .is_symlink()
         );
 
-        LocalApply::<Forget>::new()
-            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+        LocalApply
+            .apply(Forget::new("demo", LocalTarget::new(&target)))
             .unwrap();
 
         assert_eq!(
@@ -882,8 +700,8 @@ mod tests {
         fs::create_dir_all(target.join("nested")).unwrap();
         fs::write(target.join("nested/file.txt"), "obsolete").unwrap();
 
-        LocalApply::<Forget>::new()
-            .apply_node(Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Forget>())
+        LocalApply
+            .apply(Forget::new("demo", LocalTarget::new(&target)))
             .unwrap();
 
         assert!(!target.exists());
@@ -897,12 +715,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "same").unwrap();
 
-        let prepared = prepare::<CreateOrReplace>(&source, &source);
-        assert!(
-            LocalApply::<CreateOrReplace>::new()
-                .apply_node(prepared)
-                .is_err()
-        );
+        let acquired = acquire(MaterializeMode::CreateOrReplace, &source, &source);
+        assert!(LocalApply.apply(acquired).is_err());
         assert_eq!(fs::read_to_string(&source).unwrap(), "same");
 
         fs::remove_dir_all(root).unwrap();
@@ -916,16 +730,23 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&target, "old").unwrap();
 
-        let node = crate::Prepared {
-            input: Intent::new(Item::new("demo"), LocalTarget::new(&target)).op::<Replace>(),
-            prepared: crate::LocalPrepared {
+        let node = crate::Acquired {
+            input: Materialize::new(
+                "demo",
+                LocalPath::new(&source),
+                LocalTarget::new(&target),
+                MaterializeMode::Replace,
+            ),
+            material: LocalMaterial {
                 path: source,
-                kind: crate::MaterialKind::File,
+                kind: MaterialKind::File,
             },
-            evidence: crate::NoEvidence,
+            evidence: LocalAcquireEvidence {
+                path: target.clone(),
+            },
         };
 
-        assert!(LocalApply::<Replace>::new().apply_node(node).is_err());
+        assert!(LocalApply.apply(node).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "old");
 
         fs::remove_dir_all(root).unwrap();
@@ -940,8 +761,8 @@ mod tests {
         fs::write(source.join("a.txt"), "alpha").unwrap();
         fs::write(source.join("nested").join("b.txt"), "beta").unwrap();
 
-        let applied = LocalApply::<Create>::new()
-            .apply_node(prepare::<Create>(&source, &target))
+        let applied = LocalApply
+            .apply(acquire(MaterializeMode::Create, &source, &target))
             .unwrap();
 
         assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "alpha");
@@ -966,7 +787,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("old.txt"), "old").unwrap();
 
-        let result = LocalApply::<Replace>::new().apply_node(prepare::<Replace>(&source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::Replace, &source, &target));
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(target.join("old.txt")).unwrap(), "old");
 
@@ -982,8 +803,8 @@ mod tests {
         fs::write(source.join("new.txt"), "new").unwrap();
         fs::write(&target, "old").unwrap();
 
-        LocalApply::<Replace>::new()
-            .apply_node(prepare::<Replace>(&source, &target))
+        LocalApply
+            .apply(acquire(MaterializeMode::Replace, &source, &target))
             .unwrap();
 
         assert_eq!(fs::read_to_string(target.join("new.txt")).unwrap(), "new");
@@ -1005,7 +826,7 @@ mod tests {
         let target = source.join("nested").join("target");
         fs::create_dir_all(&source).unwrap();
 
-        let result = LocalApply::<Create>::new().apply_node(prepare::<Create>(&source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::Create, &source, &target));
         assert!(result.is_err());
         assert!(!target.exists());
 
@@ -1021,21 +842,14 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let missing = LocalInspect
-            .inspect_node(LocalTarget::new(&missing))
-            .unwrap();
-        let file = LocalInspect.inspect_node(LocalTarget::new(&file)).unwrap();
-        let directory = LocalInspect
-            .inspect_node(LocalTarget::new(&directory))
-            .unwrap();
+        let missing = LocalInspect.inspect(LocalTarget::new(&missing)).unwrap();
+        let file = LocalInspect.inspect(LocalTarget::new(&file)).unwrap();
+        let directory = LocalInspect.inspect(LocalTarget::new(&directory)).unwrap();
 
         assert_eq!(missing.observation(), &LocalObservation::Missing);
         assert_eq!(file.observation(), &LocalObservation::File { bytes: 6 });
         assert_eq!(directory.observation(), &LocalObservation::Directory);
-        assert_eq!(
-            file.evidence().method,
-            crate::LocalInspectMethod::NoFollowMetadata
-        );
+        assert_eq!(file.evidence(), &LocalInspectEvidence);
         assert_eq!(fs::read_to_string(&file.input().path).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
@@ -1048,9 +862,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         symlink_file(root.join("missing-source"), &target).unwrap();
 
-        let inspected = LocalInspect
-            .inspect_node(LocalTarget::new(&target))
-            .unwrap();
+        let inspected = LocalInspect.inspect(LocalTarget::new(&target)).unwrap();
 
         assert_eq!(inspected.observation(), &LocalObservation::Symlink);
         assert!(
@@ -1088,8 +900,8 @@ mod tests {
         assert_eq!(
             wrong_kind.reconciliation(),
             &LocalReconciliation::WrongKind {
-                expected: crate::LocalEntryKind::File,
-                observed: crate::LocalEntryKind::Directory,
+                expected: LocalEntryKind::File,
+                observed: LocalEntryKind::Directory,
             }
         );
         assert_eq!(
@@ -1099,10 +911,7 @@ mod tests {
                 observed_bytes: 6,
             }
         );
-        assert_eq!(
-            matched.evidence().previous.method,
-            crate::LocalInspectMethod::NoFollowMetadata
-        );
+        assert_eq!(matched.evidence().previous, LocalInspectEvidence);
         assert_eq!(
             matched.evidence().current.expected,
             LocalExpectation::FileSize(6)
@@ -1122,11 +931,11 @@ mod tests {
     ) -> crate::Reconciled<
         LocalTarget,
         LocalReconciliation,
-        crate::EvidenceChain<crate::LocalInspectEvidence, crate::LocalReconcileEvidence>,
+        crate::EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>,
     > {
         LocalReconcile
-            .reconcile_node(
-                LocalInspect.inspect_node(LocalTarget::new(path)).unwrap(),
+            .reconcile(
+                LocalInspect.inspect(LocalTarget::new(path)).unwrap(),
                 expected,
             )
             .unwrap()
@@ -1144,28 +953,29 @@ mod tests {
         fs::write(source.join("real.txt"), "real").unwrap();
         symlink("real.txt", source.join("link.txt")).unwrap();
 
-        let result = LocalApply::<Create>::new().apply_node(prepare::<Create>(&source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::Create, &source, &target));
         assert!(result.is_err());
         assert!(!target.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn prepare<O>(
+    fn acquire(
+        mode: MaterializeMode,
         source: &std::path::Path,
         target: &std::path::Path,
-    ) -> crate::Prepared<
-        crate::Intent<crate::Item, crate::LocalTarget, O>,
-        crate::LocalPrepared,
-        crate::EvidenceChain<crate::AcquireEvidence, crate::PrepareEvidence>,
+    ) -> crate::Acquired<
+        Materialize<&'static str, LocalPath, LocalTarget>,
+        LocalMaterial,
+        LocalAcquireEvidence,
     > {
-        let chosen = Intent::new(Item::new("demo"), LocalTarget::new(target))
-            .op::<O>()
-            .with_source(LocalPath::new(source))
-            .select_first()
-            .unwrap();
-        let acquired = LocalAcquire.acquire_node(chosen).unwrap();
-        let verified = IdentityVerify.verify_node(acquired, Identity).unwrap();
-        IdentityPrepare.prepare_node(verified, Identity).unwrap()
+        LocalAcquire
+            .acquire(Materialize::new(
+                "demo",
+                LocalPath::new(source),
+                LocalTarget::new(target),
+                mode,
+            ))
+            .unwrap()
     }
 }

@@ -6,15 +6,18 @@ Pulith is one feature-gated Rust crate ecosystem for composing typed external-re
 behaviors. Artifact materialization is one concrete behavior family:
 
 ```text
-materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
-forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
-observe:     LocalTarget -> Inspected -> Reconciled
-             RemoteUrl  -> Inspected
+Materialize -> Acquired -> Applied
+                        -> Verified -> Applied
+                        -> Prepared -> Applied
+                        -> Verified -> Prepared -> Applied
+Forget -----------------------------> Applied
+LocalTarget -> Inspected -> Reconciled
+RemoteUrl  --> Inspected
 ```
 
-Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
-plus its `Evidence`, `Error`, and `Output`. Callers compose policy and effects; there is no global
-`App`, `Context`, registry, or factory.
+Each behavior passes policy `Need` as a trait type parameter where required and declares associated
+`Error` and `Output` contracts. The typed `Output` carries the behavior's evidence. Callers compose
+policy and effects; there is no global `App`, `Context`, registry, or factory.
 
 Keep three axes orthogonal:
 
@@ -63,12 +66,13 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 ## Design rules
 
 - Design behavior and evidence laws before code.
-- For every public behavior, document input, `Need` where required, `Evidence`, `Error`, `Output`,
-  effect/failure law, authority owner, resource semantics, and concrete adapter or caller.
-- Preserve the typed transition chain and associated types.
+- For every public behavior, document input, `Need` where required, output-carried `Evidence`,
+  `Error`, `Output`, effect/failure law, authority owner, resource semantics, and concrete adapter
+  or caller.
+- Preserve the typed transition chain, generic `Need`, and associated `Error`/`Output` contracts.
 - Treat state types as composition vocabulary, not proof that every transition has a built-in
   concrete behavior; document implemented and caller-owned boundaries explicitly.
-- Target-only operations such as `Forget` branch directly from intent to apply and must not require
+- Target-only operations such as `Forget` branch directly to apply and must not require
   a synthetic source, acquisition, verification, or preparation path.
 - Prefer enum/ZST/associated-type identity over strings.
 - Keep sync and async semantics aligned; only execution modality may differ.

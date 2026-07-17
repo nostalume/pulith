@@ -24,12 +24,14 @@ use std::time::{Duration, SystemTime};
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
 use governor::clock::Clock;
 
-#[cfg(feature = "ureq")]
-use crate::{AcquireNode, InspectNode};
 #[cfg(any(feature = "reqwest", feature = "ureq"))]
-use crate::{Acquired, Chosen, Inspected, LocalMaterial, MaterialKind};
+use crate::local::{LocalMaterial, MaterialKind};
+#[cfg(feature = "ureq")]
+use crate::{Acquire, Inspect};
+#[cfg(any(feature = "reqwest", feature = "ureq"))]
+use crate::{Acquired, Inspected, Materialize};
 #[cfg(feature = "reqwest")]
-use crate::{AsyncAcquireNode, AsyncInspectNode};
+use crate::{AsyncAcquire, AsyncInspect};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteUrlError {
@@ -80,18 +82,7 @@ pub enum AcquireError {
         attempts: Vec<AttemptEvidence>,
         resume: Option<ResumeEvidence>,
     },
-    Admission {
-        url: url::Url,
-        kind: AdmissionError,
-        attempts: Vec<AttemptEvidence>,
-        resume: Option<ResumeEvidence>,
-    },
-    Pacing {
-        url: url::Url,
-        kind: PacingError,
-        attempts: Vec<AttemptEvidence>,
-        resume: Option<ResumeEvidence>,
-    },
+
     Local {
         url: Option<url::Url>,
         action: &'static str,
@@ -126,40 +117,6 @@ pub enum UnsafeDestination {
     NonFile,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionError {
-    Unavailable,
-    Closed,
-    Rejected,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PacingError {
-    Unavailable,
-    Closed,
-    Rejected,
-}
-
-impl From<PacingError> for AdmissionError {
-    fn from(error: PacingError) -> Self {
-        match error {
-            PacingError::Unavailable => Self::Unavailable,
-            PacingError::Closed => Self::Closed,
-            PacingError::Rejected => Self::Rejected,
-        }
-    }
-}
-
-impl From<AdmissionError> for PacingError {
-    fn from(error: AdmissionError) -> Self {
-        match error {
-            AdmissionError::Unavailable => Self::Unavailable,
-            AdmissionError::Closed => Self::Closed,
-            AdmissionError::Rejected => Self::Rejected,
-        }
-    }
-}
-
 impl fmt::Display for AcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -189,12 +146,7 @@ impl fmt::Display for AcquireError {
                     "net acquire byte limit exceeded for {url}: {actual} > {max}"
                 )
             }
-            Self::Admission { url, kind, .. } => {
-                write!(f, "net acquire admission failed for {url}: {kind:?}")
-            }
-            Self::Pacing { url, kind, .. } => {
-                write!(f, "net acquire byte pacing failed for {url}: {kind:?}")
-            }
+
             Self::Local {
                 action,
                 path,
@@ -306,8 +258,6 @@ pub struct AcquirePolicy {
     pub headers: Vec<(String, String)>,
     pub retry: RetryPolicy,
     pub resume: ResumePolicy,
-    pub admission: AdmissionMode,
-    pub byte_pacing: BytePacingMode,
 }
 
 impl AcquirePolicy {
@@ -335,31 +285,6 @@ impl AcquirePolicy {
         self.resume = resume;
         self
     }
-
-    pub fn admission(mut self, admission: AdmissionMode) -> Self {
-        self.admission = admission;
-        self
-    }
-
-    pub fn shared_admission(self) -> Self {
-        self.admission(AdmissionMode::Shared)
-    }
-
-    pub fn byte_pacing(mut self, byte_pacing: BytePacingMode) -> Self {
-        self.byte_pacing = byte_pacing;
-        self
-    }
-
-    pub fn shared_byte_pacing(self) -> Self {
-        self.byte_pacing(BytePacingMode::Shared)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum AdmissionMode {
-    #[default]
-    Unbounded,
-    Shared,
 }
 
 /// A sustained outbound-attempt rate and its burst capacity.
@@ -427,6 +352,26 @@ impl RateAdmission {
             Err(not_until) => Some(not_until.wait_time_from(self.limiter.clock().now())),
         }
     }
+
+    #[cfg(feature = "ureq")]
+    fn enter_sync(&self) -> Duration {
+        let mut waited = Duration::ZERO;
+        while let Some(wait) = self.check() {
+            std::thread::sleep(wait);
+            waited = waited.saturating_add(wait);
+        }
+        waited
+    }
+
+    #[cfg(feature = "reqwest")]
+    async fn enter_async(&self) -> Duration {
+        let mut waited = Duration::ZERO;
+        while let Some(wait) = self.check() {
+            tokio::time::sleep(wait).await;
+            waited = waited.saturating_add(wait);
+        }
+        waited
+    }
 }
 
 impl fmt::Debug for RateAdmission {
@@ -443,13 +388,6 @@ impl fmt::Debug for RateAdmission {
 /// before that chunk enters the staging artifact. It is not raw socket
 /// bandwidth control: the HTTP client, TLS stack, or kernel may already have
 /// buffered bytes before Pulith observes the chunk.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum BytePacingMode {
-    #[default]
-    Unbounded,
-    Shared,
-}
-
 /// A body-copy byte rate and its maximum burst capacity.
 ///
 /// `bytes_per_second` is the sustained GCRA rate. `burst_bytes` is the largest
@@ -516,12 +454,40 @@ impl ByteRatePacer {
     }
 
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
-    fn check_batch(&self, batch: NonZeroU32) -> Result<Option<Duration>, PacingError> {
+    fn check_batch(&self, batch: NonZeroU32) -> Option<Duration> {
         match self.limiter.check_n(batch) {
-            Ok(Ok(_)) => Ok(None),
-            Ok(Err(not_until)) => Ok(Some(not_until.wait_time_from(self.limiter.clock().now()))),
-            Err(_) => Err(PacingError::Rejected),
+            Ok(Ok(_)) => None,
+            Ok(Err(not_until)) => Some(not_until.wait_time_from(self.limiter.clock().now())),
+            Err(_) => unreachable!("pacing batches never exceed configured burst"),
         }
+    }
+
+    #[cfg(feature = "ureq")]
+    fn before_chunk_sync(&self, bytes: u64) -> Duration {
+        let mut remaining = bytes;
+        let mut waited = Duration::ZERO;
+        while let Some(batch) = self.next_batch(remaining) {
+            while let Some(wait) = self.check_batch(batch) {
+                std::thread::sleep(wait);
+                waited = waited.saturating_add(wait);
+            }
+            remaining -= u64::from(batch.get());
+        }
+        waited
+    }
+
+    #[cfg(feature = "reqwest")]
+    async fn before_chunk_async(&self, bytes: u64) -> Duration {
+        let mut remaining = bytes;
+        let mut waited = Duration::ZERO;
+        while let Some(batch) = self.next_batch(remaining) {
+            while let Some(wait) = self.check_batch(batch) {
+                tokio::time::sleep(wait).await;
+                waited = waited.saturating_add(wait);
+            }
+            remaining -= u64::from(batch.get());
+        }
+        waited
     }
 }
 
@@ -530,171 +496,6 @@ impl fmt::Debug for ByteRatePacer {
         f.debug_struct("ByteRatePacer")
             .field("rate", &self.rate)
             .finish_non_exhaustive()
-    }
-}
-
-pub struct AdmissionPermit {
-    waited: Duration,
-}
-
-impl AdmissionPermit {
-    pub fn immediate() -> Self {
-        Self {
-            waited: Duration::ZERO,
-        }
-    }
-
-    pub fn waited(waited: Duration) -> Self {
-        Self { waited }
-    }
-
-    pub fn waited_for(&self) -> Duration {
-        self.waited
-    }
-}
-
-/// Evidence returned when a body chunk is admitted for staged writing.
-pub struct BytePacingPermit {
-    waited: Duration,
-}
-
-impl BytePacingPermit {
-    pub fn immediate() -> Self {
-        Self {
-            waited: Duration::ZERO,
-        }
-    }
-
-    pub fn waited(waited: Duration) -> Self {
-        Self { waited }
-    }
-
-    pub fn waited_for(&self) -> Duration {
-        self.waited
-    }
-}
-
-#[cfg(feature = "ureq")]
-pub trait SyncAdmission: Send + Sync {
-    fn enter(&self) -> Result<AdmissionPermit, AdmissionError>;
-}
-
-#[cfg(feature = "reqwest")]
-pub trait AsyncAdmission: Send + Sync {
-    fn enter(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<AdmissionPermit, AdmissionError>> + Send + '_>>;
-}
-
-#[cfg(feature = "ureq")]
-impl SyncAdmission for RateAdmission {
-    fn enter(&self) -> Result<AdmissionPermit, AdmissionError> {
-        let mut waited = Duration::ZERO;
-        loop {
-            match self.check() {
-                None => return Ok(AdmissionPermit::waited(waited)),
-                Some(wait) => {
-                    std::thread::sleep(wait);
-                    waited = waited.saturating_add(wait);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "reqwest")]
-impl AsyncAdmission for RateAdmission {
-    fn enter(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<AdmissionPermit, AdmissionError>> + Send + '_>> {
-        Box::pin(async move {
-            let mut waited = Duration::ZERO;
-            loop {
-                match self.check() {
-                    None => return Ok(AdmissionPermit::waited(waited)),
-                    Some(wait) => {
-                        tokio::time::sleep(wait).await;
-                        waited = waited.saturating_add(wait);
-                    }
-                }
-            }
-        })
-    }
-}
-
-#[cfg(feature = "ureq")]
-/// Synchronous body-copy pacer.
-///
-/// `before_chunk` is called after `max_bytes` accepts an observed chunk and
-/// before the chunk is written into staging.
-pub trait SyncBytePacer: Send + Sync {
-    fn before_chunk(&self, bytes: u64) -> Result<BytePacingPermit, PacingError>;
-}
-
-#[cfg(feature = "reqwest")]
-/// Asynchronous body-copy pacer.
-///
-/// `before_chunk` is awaited after `max_bytes` accepts an observed chunk and
-/// before the chunk is written into staging.
-pub trait AsyncBytePacer: Send + Sync {
-    fn before_chunk(
-        &self,
-        bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<BytePacingPermit, PacingError>> + Send + '_>>;
-}
-
-#[cfg(feature = "ureq")]
-impl SyncBytePacer for ByteRatePacer {
-    fn before_chunk(&self, bytes: u64) -> Result<BytePacingPermit, PacingError> {
-        if bytes == 0 {
-            return Ok(BytePacingPermit::immediate());
-        }
-
-        let mut remaining = bytes;
-        let mut waited = Duration::ZERO;
-        while let Some(batch) = self.next_batch(remaining) {
-            loop {
-                match self.check_batch(batch)? {
-                    None => break,
-                    Some(wait) => {
-                        std::thread::sleep(wait);
-                        waited = waited.saturating_add(wait);
-                    }
-                }
-            }
-            remaining -= u64::from(batch.get());
-        }
-        Ok(BytePacingPermit::waited(waited))
-    }
-}
-
-#[cfg(feature = "reqwest")]
-impl AsyncBytePacer for ByteRatePacer {
-    fn before_chunk(
-        &self,
-        bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<BytePacingPermit, PacingError>> + Send + '_>> {
-        Box::pin(async move {
-            if bytes == 0 {
-                return Ok(BytePacingPermit::immediate());
-            }
-
-            let mut remaining = bytes;
-            let mut waited = Duration::ZERO;
-            while let Some(batch) = self.next_batch(remaining) {
-                loop {
-                    match self.check_batch(batch)? {
-                        None => break,
-                        Some(wait) => {
-                            tokio::time::sleep(wait).await;
-                            waited = waited.saturating_add(wait);
-                        }
-                    }
-                }
-                remaining -= u64::from(batch.get());
-            }
-            Ok(BytePacingPermit::waited(waited))
-        })
     }
 }
 
@@ -747,7 +548,6 @@ impl RetryPolicy {
 pub struct HttpInspectPolicy {
     pub timeout: Option<Duration>,
     pub retry: RetryPolicy,
-    pub admission: AdmissionMode,
 }
 
 impl HttpInspectPolicy {
@@ -760,17 +560,6 @@ impl HttpInspectPolicy {
         self.retry = retry;
         self
     }
-
-    pub fn shared_admission(mut self) -> Self {
-        self.admission = AdmissionMode::Shared;
-        self
-    }
-}
-
-/// Request mechanism used to produce HTTP inspection evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpInspectMethod {
-    Head,
 }
 
 /// HTTP-specific facts reported by a HEAD response.
@@ -811,7 +600,6 @@ impl HttpInspectAttemptEvidence {
 pub struct HttpInspectEvidence {
     pub requested_url: url::Url,
     pub final_url: url::Url,
-    pub method: HttpInspectMethod,
     pub attempts: Vec<HttpInspectAttemptEvidence>,
 }
 
@@ -823,11 +611,7 @@ pub enum HttpInspectError {
         message: String,
         attempts: Vec<HttpInspectAttemptEvidence>,
     },
-    Admission {
-        url: url::Url,
-        kind: AdmissionError,
-        attempts: Vec<HttpInspectAttemptEvidence>,
-    },
+
     Protocol {
         url: url::Url,
         message: String,
@@ -841,9 +625,7 @@ impl fmt::Display for HttpInspectError {
             Self::Transport { url, message, .. } => {
                 write!(f, "HTTP inspection transport error for {url}: {message}")
             }
-            Self::Admission { url, kind, .. } => {
-                write!(f, "HTTP inspection admission failed for {url}: {kind:?}")
-            }
+
             Self::Protocol { url, message, .. } => {
                 write!(f, "HTTP inspection protocol error for {url}: {message}")
             }
@@ -858,12 +640,16 @@ impl std::error::Error for HttpInspectError {}
 /// Resume without a strong validator is intentionally unavailable:
 ///
 /// ```compile_fail
-/// use pulith::ResumePolicy;
+/// use pulith::net::ResumePolicy;
 /// let _ = ResumePolicy::unvalidated("artifact.part");
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResumePolicy {
-    pub mode: ResumeMode,
+pub enum ResumePolicy {
+    RestartOnly,
+    IfRange {
+        partial_path: PathBuf,
+        validator: Validator,
+    },
 }
 
 impl Default for ResumePolicy {
@@ -874,28 +660,15 @@ impl Default for ResumePolicy {
 
 impl ResumePolicy {
     pub fn restart_only() -> Self {
-        Self {
-            mode: ResumeMode::RestartOnly,
-        }
+        Self::RestartOnly
     }
 
     pub fn if_range(partial_path: impl Into<PathBuf>, validator: Validator) -> Self {
-        Self {
-            mode: ResumeMode::IfRange {
-                partial_path: partial_path.into(),
-                validator,
-            },
+        Self::IfRange {
+            partial_path: partial_path.into(),
+            validator,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResumeMode {
-    RestartOnly,
-    IfRange {
-        partial_path: PathBuf,
-        validator: Validator,
-    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -978,14 +751,10 @@ impl RemoteSource {
     pub fn destination(&self) -> &Path {
         &self.destination
     }
-
-    pub fn policy_ref(&self) -> &AcquirePolicy {
-        &self.policy
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcquireEvidence {
+pub struct HttpAcquireEvidence {
     pub url: url::Url,
     pub final_path: PathBuf,
     pub status: u16,
@@ -1024,8 +793,9 @@ pub struct AttemptEvidence {
     pub outcome: AttemptOutcome,
 }
 
+#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 impl AttemptEvidence {
-    pub fn new(attempt: u32, outcome: AttemptOutcome) -> Self {
+    fn new(attempt: u32, outcome: AttemptOutcome) -> Self {
         Self {
             attempt,
             status: None,
@@ -1039,7 +809,7 @@ impl AttemptEvidence {
         }
     }
 
-    pub fn response(
+    fn response(
         attempt: u32,
         status: u16,
         content_length: Option<u64>,
@@ -1052,7 +822,8 @@ impl AttemptEvidence {
             .with_admission_wait(admission_wait)
     }
 
-    pub fn transfer(
+    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    fn transfer(
         attempt: u32,
         status: u16,
         bytes: u64,
@@ -1063,37 +834,39 @@ impl AttemptEvidence {
         Self::response(attempt, status, content_length, admission_wait, outcome).with_bytes(bytes)
     }
 
-    pub fn with_status(mut self, status: u16) -> Self {
+    fn with_status(mut self, status: u16) -> Self {
         self.status = Some(status);
         self
     }
 
-    pub fn with_bytes(mut self, bytes: u64) -> Self {
+    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    fn with_bytes(mut self, bytes: u64) -> Self {
         self.bytes = bytes;
         self
     }
 
-    pub fn with_content_length(mut self, content_length: Option<u64>) -> Self {
+    fn with_content_length(mut self, content_length: Option<u64>) -> Self {
         self.content_length = content_length;
         self
     }
 
-    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
         self.retry_after = retry_after;
         self
     }
 
-    pub fn with_planned_delay(mut self, planned_delay: Option<Duration>) -> Self {
+    fn with_planned_delay(mut self, planned_delay: Option<Duration>) -> Self {
         self.planned_delay = planned_delay;
         self
     }
 
-    pub fn with_admission_wait(mut self, admission_wait: Option<Duration>) -> Self {
+    fn with_admission_wait(mut self, admission_wait: Option<Duration>) -> Self {
         self.admission_wait = admission_wait;
         self
     }
 
-    pub fn with_pacing_wait(mut self, pacing_wait: Duration) -> Self {
+    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    fn with_pacing_wait(mut self, pacing_wait: Duration) -> Self {
         self.pacing_wait = pacing_wait;
         self
     }
@@ -1108,26 +881,24 @@ pub enum AttemptOutcome {
     NonRetryableNetworkError,
     LocalFailure,
     LimitExceeded,
-    AdmissionRejected,
-    PacingRejected,
 }
 
 #[cfg(feature = "ureq")]
-pub type SyncDelay = Arc<dyn Fn(Duration) + Send + Sync>;
+type SyncSleep = Arc<dyn Fn(Duration) + Send + Sync>;
 
 #[cfg(feature = "reqwest")]
-pub type AsyncDelayFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type AsyncSleepFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[cfg(feature = "reqwest")]
-pub type AsyncDelay = Arc<dyn Fn(Duration) -> AsyncDelayFuture + Send + Sync>;
+type AsyncSleep = Arc<dyn Fn(Duration) -> AsyncSleepFuture + Send + Sync>;
 
 #[cfg(feature = "ureq")]
 #[derive(Clone)]
 pub struct UreqResource {
     agent: ureq::Agent,
-    delay: SyncDelay,
-    admission: Option<Arc<dyn SyncAdmission>>,
-    byte_pacer: Option<Arc<dyn SyncBytePacer>>,
+    delay: SyncSleep,
+    admission: Option<Arc<RateAdmission>>,
+    byte_pacer: Option<Arc<ByteRatePacer>>,
 }
 
 #[cfg(feature = "ureq")]
@@ -1151,35 +922,20 @@ impl UreqResource {
         }
     }
 
-    pub fn agent(&self) -> &ureq::Agent {
-        &self.agent
-    }
-
-    pub fn with_delay(mut self, delay: SyncDelay) -> Self {
+    #[cfg(test)]
+    fn with_delay(mut self, delay: SyncSleep) -> Self {
         self.delay = delay;
         self
     }
 
-    pub fn delay(&self) -> &SyncDelay {
-        &self.delay
-    }
-
-    pub fn with_admission(mut self, admission: Arc<dyn SyncAdmission>) -> Self {
+    pub fn with_admission(mut self, admission: Arc<RateAdmission>) -> Self {
         self.admission = Some(admission);
         self
     }
 
-    pub fn admission(&self) -> Option<&Arc<dyn SyncAdmission>> {
-        self.admission.as_ref()
-    }
-
-    pub fn with_byte_pacer(mut self, byte_pacer: Arc<dyn SyncBytePacer>) -> Self {
+    pub fn with_byte_pacer(mut self, byte_pacer: Arc<ByteRatePacer>) -> Self {
         self.byte_pacer = Some(byte_pacer);
         self
-    }
-
-    pub fn byte_pacer(&self) -> Option<&Arc<dyn SyncBytePacer>> {
-        self.byte_pacer.as_ref()
     }
 }
 
@@ -1203,74 +959,33 @@ pub struct UreqInspect {
 #[cfg(feature = "ureq")]
 impl Default for UreqInspect {
     fn default() -> Self {
-        Self::new()
+        Self::new(UreqResource::default(), HttpInspectPolicy::default())
     }
 }
 
 #[cfg(feature = "ureq")]
 impl UreqInspect {
-    pub fn new() -> Self {
-        Self::with_resource(UreqResource::default())
-    }
-
-    pub fn with_resource(resources: UreqResource) -> Self {
-        Self {
-            resources,
-            policy: HttpInspectPolicy::default(),
-        }
-    }
-
-    pub fn with_policy(mut self, policy: HttpInspectPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    pub fn resources(&self) -> &UreqResource {
-        &self.resources
-    }
-
-    pub fn policy(&self) -> &HttpInspectPolicy {
-        &self.policy
+    pub fn new(resources: UreqResource, policy: HttpInspectPolicy) -> Self {
+        Self { resources, policy }
     }
 }
 
 #[cfg(feature = "ureq")]
-impl InspectNode<RemoteUrl> for UreqInspect {
-    type Observation = HttpObservation;
-    type Evidence = HttpInspectEvidence;
+impl Inspect<RemoteUrl> for UreqInspect {
     type Error = HttpInspectError;
     type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
 
-    fn inspect_node(&self, node: RemoteUrl) -> Result<Self::Output, Self::Error> {
+    fn inspect(&self, node: RemoteUrl) -> Result<Self::Output, Self::Error> {
         use ureq::ResponseExt as _;
 
         let requested_url = node.as_url().clone();
         let mut attempts = Vec::new();
         for attempt in 0..=self.policy.retry.max_retries {
-            let admission_wait = match self.policy.admission {
-                AdmissionMode::Unbounded => None,
-                AdmissionMode::Shared => {
-                    let admission = self.resources.admission().ok_or_else(|| {
-                        attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
-                        HttpInspectError::Admission {
-                            url: requested_url.clone(),
-                            kind: AdmissionError::Unavailable,
-                            attempts: attempts.clone(),
-                        }
-                    })?;
-                    match admission.enter() {
-                        Ok(permit) => Some(permit.waited_for()),
-                        Err(kind) => {
-                            attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
-                            return Err(HttpInspectError::Admission {
-                                url: requested_url.clone(),
-                                kind,
-                                attempts,
-                            });
-                        }
-                    }
-                }
-            };
+            let admission_wait = self
+                .resources
+                .admission
+                .as_ref()
+                .map(|admission| admission.enter_sync());
 
             let mut request_config = self
                 .resources
@@ -1346,7 +1061,6 @@ impl InspectNode<RemoteUrl> for UreqInspect {
                 HttpInspectEvidence {
                     requested_url,
                     final_url,
-                    method: HttpInspectMethod::Head,
                     attempts,
                 },
             ));
@@ -1357,34 +1071,24 @@ impl InspectNode<RemoteUrl> for UreqInspect {
 
 #[cfg(feature = "ureq")]
 #[derive(Clone, Debug, Default)]
-pub struct UreqAcquire<R = UreqResource> {
-    resources: R,
+pub struct UreqAcquire {
+    resources: UreqResource,
 }
 
 #[cfg(feature = "ureq")]
-impl UreqAcquire<UreqResource> {
-    pub fn new() -> Self {
-        Self::with_resource(UreqResource::default())
-    }
-
-    pub fn with_resource(resources: UreqResource) -> Self {
+impl UreqAcquire {
+    pub fn new(resources: UreqResource) -> Self {
         Self { resources }
     }
-
-    pub fn resources(&self) -> &UreqResource {
-        &self.resources
-    }
 }
 
 #[cfg(feature = "ureq")]
-impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
-    type Material = LocalMaterial;
-    type Evidence = AcquireEvidence;
+impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
     type Error = AcquireError;
-    type Output = Acquired<I, LocalMaterial, AcquireEvidence>;
+    type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
 
-    fn acquire_node(&self, node: Chosen<I, RemoteSource>) -> Result<Self::Output, Self::Error> {
-        let source = node.source;
+    fn acquire(&self, node: Materialize<I, RemoteSource, T>) -> Result<Self::Output, Self::Error> {
+        let source = node.source.clone();
         let parent = destination_parent(&source.destination)?;
         std::fs::create_dir_all(&parent).map_err(|err| {
             AcquireError::local(Some(&source.url), "create download parent", &parent, err)
@@ -1403,13 +1107,11 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
             let resume_context = (!resume_suppressed)
                 .then(|| planned_resume(&source.policy.resume))
                 .flatten();
-            let (_admission_permit, admission_wait) = admit_sync_attempt(
-                self.resources.admission(),
-                &source,
-                attempt,
-                &mut attempts,
-                &resume,
-            )?;
+            let admission_wait = self
+                .resources
+                .admission
+                .as_ref()
+                .map(|admission| admission.enter_sync());
             let mut request = self.resources.agent.get(source.url.as_str());
             for (name, value) in &source.policy.headers {
                 request = request.header(name, value);
@@ -1615,24 +1317,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
             } else {
                 0
             };
-            let active_pacer = match source.policy.byte_pacing {
-                BytePacingMode::Unbounded => None,
-                BytePacingMode::Shared => Some(self.resources.byte_pacer().ok_or_else(|| {
-                    attempts.push(AttemptEvidence::response(
-                        attempt,
-                        status,
-                        content_length,
-                        admission_wait,
-                        AttemptOutcome::PacingRejected,
-                    ));
-                    AcquireError::Pacing {
-                        url: source.url.as_url().clone(),
-                        kind: PacingError::Unavailable,
-                        attempts: attempts.clone(),
-                        resume: resume.clone(),
-                    }
-                })?),
-            };
+            let active_pacer = self.resources.byte_pacer.as_ref();
             let copy = match copy_response_body(
                 response.body_mut().as_reader(),
                 temp.as_file_mut(),
@@ -1683,21 +1368,7 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                         resume,
                     });
                 }
-                Err(BodyCopyError::Pacing(kind)) => {
-                    attempts.push(AttemptEvidence::response(
-                        attempt,
-                        status,
-                        content_length,
-                        admission_wait,
-                        AttemptOutcome::PacingRejected,
-                    ));
-                    return Err(AcquireError::Pacing {
-                        url: source.url.as_url().clone(),
-                        kind,
-                        attempts,
-                        resume,
-                    });
-                }
+
                 Err(BodyCopyError::Local {
                     action,
                     path,
@@ -1765,12 +1436,12 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
                 .with_pacing_wait(copy.pacing_wait),
             );
             return Ok(Acquired::from_acquire(
-                node.input,
+                node,
                 LocalMaterial {
                     path: source.destination.clone(),
                     kind: MaterialKind::File,
                 },
-                AcquireEvidence {
+                HttpAcquireEvidence {
                     url: source.url.into_url(),
                     final_path: source.destination,
                     status,
@@ -1790,9 +1461,9 @@ impl<I> AcquireNode<Chosen<I, RemoteSource>> for UreqAcquire<UreqResource> {
 #[derive(Clone)]
 pub struct ReqwestResource {
     client: reqwest::Client,
-    delay: AsyncDelay,
-    admission: Option<Arc<dyn AsyncAdmission>>,
-    byte_pacer: Option<Arc<dyn AsyncBytePacer>>,
+    delay: AsyncSleep,
+    admission: Option<Arc<RateAdmission>>,
+    byte_pacer: Option<Arc<ByteRatePacer>>,
 }
 
 #[cfg(feature = "reqwest")]
@@ -1816,35 +1487,20 @@ impl ReqwestResource {
         }
     }
 
-    pub fn client(&self) -> &reqwest::Client {
-        &self.client
-    }
-
-    pub fn with_delay(mut self, delay: AsyncDelay) -> Self {
+    #[cfg(test)]
+    fn with_delay(mut self, delay: AsyncSleep) -> Self {
         self.delay = delay;
         self
     }
 
-    pub fn delay(&self) -> &AsyncDelay {
-        &self.delay
-    }
-
-    pub fn with_admission(mut self, admission: Arc<dyn AsyncAdmission>) -> Self {
+    pub fn with_admission(mut self, admission: Arc<RateAdmission>) -> Self {
         self.admission = Some(admission);
         self
     }
 
-    pub fn admission(&self) -> Option<&Arc<dyn AsyncAdmission>> {
-        self.admission.as_ref()
-    }
-
-    pub fn with_byte_pacer(mut self, byte_pacer: Arc<dyn AsyncBytePacer>) -> Self {
+    pub fn with_byte_pacer(mut self, byte_pacer: Arc<ByteRatePacer>) -> Self {
         self.byte_pacer = Some(byte_pacer);
         self
-    }
-
-    pub fn byte_pacer(&self) -> Option<&Arc<dyn AsyncBytePacer>> {
-        self.byte_pacer.as_ref()
     }
 }
 
@@ -1868,94 +1524,53 @@ pub struct ReqwestInspect {
 #[cfg(feature = "reqwest")]
 impl Default for ReqwestInspect {
     fn default() -> Self {
-        Self::new()
+        Self::new(ReqwestResource::default(), HttpInspectPolicy::default())
     }
 }
 
 #[cfg(feature = "reqwest")]
 impl ReqwestInspect {
-    pub fn new() -> Self {
-        Self::with_resource(ReqwestResource::default())
-    }
-
-    pub fn with_resource(resources: ReqwestResource) -> Self {
-        Self {
-            resources,
-            policy: HttpInspectPolicy::default(),
-        }
-    }
-
-    pub fn with_policy(mut self, policy: HttpInspectPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    pub fn resources(&self) -> &ReqwestResource {
-        &self.resources
-    }
-
-    pub fn policy(&self) -> &HttpInspectPolicy {
-        &self.policy
+    pub fn new(resources: ReqwestResource, policy: HttpInspectPolicy) -> Self {
+        Self { resources, policy }
     }
 }
 
 #[cfg(feature = "reqwest")]
-impl AsyncInspectNode<RemoteUrl> for ReqwestInspect {
-    type Observation = HttpObservation;
-    type Evidence = HttpInspectEvidence;
+impl AsyncInspect<RemoteUrl> for ReqwestInspect {
     type Error = HttpInspectError;
     type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
-    type Future<'a>
-        = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + 'a>>
-    where
-        Self: 'a,
-        RemoteUrl: 'a;
 
-    fn inspect_node_async(&self, node: RemoteUrl) -> Self::Future<'_> {
-        Box::pin(inspect_reqwest(
+    fn inspect_async<'a>(
+        &'a self,
+        node: RemoteUrl,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
+    where
+        RemoteUrl: 'a,
+    {
+        inspect_reqwest(
             self.resources.client.clone(),
             self.resources.delay.clone(),
             self.resources.admission.clone(),
             self.policy.clone(),
             node,
-        ))
+        )
     }
 }
 
 #[cfg(feature = "reqwest")]
 async fn inspect_reqwest(
     client: reqwest::Client,
-    delay: AsyncDelay,
-    admission: Option<Arc<dyn AsyncAdmission>>,
+    delay: AsyncSleep,
+    admission: Option<Arc<RateAdmission>>,
     policy: HttpInspectPolicy,
     node: RemoteUrl,
 ) -> Result<Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>, HttpInspectError> {
     let requested_url = node.as_url().clone();
     let mut attempts = Vec::new();
     for attempt in 0..=policy.retry.max_retries {
-        let admission_wait = match policy.admission {
-            AdmissionMode::Unbounded => None,
-            AdmissionMode::Shared => {
-                let admission = admission.as_ref().ok_or_else(|| {
-                    attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
-                    HttpInspectError::Admission {
-                        url: requested_url.clone(),
-                        kind: AdmissionError::Unavailable,
-                        attempts: attempts.clone(),
-                    }
-                })?;
-                match admission.enter().await {
-                    Ok(permit) => Some(permit.waited_for()),
-                    Err(kind) => {
-                        attempts.push(HttpInspectAttemptEvidence::new(attempt, None, None));
-                        return Err(HttpInspectError::Admission {
-                            url: requested_url.clone(),
-                            kind,
-                            attempts,
-                        });
-                    }
-                }
-            }
+        let admission_wait = match admission.as_ref() {
+            Some(admission) => Some(admission.enter_async().await),
+            None => None,
         };
 
         let mut request = client.head(node.as_str());
@@ -2016,7 +1631,6 @@ async fn inspect_reqwest(
             HttpInspectEvidence {
                 requested_url,
                 final_url,
-                method: HttpInspectMethod::Head,
                 attempts,
             },
         ));
@@ -2026,55 +1640,49 @@ async fn inspect_reqwest(
 
 #[cfg(feature = "reqwest")]
 #[derive(Clone, Debug, Default)]
-pub struct ReqwestAcquire<R = ReqwestResource> {
-    resources: R,
+pub struct ReqwestAcquire {
+    resources: ReqwestResource,
 }
 
 #[cfg(feature = "reqwest")]
-impl ReqwestAcquire<ReqwestResource> {
-    pub fn new() -> Self {
-        Self::with_resource(ReqwestResource::default())
-    }
-
-    pub fn with_resource(resources: ReqwestResource) -> Self {
+impl ReqwestAcquire {
+    pub fn new(resources: ReqwestResource) -> Self {
         Self { resources }
     }
-
-    pub fn resources(&self) -> &ReqwestResource {
-        &self.resources
-    }
 }
 
 #[cfg(feature = "reqwest")]
-impl<I: 'static> AsyncAcquireNode<Chosen<I, RemoteSource>> for ReqwestAcquire<ReqwestResource> {
-    type Material = LocalMaterial;
-    type Evidence = AcquireEvidence;
+impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for ReqwestAcquire {
     type Error = AcquireError;
-    type Output = Acquired<I, LocalMaterial, AcquireEvidence>;
-    type Future<'a>
-        = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + 'a>>
-    where
-        Self: 'a,
-        Chosen<I, RemoteSource>: 'a;
+    type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
 
-    fn acquire_node_async(&self, node: Chosen<I, RemoteSource>) -> Self::Future<'_> {
+    fn acquire_async<'a>(
+        &'a self,
+        node: Materialize<I, RemoteSource, T>,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
+    where
+        Materialize<I, RemoteSource, T>: 'a,
+    {
         let client = self.resources.client.clone();
         let delay = self.resources.delay.clone();
         let admission = self.resources.admission.clone();
         let byte_pacer = self.resources.byte_pacer.clone();
-        Box::pin(async move { acquire_reqwest(client, delay, admission, byte_pacer, node).await })
+        async move { acquire_reqwest(client, delay, admission, byte_pacer, node).await }
     }
 }
 
 #[cfg(feature = "reqwest")]
-async fn acquire_reqwest<I>(
+async fn acquire_reqwest<I, T>(
     client: reqwest::Client,
-    delay: AsyncDelay,
-    admission: Option<Arc<dyn AsyncAdmission>>,
-    byte_pacer: Option<Arc<dyn AsyncBytePacer>>,
-    node: Chosen<I, RemoteSource>,
-) -> Result<Acquired<I, LocalMaterial, AcquireEvidence>, AcquireError> {
-    let source = node.source;
+    delay: AsyncSleep,
+    admission: Option<Arc<RateAdmission>>,
+    byte_pacer: Option<Arc<ByteRatePacer>>,
+    node: Materialize<I, RemoteSource, T>,
+) -> Result<
+    Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>,
+    AcquireError,
+> {
+    let source = node.source.clone();
     let parent = destination_parent(&source.destination)?;
     std::fs::create_dir_all(&parent).map_err(|err| {
         AcquireError::local(Some(&source.url), "create download parent", &parent, err)
@@ -2093,9 +1701,10 @@ async fn acquire_reqwest<I>(
         let resume_context = (!resume_suppressed)
             .then(|| planned_resume(&source.policy.resume))
             .flatten();
-        let (_admission_permit, admission_wait) =
-            admit_async_attempt(admission.as_ref(), &source, attempt, &mut attempts, &resume)
-                .await?;
+        let admission_wait = match admission.as_ref() {
+            Some(admission) => Some(admission.enter_async().await),
+            None => None,
+        };
         let mut request = client.get(source.url.as_str());
         for (name, value) in &source.policy.headers {
             request = request.header(name, value);
@@ -2276,25 +1885,7 @@ async fn acquire_reqwest<I>(
         } else {
             StagedDownload::<Open>::new_in(&parent)?
         };
-        let active_pacer = match source.policy.byte_pacing {
-            BytePacingMode::Unbounded => None,
-            BytePacingMode::Shared => Some(byte_pacer.as_ref().ok_or_else(|| {
-                attempts.push(AttemptEvidence::transfer(
-                    attempt,
-                    status,
-                    stage.bytes,
-                    content_length,
-                    admission_wait,
-                    AttemptOutcome::PacingRejected,
-                ));
-                AcquireError::Pacing {
-                    url: source.url.as_url().clone(),
-                    kind: PacingError::Unavailable,
-                    attempts: attempts.clone(),
-                    resume: resume.clone(),
-                }
-            })?),
-        };
+        let active_pacer = byte_pacer.as_ref();
         while let Some(chunk) = match response.chunk().await {
             Ok(chunk) => chunk,
             Err(err) => {
@@ -2346,25 +1937,7 @@ async fn acquire_reqwest<I>(
                         resume,
                     });
                 }
-                Err(StageWriteError::Pacing(kind)) => {
-                    attempts.push(
-                        AttemptEvidence::transfer(
-                            attempt,
-                            status,
-                            stage.bytes,
-                            content_length,
-                            admission_wait,
-                            AttemptOutcome::PacingRejected,
-                        )
-                        .with_pacing_wait(stage.pacing_wait),
-                    );
-                    return Err(AcquireError::Pacing {
-                        url: source.url.as_url().clone(),
-                        kind,
-                        attempts,
-                        resume,
-                    });
-                }
+
                 Err(StageWriteError::Local {
                     action,
                     path,
@@ -2420,12 +1993,12 @@ async fn acquire_reqwest<I>(
             .with_pacing_wait(pacing_wait),
         );
         return Ok(Acquired::from_acquire(
-            node.input,
+            node,
             LocalMaterial {
                 path: source.destination.clone(),
                 kind: MaterialKind::File,
             },
-            AcquireEvidence {
+            HttpAcquireEvidence {
                 url: source.url.into_url(),
                 final_path: source.destination,
                 status,
@@ -2499,92 +2072,6 @@ fn reject_known_oversize(
     Ok(())
 }
 
-#[cfg(feature = "ureq")]
-#[allow(
-    clippy::result_large_err,
-    reason = "AcquireError intentionally carries complete retry and resume evidence"
-)]
-fn admit_sync_attempt(
-    admission: Option<&Arc<dyn SyncAdmission>>,
-    source: &RemoteSource,
-    attempt: u32,
-    attempts: &mut Vec<AttemptEvidence>,
-    resume: &Option<ResumeEvidence>,
-) -> Result<(Option<AdmissionPermit>, Option<Duration>), AcquireError> {
-    match source.policy.admission {
-        AdmissionMode::Unbounded => Ok((None, None)),
-        AdmissionMode::Shared => {
-            let admission = admission.ok_or_else(|| {
-                admission_error(
-                    source,
-                    attempt,
-                    attempts,
-                    resume,
-                    AdmissionError::Unavailable,
-                )
-            })?;
-            match admission.enter() {
-                Ok(permit) => {
-                    let waited = permit.waited_for();
-                    Ok((Some(permit), Some(waited)))
-                }
-                Err(kind) => Err(admission_error(source, attempt, attempts, resume, kind)),
-            }
-        }
-    }
-}
-
-#[cfg(feature = "reqwest")]
-async fn admit_async_attempt(
-    admission: Option<&Arc<dyn AsyncAdmission>>,
-    source: &RemoteSource,
-    attempt: u32,
-    attempts: &mut Vec<AttemptEvidence>,
-    resume: &Option<ResumeEvidence>,
-) -> Result<(Option<AdmissionPermit>, Option<Duration>), AcquireError> {
-    match source.policy.admission {
-        AdmissionMode::Unbounded => Ok((None, None)),
-        AdmissionMode::Shared => {
-            let admission = admission.ok_or_else(|| {
-                admission_error(
-                    source,
-                    attempt,
-                    attempts,
-                    resume,
-                    AdmissionError::Unavailable,
-                )
-            })?;
-            match admission.enter().await {
-                Ok(permit) => {
-                    let waited = permit.waited_for();
-                    Ok((Some(permit), Some(waited)))
-                }
-                Err(kind) => Err(admission_error(source, attempt, attempts, resume, kind)),
-            }
-        }
-    }
-}
-
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
-fn admission_error(
-    source: &RemoteSource,
-    attempt: u32,
-    attempts: &mut Vec<AttemptEvidence>,
-    resume: &Option<ResumeEvidence>,
-    kind: AdmissionError,
-) -> AcquireError {
-    attempts.push(AttemptEvidence::new(
-        attempt,
-        AttemptOutcome::AdmissionRejected,
-    ));
-    AcquireError::Admission {
-        url: source.url.as_url().clone(),
-        kind,
-        attempts: attempts.clone(),
-        resume: resume.clone(),
-    }
-}
-
 #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
 fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     let delay = policy
@@ -2644,9 +2131,9 @@ impl PlannedResume {
 
 #[cfg(any(feature = "ureq", feature = "reqwest"))]
 fn planned_resume(policy: &ResumePolicy) -> Option<PlannedResume> {
-    let (partial_path, validator) = match &policy.mode {
-        ResumeMode::RestartOnly => return None,
-        ResumeMode::IfRange {
+    let (partial_path, validator) = match policy {
+        ResumePolicy::RestartOnly => return None,
+        ResumePolicy::IfRange {
             partial_path,
             validator,
         } => (partial_path.clone(), validator.clone()),
@@ -2747,7 +2234,6 @@ enum BodyCopyError {
         max: u64,
         actual: u64,
     },
-    Pacing(PacingError),
     Local {
         action: &'static str,
         path: PathBuf,
@@ -2761,7 +2247,7 @@ fn copy_response_body(
     writer: &mut impl Write,
     max_bytes: Option<u64>,
     initial_bytes: u64,
-    pacer: Option<&Arc<dyn SyncBytePacer>>,
+    pacer: Option<&Arc<ByteRatePacer>>,
 ) -> Result<BodyCopyProgress, BodyCopyError> {
     let mut buffer = [0; 16 * 1024];
     let mut bytes = initial_bytes;
@@ -2780,10 +2266,7 @@ fn copy_response_body(
             return Err(BodyCopyError::LimitExceeded { max, actual });
         }
         if let Some(pacer) = pacer {
-            pacing_wait += pacer
-                .before_chunk(read as u64)
-                .map_err(BodyCopyError::Pacing)?
-                .waited_for();
+            pacing_wait += pacer.before_chunk_sync(read as u64);
         }
         writer
             .write_all(&buffer[..read])
@@ -2802,7 +2285,6 @@ enum StageWriteError {
         max: u64,
         actual: u64,
     },
-    Pacing(PacingError),
     Local {
         action: &'static str,
         path: PathBuf,
@@ -2870,7 +2352,7 @@ impl StagedDownload<Open> {
         &mut self,
         chunk: &[u8],
         max_bytes: Option<u64>,
-        pacer: Option<&Arc<dyn AsyncBytePacer>>,
+        pacer: Option<&Arc<ByteRatePacer>>,
     ) -> Result<(), StageWriteError> {
         let actual = self.bytes.saturating_add(chunk.len() as u64);
         if let Some(max) = max_bytes
@@ -2879,11 +2361,7 @@ impl StagedDownload<Open> {
             return Err(StageWriteError::LimitExceeded { max, actual });
         }
         if let Some(pacer) = pacer {
-            self.pacing_wait += pacer
-                .before_chunk(chunk.len() as u64)
-                .await
-                .map_err(StageWriteError::Pacing)?
-                .waited_for();
+            self.pacing_wait += pacer.before_chunk_async(chunk.len() as u64).await;
         }
         use tokio::io::AsyncWriteExt;
         self.writer
@@ -2931,21 +2409,32 @@ impl StagedDownload<Closed> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "ureq")]
-    use crate::{AcquireNode, InspectNode};
     #[cfg(all(
         any(feature = "reqwest", feature = "ureq"),
         feature = "hash",
         feature = "blake3"
     ))]
-    use crate::{
-        ApplyNode, ArtifactDescriptor, Blake3, CreateOrReplace, DescriptorVerify, DigestNeed,
-        HashVerify, IdentityPrepare, LocalApply, PrepareNode, VerifyNode,
-    };
-    #[cfg(feature = "reqwest")]
-    use crate::{AsyncAcquireNode, AsyncInspectNode};
+    use crate::hash::{ArtifactDescriptor, Blake3, DigestValue, HashVerify};
+    #[cfg(all(
+        any(feature = "reqwest", feature = "ureq"),
+        feature = "hash",
+        feature = "blake3"
+    ))]
+    use crate::local::LocalApply;
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
-    use crate::{Intent, Item, LocalTarget};
+    use crate::local::LocalTarget;
+    #[cfg(feature = "ureq")]
+    use crate::{Acquire, Inspect};
+    #[cfg(all(
+        any(feature = "reqwest", feature = "ureq"),
+        feature = "hash",
+        feature = "blake3"
+    ))]
+    use crate::{Apply, Verify};
+    #[cfg(feature = "reqwest")]
+    use crate::{AsyncAcquire, AsyncInspect};
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    use crate::{Materialize, MaterializeMode};
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
     use std::io::Write as TestWrite;
     #[cfg(any(feature = "reqwest", feature = "ureq"))]
@@ -2961,91 +2450,17 @@ mod tests {
         Validator::strong_etag("\"abc\"").unwrap()
     }
 
-    #[cfg(feature = "ureq")]
-    struct TestSyncAdmission {
-        waited: Duration,
-        error: Option<AdmissionError>,
-        enters: TestArc<Mutex<u32>>,
-    }
-
-    #[cfg(feature = "ureq")]
-    impl SyncAdmission for TestSyncAdmission {
-        fn enter(&self) -> Result<AdmissionPermit, AdmissionError> {
-            *self.enters.lock().unwrap() += 1;
-            match self.error.clone() {
-                Some(error) => Err(error),
-                None => Ok(AdmissionPermit::waited(self.waited)),
-            }
-        }
-    }
-
-    #[cfg(feature = "reqwest")]
-    struct TestAsyncAdmission {
-        waited: Duration,
-        error: Option<AdmissionError>,
-        enters: TestArc<Mutex<u32>>,
-    }
-
-    #[cfg(feature = "reqwest")]
-    impl AsyncAdmission for TestAsyncAdmission {
-        fn enter(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<AdmissionPermit, AdmissionError>> + Send + '_>>
-        {
-            Box::pin(async move {
-                *self.enters.lock().unwrap() += 1;
-                match self.error.clone() {
-                    Some(error) => Err(error),
-                    None => Ok(AdmissionPermit::waited(self.waited)),
-                }
-            })
-        }
-    }
-
-    #[cfg(feature = "ureq")]
-    struct TestSyncBytePacer {
-        waited: Duration,
-        error: Option<PacingError>,
-        enters: TestArc<Mutex<u32>>,
-        bytes: TestArc<Mutex<Vec<u64>>>,
-    }
-
-    #[cfg(feature = "ureq")]
-    impl SyncBytePacer for TestSyncBytePacer {
-        fn before_chunk(&self, bytes: u64) -> Result<BytePacingPermit, PacingError> {
-            *self.enters.lock().unwrap() += 1;
-            self.bytes.lock().unwrap().push(bytes);
-            match self.error.clone() {
-                Some(error) => Err(error),
-                None => Ok(BytePacingPermit::waited(self.waited)),
-            }
-        }
-    }
-
-    #[cfg(feature = "reqwest")]
-    struct TestAsyncBytePacer {
-        waited: Duration,
-        error: Option<PacingError>,
-        enters: TestArc<Mutex<u32>>,
-        bytes: TestArc<Mutex<Vec<u64>>>,
-    }
-
-    #[cfg(feature = "reqwest")]
-    impl AsyncBytePacer for TestAsyncBytePacer {
-        fn before_chunk(
-            &self,
-            bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = Result<BytePacingPermit, PacingError>> + Send + '_>>
-        {
-            Box::pin(async move {
-                *self.enters.lock().unwrap() += 1;
-                self.bytes.lock().unwrap().push(bytes);
-                match self.error.clone() {
-                    Some(error) => Err(error),
-                    None => Ok(BytePacingPermit::waited(self.waited)),
-                }
-            })
-        }
+    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    fn materialize(
+        source: RemoteSource,
+        target: impl Into<PathBuf>,
+    ) -> Materialize<&'static str, RemoteSource, LocalTarget> {
+        Materialize::new(
+            "artifact",
+            source,
+            LocalTarget::new(target),
+            MaterializeMode::CreateOrReplace,
+        )
     }
 
     #[test]
@@ -3102,21 +2517,11 @@ mod tests {
     fn module_short_names_replace_net_prefix() {
         let policy = AcquirePolicy::default()
             .retry(RetryPolicy::disabled())
-            .resume(ResumePolicy::restart_only())
-            .shared_admission();
-        assert_eq!(policy.admission, AdmissionMode::Shared);
+            .resume(ResumePolicy::restart_only());
+        assert_eq!(policy.resume, ResumePolicy::RestartOnly);
 
-        let attempt = AttemptEvidence::new(0, AttemptOutcome::AdmissionRejected);
+        let attempt = AttemptEvidence::new(0, AttemptOutcome::NonRetryableNetworkError);
         assert_eq!(attempt.status, None);
-    }
-
-    #[test]
-    fn net_admission_defaults_to_unbounded_and_can_be_shared() {
-        assert_eq!(AcquirePolicy::default().admission, AdmissionMode::Unbounded);
-        assert_eq!(
-            AcquirePolicy::default().shared_admission().admission,
-            AdmissionMode::Shared
-        );
     }
 
     #[test]
@@ -3126,9 +2531,8 @@ mod tests {
         assert_eq!(rate.attempts_per_second().get(), 20);
         assert_eq!(rate.burst_attempts().get(), 4);
 
-        let root_rate =
-            crate::AttemptRate::new(NonZeroU32::new(10).unwrap(), NonZeroU32::new(2).unwrap());
-        let admission = crate::RateAdmission::new(root_rate);
+        let root_rate = AttemptRate::new(NonZeroU32::new(10).unwrap(), NonZeroU32::new(2).unwrap());
+        let admission = RateAdmission::new(root_rate);
         assert_eq!(admission.rate(), root_rate);
     }
 
@@ -3140,11 +2544,11 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
         ));
 
-        let first = SyncAdmission::enter(&admission).unwrap();
-        let second = SyncAdmission::enter(&admission).unwrap();
+        let first = admission.enter_sync();
+        let second = admission.enter_sync();
 
-        assert_eq!(first.waited_for(), Duration::ZERO);
-        assert!(second.waited_for() > Duration::ZERO);
+        assert_eq!(first, Duration::ZERO);
+        assert!(second > Duration::ZERO);
     }
 
     #[test]
@@ -3156,11 +2560,11 @@ mod tests {
                 NonZeroU32::new(1).unwrap(),
             ));
 
-            let first = AsyncAdmission::enter(&admission).await.unwrap();
-            let second = AsyncAdmission::enter(&admission).await.unwrap();
+            let first = admission.enter_async().await;
+            let second = admission.enter_async().await;
 
-            assert_eq!(first.waited_for(), Duration::ZERO);
-            assert!(second.waited_for() > Duration::ZERO);
+            assert_eq!(first, Duration::ZERO);
+            assert!(second > Duration::ZERO);
         });
     }
 
@@ -3174,11 +2578,11 @@ mod tests {
         assert_eq!(rate.bytes_per_second().get(), 1_024);
         assert_eq!(rate.burst_bytes().get(), 4_096);
 
-        let root_rate = crate::ByteRate::new(
+        let root_rate = ByteRate::new(
             NonZeroU32::new(2_048).unwrap(),
             NonZeroU32::new(8_192).unwrap(),
         );
-        let root_pacer = crate::ByteRatePacer::new(root_rate);
+        let root_pacer = ByteRatePacer::new(root_rate);
         assert_eq!(root_pacer.rate(), root_rate);
     }
 
@@ -3190,10 +2594,7 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
         ));
 
-        assert_eq!(
-            SyncBytePacer::before_chunk(&pacer, 0).unwrap().waited_for(),
-            Duration::ZERO,
-        );
+        assert_eq!(pacer.before_chunk_sync(0), Duration::ZERO);
     }
 
     #[test]
@@ -3204,9 +2605,9 @@ mod tests {
             NonZeroU32::new(2).unwrap(),
         ));
 
-        let permit = SyncBytePacer::before_chunk(&pacer, 3).unwrap();
+        let waited = pacer.before_chunk_sync(3);
 
-        assert!(permit.waited_for() > Duration::ZERO);
+        assert!(waited > Duration::ZERO);
     }
 
     #[test]
@@ -3217,11 +2618,11 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
         ));
 
-        let first = SyncBytePacer::before_chunk(&pacer, 1).unwrap();
-        let second = SyncBytePacer::before_chunk(&pacer, 1).unwrap();
+        let first = pacer.before_chunk_sync(1);
+        let second = pacer.before_chunk_sync(1);
 
-        assert_eq!(first.waited_for(), Duration::ZERO);
-        assert!(second.waited_for() > Duration::ZERO);
+        assert_eq!(first, Duration::ZERO);
+        assert!(second > Duration::ZERO);
     }
 
     #[test]
@@ -3233,13 +2634,7 @@ mod tests {
                 NonZeroU32::new(1).unwrap(),
             ));
 
-            assert_eq!(
-                AsyncBytePacer::before_chunk(&pacer, 0)
-                    .await
-                    .unwrap()
-                    .waited_for(),
-                Duration::ZERO,
-            );
+            assert_eq!(pacer.before_chunk_async(0).await, Duration::ZERO);
         });
     }
 
@@ -3252,9 +2647,9 @@ mod tests {
                 NonZeroU32::new(2).unwrap(),
             ));
 
-            let permit = AsyncBytePacer::before_chunk(&pacer, 3).await.unwrap();
+            let waited = pacer.before_chunk_async(3).await;
 
-            assert!(permit.waited_for() > Duration::ZERO);
+            assert!(waited > Duration::ZERO);
         });
     }
 
@@ -3267,11 +2662,11 @@ mod tests {
                 NonZeroU32::new(1).unwrap(),
             ));
 
-            let first = AsyncBytePacer::before_chunk(&pacer, 1).await.unwrap();
-            let second = AsyncBytePacer::before_chunk(&pacer, 1).await.unwrap();
+            let first = pacer.before_chunk_async(1).await;
+            let second = pacer.before_chunk_async(1).await;
 
-            assert_eq!(first.waited_for(), Duration::ZERO);
-            assert!(second.waited_for() > Duration::ZERO);
+            assert_eq!(first, Duration::ZERO);
+            assert!(second > Duration::ZERO);
         });
     }
 
@@ -3297,7 +2692,7 @@ mod tests {
         assert_eq!(attempt.outcome, AttemptOutcome::RetryableStatus);
 
         assert_eq!(
-            AttemptEvidence::new(0, AttemptOutcome::AdmissionRejected),
+            AttemptEvidence::new(0, AttemptOutcome::NonRetryableNetworkError),
             AttemptEvidence {
                 attempt: 0,
                 status: None,
@@ -3307,7 +2702,7 @@ mod tests {
                 planned_delay: None,
                 admission_wait: None,
                 pacing_wait: Duration::ZERO,
-                outcome: AttemptOutcome::AdmissionRejected,
+                outcome: AttemptOutcome::NonRetryableNetworkError,
             }
         );
     }
@@ -3342,8 +2737,8 @@ mod tests {
         let validator = test_validator();
 
         assert_eq!(
-            ResumePolicy::if_range(&partial, validator.clone()).mode,
-            ResumeMode::IfRange {
+            ResumePolicy::if_range(&partial, validator.clone()),
+            ResumePolicy::IfRange {
                 partial_path: partial,
                 validator
             }
@@ -3449,8 +2844,8 @@ mod tests {
     #[cfg(feature = "ureq")]
     fn ureq_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
-        let inspected = UreqInspect::new()
-            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+        let inspected = UreqInspect::default()
+            .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         let request = server.next_request();
         server.join();
@@ -3461,7 +2856,6 @@ mod tests {
             inspected.observation().declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence().method, HttpInspectMethod::Head);
         assert_eq!(inspected.evidence().attempts.len(), 1);
         assert_eq!(
             inspected.evidence().requested_url,
@@ -3473,8 +2867,8 @@ mod tests {
     #[cfg(feature = "ureq")]
     fn ureq_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
-        let inspected = UreqInspect::new()
-            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+        let inspected = UreqInspect::default()
+            .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         let request = server.next_request();
         server.join();
@@ -3488,23 +2882,17 @@ mod tests {
     #[cfg(feature = "ureq")]
     fn ureq_inspect_retries_status_and_returns_final_observation() {
         let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
-        let enters = TestArc::new(Mutex::new(0));
-        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
-            waited: Duration::from_millis(5),
-            error: None,
-            enters: TestArc::clone(&enters),
-        }));
-        let policy = HttpInspectPolicy::default()
-            .retry(RetryPolicy {
-                max_retries: 1,
-                base_delay: Duration::ZERO,
-                max_delay: None,
-                respect_retry_after: false,
-            })
-            .shared_admission();
-        let inspected = UreqInspect::with_resource(resources)
-            .with_policy(policy)
-            .inspect_node(RemoteUrl::parse(&server.url).unwrap())
+        let resources = UreqResource::default().with_admission(TestArc::new(RateAdmission::new(
+            AttemptRate::new(NonZeroU32::new(1_000).unwrap(), NonZeroU32::new(2).unwrap()),
+        )));
+        let policy = HttpInspectPolicy::default().retry(RetryPolicy {
+            max_retries: 1,
+            base_delay: Duration::ZERO,
+            max_delay: None,
+            respect_retry_after: false,
+        });
+        let inspected = UreqInspect::new(resources, policy)
+            .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
         assert!(server.next_request().starts_with("HEAD "));
@@ -3516,9 +2904,12 @@ mod tests {
         assert_eq!(inspected.evidence().attempts[1].status, Some(404));
         assert_eq!(
             inspected.evidence().attempts[0].admission_wait,
-            Some(Duration::from_millis(5))
+            Some(Duration::ZERO)
         );
-        assert_eq!(*enters.lock().unwrap(), 2);
+        assert_eq!(
+            inspected.evidence().attempts[1].admission_wait,
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -3526,7 +2917,7 @@ mod tests {
     fn ureq_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
-        let inspected = UreqInspect::new().inspect_node(requested.clone()).unwrap();
+        let inspected = UreqInspect::default().inspect(requested.clone()).unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
@@ -3537,39 +2928,13 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_inspect_surfaces_shared_admission_failure_without_request() {
-        let enters = TestArc::new(Mutex::new(0));
-        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
-            waited: Duration::ZERO,
-            error: Some(AdmissionError::Rejected),
-            enters: TestArc::clone(&enters),
-        }));
-        let inspect = UreqInspect::with_resource(resources)
-            .with_policy(HttpInspectPolicy::default().shared_admission());
-
-        let error = inspect
-            .inspect_node(RemoteUrl::parse("http://127.0.0.1:9/resource").unwrap())
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            HttpInspectError::Admission {
-                kind: AdmissionError::Rejected,
-                ..
-            }
-        ));
-        assert_eq!(*enters.lock().unwrap(), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
     fn ureq_inspect_preserves_transport_attempt_evidence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let error = UreqInspect::new()
-            .inspect_node(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap())
+        let error = UreqInspect::default()
+            .inspect(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap())
             .unwrap_err();
 
         match error {
@@ -3586,7 +2951,7 @@ mod tests {
     fn reqwest_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
         let inspected = block_on_reqwest(
-            ReqwestInspect::new().inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+            ReqwestInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
         let request = server.next_request();
@@ -3598,7 +2963,6 @@ mod tests {
             inspected.observation().declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence().method, HttpInspectMethod::Head);
         assert_eq!(inspected.evidence().attempts.len(), 1);
         assert_eq!(
             inspected.evidence().requested_url,
@@ -3611,7 +2975,7 @@ mod tests {
     fn reqwest_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
         let inspected = block_on_reqwest(
-            ReqwestInspect::new().inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+            ReqwestInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
         let request = server.next_request();
@@ -3626,25 +2990,19 @@ mod tests {
     #[cfg(feature = "reqwest")]
     fn reqwest_inspect_retries_status_and_returns_final_observation() {
         let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
-        let enters = TestArc::new(Mutex::new(0));
         let resources =
-            ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
-                waited: Duration::from_millis(5),
-                error: None,
-                enters: TestArc::clone(&enters),
-            }));
-        let policy = HttpInspectPolicy::default()
-            .retry(RetryPolicy {
-                max_retries: 1,
-                base_delay: Duration::ZERO,
-                max_delay: None,
-                respect_retry_after: false,
-            })
-            .shared_admission();
+            ReqwestResource::default().with_admission(TestArc::new(RateAdmission::new(
+                AttemptRate::new(NonZeroU32::new(1_000).unwrap(), NonZeroU32::new(2).unwrap()),
+            )));
+        let policy = HttpInspectPolicy::default().retry(RetryPolicy {
+            max_retries: 1,
+            base_delay: Duration::ZERO,
+            max_delay: None,
+            respect_retry_after: false,
+        });
         let inspected = block_on_reqwest(
-            ReqwestInspect::with_resource(resources)
-                .with_policy(policy)
-                .inspect_node_async(RemoteUrl::parse(&server.url).unwrap()),
+            ReqwestInspect::new(resources, policy)
+                .inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
@@ -3657,9 +3015,12 @@ mod tests {
         assert_eq!(inspected.evidence().attempts[1].status, Some(404));
         assert_eq!(
             inspected.evidence().attempts[0].admission_wait,
-            Some(Duration::from_millis(5))
+            Some(Duration::ZERO)
         );
-        assert_eq!(*enters.lock().unwrap(), 2);
+        assert_eq!(
+            inspected.evidence().attempts[1].admission_wait,
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -3668,7 +3029,7 @@ mod tests {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
         let inspected =
-            block_on_reqwest(ReqwestInspect::new().inspect_node_async(requested.clone())).unwrap();
+            block_on_reqwest(ReqwestInspect::default().inspect_async(requested.clone())).unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
@@ -3679,44 +3040,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_inspect_surfaces_shared_admission_failure_without_request() {
-        let enters = TestArc::new(Mutex::new(0));
-        let resources =
-            ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
-                waited: Duration::ZERO,
-                error: Some(AdmissionError::Rejected),
-                enters: TestArc::clone(&enters),
-            }));
-        let inspect = ReqwestInspect::with_resource(resources)
-            .with_policy(HttpInspectPolicy::default().shared_admission());
-
-        let error = block_on_reqwest(
-            inspect.inspect_node_async(RemoteUrl::parse("http://127.0.0.1:9/resource").unwrap()),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            HttpInspectError::Admission {
-                kind: AdmissionError::Rejected,
-                ..
-            }
-        ));
-        assert_eq!(*enters.lock().unwrap(), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
     fn reqwest_inspect_preserves_transport_attempt_evidence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let error =
-            block_on_reqwest(ReqwestInspect::new().inspect_node_async(
-                RemoteUrl::parse(&format!("http://{address}/resource")).unwrap(),
-            ))
-            .unwrap_err();
+        let error = block_on_reqwest(
+            ReqwestInspect::default()
+                .inspect_async(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap()),
+        )
+        .unwrap_err();
 
         match error {
             HttpInspectError::Transport { attempts, .. } => {
@@ -3735,16 +3068,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-        let intent = Intent::new(
-            Item::new("artifact"),
-            LocalTarget::new(temp.path().join("out")),
-        );
-        let chosen = crate::Chosen {
-            input: intent,
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(acquired.material.kind, MaterialKind::File);
@@ -3763,15 +3089,9 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         std::fs::write(&destination, b"old").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3794,53 +3114,12 @@ mod tests {
         let policy = AcquirePolicy::default().max_bytes(3);
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_max_bytes_rejects_before_byte_pacing() {
-        let enters = TestArc::new(Mutex::new(0));
-        let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-        let server = serve_once(200, b"too large", &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-            .policy(AcquirePolicy::default().max_bytes(3).shared_byte_pacing());
-        let resources = UreqResource::default().with_byte_pacer(TestArc::new(TestSyncBytePacer {
-            waited: Duration::from_millis(5),
-            error: None,
-            enters: TestArc::clone(&enters),
-            bytes: TestArc::clone(&paced_bytes),
-        }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let error = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap_err();
-        server.join();
-
-        assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
-        assert_eq!(*enters.lock().unwrap(), 0);
-        assert!(paced_bytes.lock().unwrap().is_empty());
         assert!(!destination.exists());
     }
 
@@ -3862,17 +3141,9 @@ mod tests {
             let sleeps = TestArc::clone(&sleeps);
             TestArc::new(move |duration| sleeps.lock().unwrap().push(duration))
         });
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
+        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"ok");
@@ -3891,194 +3162,24 @@ mod tests {
 
     #[test]
     #[cfg(feature = "ureq")]
-    fn ureq_shared_byte_pacing_records_wait_on_body_copy() {
-        let waited = Duration::from_millis(5);
-        let enters = TestArc::new(Mutex::new(0));
-        let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-        let server = serve_once(200, b"paced body", &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let policy = AcquirePolicy::default().shared_byte_pacing();
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let resources = UreqResource::default().with_byte_pacer(TestArc::new(TestSyncBytePacer {
-            waited,
-            error: None,
-            enters: TestArc::clone(&enters),
-            bytes: TestArc::clone(&paced_bytes),
-        }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
-        server.join();
-
-        assert_eq!(std::fs::read(&destination).unwrap(), b"paced body");
-        assert_eq!(*enters.lock().unwrap(), 1);
-        assert_eq!(
-            *paced_bytes.lock().unwrap(),
-            vec![b"paced body".len() as u64]
-        );
-        assert_eq!(acquired.evidence.attempts[0].pacing_wait, waited);
-        assert_eq!(
-            acquired.evidence.attempts[0].outcome,
-            AttemptOutcome::Success
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
     fn ureq_concrete_byte_rate_pacer_downloads() {
         let server = serve_once(200, b"concrete paced", &[]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-            .policy(AcquirePolicy::default().shared_byte_pacing());
+            .policy(AcquirePolicy::default());
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(1_000_000).unwrap(),
             NonZeroU32::new(16_384).unwrap(),
         ));
         let resources = UreqResource::default().with_byte_pacer(TestArc::new(pacer));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
+        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"concrete paced");
         assert_eq!(acquired.evidence.attempts[0].pacing_wait, Duration::ZERO);
-        assert_eq!(
-            acquired.evidence.attempts[0].outcome,
-            AttemptOutcome::Success
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_shared_byte_pacing_unavailable_records_rejection_without_persist() {
-        let server = serve_once(200, b"unpaced body", &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-            .policy(AcquirePolicy::default().shared_byte_pacing());
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
-        server.join();
-
-        let attempts = match error {
-            AcquireError::Pacing {
-                kind: PacingError::Unavailable,
-                attempts,
-                ..
-            } => attempts,
-            other => panic!("expected pacing unavailable, got {other:?}"),
-        };
-        assert!(!destination.exists());
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].status, Some(200));
-        assert_eq!(attempts[0].bytes, 0);
-        assert_eq!(attempts[0].pacing_wait, Duration::ZERO);
-        assert_eq!(attempts[0].outcome, AttemptOutcome::PacingRejected);
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_byte_pacing_rejection_records_pacing_rejected_without_persist() {
-        let enters = TestArc::new(Mutex::new(0));
-        let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-        let server = serve_once(200, b"reject me", &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-            .policy(AcquirePolicy::default().shared_byte_pacing());
-        let resources = UreqResource::default().with_byte_pacer(TestArc::new(TestSyncBytePacer {
-            waited: Duration::from_millis(7),
-            error: Some(PacingError::Rejected),
-            enters: TestArc::clone(&enters),
-            bytes: TestArc::clone(&paced_bytes),
-        }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let error = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap_err();
-        server.join();
-
-        let attempts = match error {
-            AcquireError::Pacing {
-                kind: PacingError::Rejected,
-                attempts,
-                ..
-            } => attempts,
-            other => panic!("expected pacing rejected, got {other:?}"),
-        };
-        assert_eq!(*enters.lock().unwrap(), 1);
-        assert_eq!(
-            *paced_bytes.lock().unwrap(),
-            vec![b"reject me".len() as u64]
-        );
-        assert!(!destination.exists());
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].outcome, AttemptOutcome::PacingRejected);
-        assert_eq!(attempts[0].pacing_wait, Duration::ZERO);
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_shared_admission_records_wait_on_attempt() {
-        let waited = Duration::from_millis(7);
-        let server = serve_once(200, b"admitted", &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let policy = AcquirePolicy::default().shared_admission();
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
-            waited,
-            error: None,
-            enters: TestArc::new(Mutex::new(0)),
-        }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
-        server.join();
-
-        assert_eq!(acquired.evidence.attempts[0].admission_wait, Some(waited));
         assert_eq!(
             acquired.evidence.attempts[0].outcome,
             AttemptOutcome::Success
@@ -4092,23 +3193,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-            .policy(AcquirePolicy::default().shared_admission());
+            .policy(AcquirePolicy::default());
         let admission = RateAdmission::new(AttemptRate::new(
             NonZeroU32::new(1_000).unwrap(),
             NonZeroU32::new(1).unwrap(),
         ));
         let resources = UreqResource::default().with_admission(TestArc::new(admission));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
+        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"rate admitted");
@@ -4119,91 +3212,6 @@ mod tests {
         assert_eq!(
             acquired.evidence.attempts[0].outcome,
             AttemptOutcome::Success
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_shared_admission_rejection_fails_before_request() {
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let source = RemoteSource::new(
-            RemoteUrl::parse("http://127.0.0.1:9/artifact.bin").unwrap(),
-            &destination,
-        )
-        .policy(AcquirePolicy::default().shared_admission());
-        let resources = UreqResource::default().with_admission(TestArc::new(TestSyncAdmission {
-            waited: Duration::ZERO,
-            error: Some(AdmissionError::Rejected),
-            enters: TestArc::new(Mutex::new(0)),
-        }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let error = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AcquireError::Admission {
-                kind: AdmissionError::Rejected,
-                ..
-            }
-        ));
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    #[cfg(feature = "ureq")]
-    fn ureq_retry_enters_shared_admission_per_attempt() {
-        let enters = TestArc::new(Mutex::new(0));
-        let server = serve_sequence(vec![(503, b"busy", &[]), (200, b"ok", &[])]);
-        let temp = tempfile::tempdir().unwrap();
-        let destination = temp.path().join("artifact.bin");
-        let policy = AcquirePolicy::default()
-            .shared_admission()
-            .retry(RetryPolicy::exponential(1, Duration::from_millis(1)));
-        let source =
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let resources = UreqResource::default()
-            .with_delay(TestArc::new(|_| {}))
-            .with_admission(TestArc::new(TestSyncAdmission {
-                waited: Duration::from_millis(3),
-                error: None,
-                enters: TestArc::clone(&enters),
-            }));
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
-
-        let acquired = UreqAcquire::with_resource(resources)
-            .acquire_node(chosen)
-            .unwrap();
-        server.join();
-
-        assert_eq!(*enters.lock().unwrap(), 2);
-        assert_eq!(acquired.evidence.attempts.len(), 2);
-        assert_eq!(
-            acquired
-                .evidence
-                .attempts
-                .iter()
-                .map(|attempt| attempt.admission_wait)
-                .collect::<Vec<_>>(),
-            vec![
-                Some(Duration::from_millis(3)),
-                Some(Duration::from_millis(3))
-            ]
         );
     }
 
@@ -4223,15 +3231,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
@@ -4254,15 +3256,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
@@ -4284,15 +3280,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         let first_request = server.next_request();
         let second_request = server.next_request();
         server.join();
@@ -4320,15 +3310,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -4354,15 +3338,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -4394,15 +3372,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -4433,15 +3405,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         let request = server.next_request();
         server.join();
 
@@ -4470,15 +3436,9 @@ mod tests {
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source =
             RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination).policy(policy);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::new().acquire_node(chosen).unwrap_err();
+        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -4501,16 +3461,10 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -4533,16 +3487,10 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             std::fs::write(&destination, b"old").unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let error = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap_err();
             server.join();
@@ -4569,60 +3517,15 @@ mod tests {
             let policy = AcquirePolicy::default().max_bytes(3);
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let error = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap_err();
             server.join();
 
             assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
-            assert!(!destination.exists());
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
-    fn reqwest_max_bytes_rejects_before_byte_pacing() {
-        block_on_reqwest(async {
-            let enters = TestArc::new(Mutex::new(0));
-            let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-            let server = serve_once(200, b"too large", &[]);
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().max_bytes(3).shared_byte_pacing());
-            let resources =
-                ReqwestResource::default().with_byte_pacer(TestArc::new(TestAsyncBytePacer {
-                    waited: Duration::from_millis(5),
-                    error: None,
-                    enters: TestArc::clone(&enters),
-                    bytes: TestArc::clone(&paced_bytes),
-                }));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let error = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
-                .await
-                .unwrap_err();
-            server.join();
-
-            assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
-            assert_eq!(*enters.lock().unwrap(), 0);
-            assert!(paced_bytes.lock().unwrap().is_empty());
             assert!(!destination.exists());
         });
     }
@@ -4649,16 +3552,10 @@ mod tests {
                     Box::pin(std::future::ready(()))
                 })
             });
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::new(resources)
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -4680,75 +3577,22 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_shared_byte_pacing_records_wait_on_body_copy() {
-        block_on_reqwest(async {
-            let waited = Duration::from_millis(13);
-            let enters = TestArc::new(Mutex::new(0));
-            let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-            let server = serve_once(200, b"async paced", &[]);
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_byte_pacing());
-            let resources =
-                ReqwestResource::default().with_byte_pacer(TestArc::new(TestAsyncBytePacer {
-                    waited,
-                    error: None,
-                    enters: TestArc::clone(&enters),
-                    bytes: TestArc::clone(&paced_bytes),
-                }));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let acquired = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
-                .await
-                .unwrap();
-            server.join();
-
-            assert_eq!(std::fs::read(&destination).unwrap(), b"async paced");
-            assert_eq!(*enters.lock().unwrap(), 1);
-            assert_eq!(
-                *paced_bytes.lock().unwrap(),
-                vec![b"async paced".len() as u64]
-            );
-            assert_eq!(acquired.evidence.attempts[0].pacing_wait, waited);
-            assert_eq!(
-                acquired.evidence.attempts[0].outcome,
-                AttemptOutcome::Success
-            );
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
     fn reqwest_concrete_byte_rate_pacer_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async concrete paced", &[]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_byte_pacing());
+                .policy(AcquirePolicy::default());
             let pacer = ByteRatePacer::new(ByteRate::new(
                 NonZeroU32::new(1_000_000).unwrap(),
                 NonZeroU32::new(16_384).unwrap(),
             ));
             let resources = ReqwestResource::default().with_byte_pacer(TestArc::new(pacer));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::new(resources)
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -4767,158 +3611,22 @@ mod tests {
 
     #[test]
     #[cfg(feature = "reqwest")]
-    fn reqwest_shared_byte_pacing_unavailable_records_rejection_without_persist() {
-        block_on_reqwest(async {
-            let server = serve_once(200, b"async unpaced", &[]);
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_byte_pacing());
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
-                .await
-                .unwrap_err();
-            server.join();
-
-            let attempts = match error {
-                AcquireError::Pacing {
-                    kind: PacingError::Unavailable,
-                    attempts,
-                    ..
-                } => attempts,
-                other => panic!("expected pacing unavailable, got {other:?}"),
-            };
-            assert!(!destination.exists());
-            assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].status, Some(200));
-            assert_eq!(attempts[0].bytes, 0);
-            assert_eq!(attempts[0].pacing_wait, Duration::ZERO);
-            assert_eq!(attempts[0].outcome, AttemptOutcome::PacingRejected);
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
-    fn reqwest_byte_pacing_rejection_records_pacing_rejected_without_persist() {
-        block_on_reqwest(async {
-            let enters = TestArc::new(Mutex::new(0));
-            let paced_bytes = TestArc::new(Mutex::new(Vec::new()));
-            let server = serve_once(200, b"reject me", &[]);
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_byte_pacing());
-            let resources =
-                ReqwestResource::default().with_byte_pacer(TestArc::new(TestAsyncBytePacer {
-                    waited: Duration::from_millis(7),
-                    error: Some(PacingError::Rejected),
-                    enters: TestArc::clone(&enters),
-                    bytes: TestArc::clone(&paced_bytes),
-                }));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let error = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
-                .await
-                .unwrap_err();
-            server.join();
-
-            let attempts = match error {
-                AcquireError::Pacing {
-                    kind: PacingError::Rejected,
-                    attempts,
-                    ..
-                } => attempts,
-                other => panic!("expected pacing rejected, got {other:?}"),
-            };
-            assert_eq!(*enters.lock().unwrap(), 1);
-            assert_eq!(
-                *paced_bytes.lock().unwrap(),
-                vec![b"reject me".len() as u64]
-            );
-            assert!(!destination.exists());
-            assert_eq!(attempts.len(), 1);
-            assert_eq!(attempts[0].outcome, AttemptOutcome::PacingRejected);
-            assert_eq!(attempts[0].pacing_wait, Duration::ZERO);
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
-    fn reqwest_shared_admission_records_wait_on_attempt() {
-        block_on_reqwest(async {
-            let waited = Duration::from_millis(11);
-            let server = serve_once(200, b"async admitted", &[]);
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_admission());
-            let resources =
-                ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
-                    waited,
-                    error: None,
-                    enters: TestArc::new(Mutex::new(0)),
-                }));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let acquired = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
-                .await
-                .unwrap();
-            server.join();
-
-            assert_eq!(acquired.evidence.attempts[0].admission_wait, Some(waited));
-            assert_eq!(
-                acquired.evidence.attempts[0].outcome,
-                AttemptOutcome::Success
-            );
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
     fn reqwest_concrete_rate_admission_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async rate admitted", &[]);
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
-                .policy(AcquirePolicy::default().shared_admission());
+                .policy(AcquirePolicy::default());
             let admission = RateAdmission::new(AttemptRate::new(
                 NonZeroU32::new(1_000).unwrap(),
                 NonZeroU32::new(1).unwrap(),
             ));
             let resources = ReqwestResource::default().with_admission(TestArc::new(admission));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::new(resources)
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -4932,47 +3640,6 @@ mod tests {
                 acquired.evidence.attempts[0].outcome,
                 AttemptOutcome::Success
             );
-        });
-    }
-
-    #[test]
-    #[cfg(feature = "reqwest")]
-    fn reqwest_shared_admission_rejection_fails_before_request() {
-        block_on_reqwest(async {
-            let temp = tempfile::tempdir().unwrap();
-            let destination = temp.path().join("artifact.bin");
-            let source = RemoteSource::new(
-                RemoteUrl::parse("http://127.0.0.1:9/artifact.bin").unwrap(),
-                &destination,
-            )
-            .policy(AcquirePolicy::default().shared_admission());
-            let resources =
-                ReqwestResource::default().with_admission(TestArc::new(TestAsyncAdmission {
-                    waited: Duration::ZERO,
-                    error: Some(AdmissionError::Rejected),
-                    enters: TestArc::new(Mutex::new(0)),
-                }));
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
-
-            let error = ReqwestAcquire::with_resource(resources)
-                .acquire_node_async(chosen)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(
-                error,
-                AcquireError::Admission {
-                    kind: AdmissionError::Rejected,
-                    ..
-                }
-            ));
-            assert!(!destination.exists());
         });
     }
 
@@ -4993,16 +3660,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -5029,16 +3690,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let error = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap_err();
             server.join();
@@ -5074,16 +3729,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let error = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap_err();
             server.join();
@@ -5118,16 +3767,10 @@ mod tests {
                 .resume(ResumePolicy::if_range(&partial, validator.clone()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             let request = server.next_request();
@@ -5160,16 +3803,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let error = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap_err();
             server.join();
@@ -5199,16 +3836,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
@@ -5234,16 +3865,10 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination)
                 .policy(policy);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             let first_request = server.next_request();
@@ -5272,21 +3897,15 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let destination = temp.path().join("artifact.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-            let chosen = crate::Chosen {
-                input: Intent::new(
-                    Item::new("artifact"),
-                    LocalTarget::new(temp.path().join("out")),
-                ),
-                source,
-            };
+            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
-            let verified = DescriptorVerify::<Blake3>::new()
-                .verify_node(
+            let verified = HashVerify::<Blake3>::new()
+                .verify(
                     acquired,
                     ArtifactDescriptor::new(expected, body.len() as u64),
                 )
@@ -5306,28 +3925,18 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let cache_path = temp.path().join("cache.bin");
             let final_path = temp.path().join("final.bin");
-            let intent = Intent::new(Item::new("artifact"), LocalTarget::new(&final_path))
-                .op::<CreateOrReplace>();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &cache_path);
-            let chosen = crate::Chosen {
-                input: intent,
-                source,
-            };
+            let chosen = materialize(source, &final_path);
 
-            let acquired = ReqwestAcquire::new()
-                .acquire_node_async(chosen)
+            let acquired = ReqwestAcquire::default()
+                .acquire_async(chosen)
                 .await
                 .unwrap();
             server.join();
             let verified = HashVerify::<Blake3>::new()
-                .verify_node(acquired, DigestNeed::new(expected))
+                .verify(acquired, DigestValue::new(expected))
                 .unwrap();
-            let prepared = IdentityPrepare
-                .prepare_node(verified, crate::Identity)
-                .unwrap();
-            let applied = LocalApply::<CreateOrReplace>::default()
-                .apply_node(prepared)
-                .unwrap();
+            let applied = LocalApply.apply(verified).unwrap();
 
             assert_eq!(std::fs::read(final_path).unwrap(), body);
             assert_eq!(applied.evidence.current.files, 1);
@@ -5343,18 +3952,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &destination);
-        let chosen = crate::Chosen {
-            input: Intent::new(
-                Item::new("artifact"),
-                LocalTarget::new(temp.path().join("out")),
-            ),
-            source,
-        };
+        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
-        let verified = DescriptorVerify::<Blake3>::new()
-            .verify_node(
+        let verified = HashVerify::<Blake3>::new()
+            .verify(
                 acquired,
                 ArtifactDescriptor::new(expected, body.len() as u64),
             )
@@ -5372,25 +3975,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_path = temp.path().join("cache.bin");
         let final_path = temp.path().join("final.bin");
-        let intent = Intent::new(Item::new("artifact"), LocalTarget::new(&final_path))
-            .op::<CreateOrReplace>();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap(), &cache_path);
-        let chosen = crate::Chosen {
-            input: intent,
-            source,
-        };
+        let chosen = materialize(source, &final_path);
 
-        let acquired = UreqAcquire::new().acquire_node(chosen).unwrap();
+        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
         server.join();
         let verified = HashVerify::<Blake3>::new()
-            .verify_node(acquired, DigestNeed::new(expected))
+            .verify(acquired, DigestValue::new(expected))
             .unwrap();
-        let prepared = IdentityPrepare
-            .prepare_node(verified, crate::Identity)
-            .unwrap();
-        let applied = LocalApply::<CreateOrReplace>::default()
-            .apply_node(prepared)
-            .unwrap();
+        let applied = LocalApply.apply(verified).unwrap();
 
         assert_eq!(std::fs::read(final_path).unwrap(), body);
         assert_eq!(applied.evidence.current.files, 1);

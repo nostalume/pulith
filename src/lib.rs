@@ -3,15 +3,19 @@
 //! Pulith models behavior as an inductive tree of semantic nodes:
 //!
 //! ```text
-//! materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
-//! forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
-//! observe:     LocalTarget -> Inspected -> Reconciled
-//!              RemoteUrl  -> Inspected
+//! Materialize -> Acquired -> Applied
+//!                         -> Verified -> Applied
+//!                         -> Prepared -> Applied
+//!                         -> Verified -> Prepared -> Applied
+//! Forget -----------------------------> Applied
+//! LocalTarget -> Inspected -> Reconciled
+//! RemoteUrl  --> Inspected
 //! ```
 //!
-//! Each behavior explicitly declares the associated contracts it uses: policy need where required,
-//! plus its evidence, error, and output. Concrete mechanisms are attached through feature-gated
-//! typed nodes rather than a global context, registry, or hidden workflow policy.
+//! Each behavior passes policy need as a trait type parameter where required and declares associated
+//! error and output contracts. The typed output carries its evidence. Concrete mechanisms are
+//! attached through feature-gated typed nodes rather than a global context, registry, or hidden
+//! workflow policy.
 //!
 //! # Domain boundaries
 //!
@@ -43,14 +47,14 @@
 //! # Current maturity
 //!
 //! The state types are composition vocabulary, not an implicit package-manager implementation.
-//! Pulith currently supplies concrete local/HTTP acquisition, identity, digest, or exact
-//! digest-plus-size descriptor verification, identity or archive preparation, staged local
-//! publication, direct local forgetting, in-memory remembering, local/HTTP inspection, and local
+//! Pulith currently supplies concrete local/HTTP acquisition, digest or exact digest-plus-size
+//! descriptor verification, archive preparation, staged local publication, direct local forgetting,
+//! local/HTTP inspection, and local
 //! reconciliation. Inspection is read-only; HTTP inspection reports status and declared response
 //! length without GET fallback or body materialization. Reconciliation consumes caller-owned expected state
 //! and produces only a classification plus evidence. A descriptor proves byte identity with a
 //! supplied expectation; it does not authenticate that expectation. Source discovery, trust
-//! authorization, durable lifecycle storage, dependency solving, multi-target transactions, and
+//! selection, authorization, durable lifecycle storage, dependency solving, multi-target transactions, and
 //! automatic repair are not provided. Async execution is concrete only for HTTP acquisition and
 //! HTTP inspection; the other transitions currently expose synchronous behavior laws only.
 
@@ -59,7 +63,8 @@ pub mod application;
 pub mod archive;
 pub mod behavior;
 pub mod error;
-pub mod evidence;
+#[cfg(feature = "local")]
+mod evidence;
 #[cfg(feature = "hash")]
 pub mod hash;
 #[cfg(feature = "local")]
@@ -67,61 +72,11 @@ pub mod local;
 #[cfg(feature = "net")]
 pub mod net;
 
-pub use application::{
-    Create, CreateOrReplace, Forget, Intent, Item, LocalPath, LocalTarget, Replace, WithSource,
-};
-#[cfg(feature = "gzip")]
-pub use archive::Gzip;
-#[cfg(feature = "xz")]
-pub use archive::Xz;
-#[cfg(feature = "zip")]
-pub use archive::Zip;
-#[cfg(feature = "zstd")]
-pub use archive::Zstd;
-#[cfg(any(feature = "zip", feature = "tar"))]
-pub use archive::{
-    ArchiveEvidence, ArchiveNeed, ArchivePolicy, ArchivePrepare, ArchiveTree, ExtractWorkspace,
-};
-#[cfg(feature = "tar")]
-pub use archive::{Plain, Tar};
+pub use application::{Forget, Materialize, MaterializeMode};
 #[cfg(feature = "reqwest")]
-pub use behavior::AsyncInspectNode;
+pub use behavior::AsyncInspect;
 pub use behavior::{
-    AcquireNode, Acquired, Applied, ApplyNode, AsyncAcquireNode, Chosen, EvidenceChain,
-    InspectNode, Inspected, NoEvidence, PrepareNode, Prepared, ReconcileNode, Reconciled,
-    RememberNode, Remembered, SelectNode, Verified, VerifyNode,
+    Acquire, Acquired, Applied, Apply, AsyncAcquire, EvidenceChain, Inspect, Inspected, Prepare,
+    Prepared, Reconcile, Reconciled, Verified, Verify,
 };
 pub use error::PulithError;
-pub use evidence::{
-    AcquireEvidence, ApplyEvidence, LocalApplyStats, LocalPlacement, PrepareEvidence, Receipt,
-    RememberEvidence,
-};
-#[cfg(all(feature = "hash", feature = "blake3"))]
-pub use hash::Blake3;
-#[cfg(all(feature = "hash", feature = "sha2"))]
-pub use hash::Sha256;
-#[cfg(feature = "hash")]
-pub use hash::{
-    ArtifactDescriptor, DescriptorEvidence, DescriptorVerify, DigestAlgorithm, DigestEvidence,
-    DigestNeed, DigestValue, HashVerify, NoHashResource,
-};
-#[cfg(feature = "local")]
-pub use local::{
-    Identity, IdentityPrepare, IdentityVerify, LocalAcquire, LocalApply, LocalEntryKind,
-    LocalExpectation, LocalInspect, LocalInspectEvidence, LocalInspectMethod, LocalMaterial,
-    LocalObservation, LocalPrepared, LocalReconcile, LocalReconcileEvidence, LocalReconciliation,
-    MaterialKind, MemoryRemember, SelectFirst,
-};
-#[cfg(feature = "net")]
-pub use net::{
-    AcquireError, AcquirePolicy, AdmissionError, AdmissionMode, AdmissionPermit, AttemptEvidence,
-    AttemptOutcome, AttemptRate, BytePacingMode, BytePacingPermit, ByteRate, ByteRatePacer,
-    HttpInspectAttemptEvidence, HttpInspectError, HttpInspectEvidence, HttpInspectMethod,
-    HttpInspectPolicy, HttpObservation, PacingError, ProtocolError, RateAdmission, RemoteSource,
-    RemoteUrl, RemoteUrlError, ResumeEvidence, ResumeMode, ResumeOutcome, ResumePolicy,
-    RetryPolicy, TransportPhase, UnsafeDestination, Validator,
-};
-#[cfg(feature = "reqwest")]
-pub use net::{AsyncAdmission, AsyncBytePacer, ReqwestAcquire, ReqwestInspect, ReqwestResource};
-#[cfg(feature = "ureq")]
-pub use net::{SyncAdmission, SyncBytePacer, UreqAcquire, UreqInspect, UreqResource};

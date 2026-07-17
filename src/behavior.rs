@@ -1,18 +1,15 @@
 #![cfg_attr(
     not(feature = "reqwest"),
     doc = r#"
-`AsyncInspectNode` is admitted only with the concrete `reqwest` adapter:
+`AsyncInspect` is admitted only with the concrete `reqwest` adapter:
 
 ```compile_fail
-use pulith::behavior::AsyncInspectNode;
+use pulith::behavior::AsyncInspect;
 ```
 "#
 )]
 
 use std::future::Future;
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct NoEvidence;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvidenceChain<A, B> {
@@ -27,32 +24,7 @@ impl<A, B> EvidenceChain<A, B> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Chosen<I, S> {
-    pub(crate) input: I,
-    pub(crate) source: S,
-}
-
-impl<I, S> Chosen<I, S> {
-    #[allow(dead_code)]
-    pub(crate) fn from_selected(input: I, source: S) -> Self {
-        Self { input, source }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn source(&self) -> &S {
-        &self.source
-    }
-
-    pub fn into_parts(self) -> (I, S) {
-        (self.input, self.source)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Acquired<I, M, E = NoEvidence> {
+pub struct Acquired<I, M, E> {
     pub(crate) input: I,
     pub(crate) material: M,
     pub(crate) evidence: E,
@@ -79,14 +51,10 @@ impl<I, M, E> Acquired<I, M, E> {
     pub fn evidence(&self) -> &E {
         &self.evidence
     }
-
-    pub fn into_parts(self) -> (I, M, E) {
-        (self.input, self.material, self.evidence)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Verified<I, M, E = NoEvidence> {
+pub struct Verified<I, M, E> {
     pub(crate) input: I,
     pub(crate) material: M,
     pub(crate) evidence: E,
@@ -113,14 +81,10 @@ impl<I, M, E> Verified<I, M, E> {
     pub fn evidence(&self) -> &E {
         &self.evidence
     }
-
-    pub fn into_parts(self) -> (I, M, E) {
-        (self.input, self.material, self.evidence)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Prepared<I, P, E = NoEvidence> {
+pub struct Prepared<I, P, E> {
     pub(crate) input: I,
     pub(crate) prepared: P,
     pub(crate) evidence: E,
@@ -147,83 +111,32 @@ impl<I, P, E> Prepared<I, P, E> {
     pub fn evidence(&self) -> &E {
         &self.evidence
     }
-
-    pub fn into_parts(self) -> (I, P, E) {
-        (self.input, self.prepared, self.evidence)
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Applied<I, R, E = NoEvidence> {
+pub struct Applied<I, E> {
     pub(crate) input: I,
-    pub(crate) receipt: R,
     pub(crate) evidence: E,
 }
 
-impl<I, R, E> Applied<I, R, E> {
+impl<I, E> Applied<I, E> {
     #[allow(dead_code)]
-    pub(crate) fn from_apply(input: I, receipt: R, evidence: E) -> Self {
-        Self {
-            input,
-            receipt,
-            evidence,
-        }
+    pub(crate) fn from_apply(input: I, evidence: E) -> Self {
+        Self { input, evidence }
     }
 
     pub fn input(&self) -> &I {
         &self.input
     }
 
-    pub fn receipt(&self) -> &R {
-        &self.receipt
-    }
-
     pub fn evidence(&self) -> &E {
         &self.evidence
-    }
-
-    pub fn into_parts(self) -> (I, R, E) {
-        (self.input, self.receipt, self.evidence)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Remembered<I, R, E = NoEvidence> {
-    pub(crate) input: I,
-    pub(crate) receipt: R,
-    pub(crate) evidence: E,
-}
-
-impl<I, R, E> Remembered<I, R, E> {
-    #[allow(dead_code)]
-    pub(crate) fn from_remember(input: I, receipt: R, evidence: E) -> Self {
-        Self {
-            input,
-            receipt,
-            evidence,
-        }
-    }
-
-    pub fn input(&self) -> &I {
-        &self.input
-    }
-
-    pub fn receipt(&self) -> &R {
-        &self.receipt
-    }
-
-    pub fn evidence(&self) -> &E {
-        &self.evidence
-    }
-
-    pub fn into_parts(self) -> (I, R, E) {
-        (self.input, self.receipt, self.evidence)
     }
 }
 
 /// Read-only observation of an external resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Inspected<I, O, E = NoEvidence> {
+pub struct Inspected<I, O, E> {
     pub(crate) input: I,
     pub(crate) observation: O,
     pub(crate) evidence: E,
@@ -249,10 +162,6 @@ impl<I, O, E> Inspected<I, O, E> {
 
     pub fn evidence(&self) -> &E {
         &self.evidence
-    }
-
-    pub fn into_parts(self) -> (I, O, E) {
-        (self.input, self.observation, self.evidence)
     }
 }
 
@@ -285,109 +194,105 @@ impl<I, R, E> Reconciled<I, R, E> {
     pub fn evidence(&self) -> &E {
         &self.evidence
     }
-
-    pub fn into_parts(self) -> (I, R, E) {
-        (self.input, self.reconciliation, self.evidence)
-    }
 }
 
-pub trait SelectNode<N> {
-    type Source;
+/// Acquires resource-specific material for a caller-owned input `N`.
+///
+/// The associated `Output` encodes material and evidence; `Error` preserves the adapter's failure
+/// law. Acquisition may perform source I/O but has no authority to publish the final target. Source
+/// semantics belong to the concrete adapter, currently local paths, `ureq`, or `reqwest`.
+pub trait Acquire<N> {
     type Error;
     type Output;
 
-    fn select_node(&self, node: N) -> Result<Self::Output, Self::Error>;
+    fn acquire(&self, node: N) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait AcquireNode<N> {
-    type Material;
-    type Evidence;
+/// Asynchronous form of [`Acquire`] with the same authority, output-evidence, and failure laws.
+///
+/// Only concrete async adapters implement this behavior; Pulith does not require a global runtime.
+pub trait AsyncAcquire<N> {
     type Error;
     type Output;
 
-    fn acquire_node(&self, node: N) -> Result<Self::Output, Self::Error>;
-}
-
-pub trait AsyncAcquireNode<N> {
-    type Material;
-    type Evidence;
-    type Error;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
+    fn acquire_async<'a>(
+        &'a self,
+        node: N,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
     where
-        Self: 'a,
         N: 'a;
-
-    fn acquire_node_async(&self, node: N) -> Self::Future<'_>;
 }
 
-/// Asynchronous read-only observation law, admitted only with a concrete async adapter.
+/// Asynchronously observes resource-specific facts without mutation or desired-state decisions.
+///
+/// `Output` carries the observation and evidence, while `Error` reports failures that produced no
+/// observation. The current concrete adapter is reqwest HTTP HEAD inspection.
 #[cfg(feature = "reqwest")]
-pub trait AsyncInspectNode<N> {
-    type Observation;
-    type Evidence;
+pub trait AsyncInspect<N> {
     type Error;
     type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Error>>
+
+    fn inspect_async<'a>(
+        &'a self,
+        node: N,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
     where
-        Self: 'a,
         N: 'a;
-
-    fn inspect_node_async(&self, node: N) -> Self::Future<'_>;
 }
 
-pub trait VerifyNode<N> {
-    type Need;
-    type Evidence;
+/// Establishes one factual proof about material in `N` against caller-supplied `Need`.
+///
+/// Verification does not authorize provenance or mutate a final target. `Output` carries verified
+/// material and evidence; `Error` reports an unmet proof. Concrete digest semantics live in `hash`.
+pub trait Verify<N, Need> {
     type Error;
     type Output;
 
-    fn verify_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
+    fn verify(&self, node: N, need: Need) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait PrepareNode<N> {
-    type Need;
-    type Prepared;
-    type Evidence;
+/// Transforms material in `N` according to caller-supplied `Need` without final publication.
+///
+/// `Output` carries prepared material and evidence; `Error` preserves transformation and cleanup
+/// failures. The current archive adapters operate only in caller-owned destructive scratch space.
+pub trait Prepare<N, Need> {
     type Error;
     type Output;
 
-    fn prepare_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
+    fn prepare(&self, node: N, need: Need) -> Result<Self::Output, Self::Error>;
 }
 
-pub trait ApplyNode<N> {
-    type Receipt;
-    type Evidence;
+/// Applies a caller-authorized target effect represented by `N`.
+///
+/// `Output` carries the applied request and evidence; `Error` means the requested effect did not
+/// complete. Resource-specific commit and failure laws belong to the adapter. Local apply is the
+/// current concrete implementation, including direct target-only [`crate::Forget`].
+pub trait Apply<N> {
     type Error;
     type Output;
 
-    fn apply_node(&self, node: N) -> Result<Self::Output, Self::Error>;
-}
-
-pub trait RememberNode<N> {
-    type Evidence;
-    type Error;
-    type Output;
-
-    fn remember_node(&self, node: N) -> Result<Self::Output, Self::Error>;
+    fn apply(&self, node: N) -> Result<Self::Output, Self::Error>;
 }
 
 /// Observes an external resource without mutating it or deciding desired state.
-pub trait InspectNode<N> {
-    type Observation;
-    type Evidence;
+///
+/// `Output` carries resource-specific facts and evidence; `Error` means no valid observation was
+/// produced. Local no-follow metadata and HTTP HEAD are the current concrete semantics.
+pub trait Inspect<N> {
     type Error;
     type Output;
 
-    fn inspect_node(&self, node: N) -> Result<Self::Output, Self::Error>;
+    fn inspect(&self, node: N) -> Result<Self::Output, Self::Error>;
 }
 
-/// Compares a typed observation with caller-owned expected state without mutation.
-pub trait ReconcileNode<N> {
-    type Need;
-    type Evidence;
+/// Compares a typed observation with caller-owned `Need` without mutation.
+///
+/// `Output` carries the classification and preserved evidence. `Error` describes comparison
+/// failure; it grants no authority to repair, adopt, delete, or persist the observed resource.
+/// Local reconciliation is the current concrete implementation.
+pub trait Reconcile<N, Need> {
     type Error;
     type Output;
 
-    fn reconcile_node(&self, node: N, need: Self::Need) -> Result<Self::Output, Self::Error>;
+    fn reconcile(&self, node: N, need: Need) -> Result<Self::Output, Self::Error>;
 }

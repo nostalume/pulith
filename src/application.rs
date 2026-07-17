@@ -1,96 +1,49 @@
-use std::marker::PhantomData;
-use std::path::PathBuf;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Intent<I, T, O = CreateOrReplace> {
-    pub item: I,
-    pub target: T,
-    pub op: PhantomData<O>,
+/// Caller-selected publication semantics for one materialization request.
+///
+/// The mode authorizes only the final target effect. It does not select a source, establish
+/// ownership, or imply rollback across multiple targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializeMode {
+    Create,
+    Replace,
+    CreateOrReplace,
 }
 
-impl<I, T> Intent<I, T, CreateOrReplace> {
-    pub fn new(item: I, target: T) -> Self {
+/// A caller-owned request to materialize one selected source at one target.
+///
+/// `Materialize` is input vocabulary, not evidence that acquisition, verification, preparation, or
+/// application has occurred. Callers compose only the concrete behaviors required for the resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Materialize<I, S, T> {
+    pub item: I,
+    pub source: S,
+    pub target: T,
+    pub mode: MaterializeMode,
+}
+
+impl<I, S, T> Materialize<I, S, T> {
+    pub fn new(item: I, source: S, target: T, mode: MaterializeMode) -> Self {
         Self {
             item,
-            target,
-            op: PhantomData,
-        }
-    }
-}
-
-impl<I, T, O> Intent<I, T, O> {
-    pub fn op<N>(self) -> Intent<I, T, N> {
-        Intent {
-            item: self.item,
-            target: self.target,
-            op: PhantomData,
-        }
-    }
-
-    pub fn with_source<S>(self, source: S) -> WithSource<Self, S> {
-        WithSource {
-            input: self,
             source,
+            target,
+            mode,
         }
     }
 }
 
+/// A caller-authorized request to remove one exact target directly.
+///
+/// `Forget` does not claim package ownership and deliberately has no source, acquisition,
+/// verification, or preparation branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WithSource<I, S> {
-    pub input: I,
-    pub source: S,
+pub struct Forget<I, T> {
+    pub item: I,
+    pub target: T,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Item {
-    pub name: String,
-    pub version: Option<String>,
-}
-
-impl Item {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            version: None,
-        }
-    }
-
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
-        self
+impl<I, T> Forget<I, T> {
+    pub fn new(item: I, target: T) -> Self {
+        Self { item, target }
     }
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalPath {
-    pub path: PathBuf,
-}
-
-impl LocalPath {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalTarget {
-    pub path: PathBuf,
-}
-
-impl LocalTarget {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Create;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Replace;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CreateOrReplace;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Forget;

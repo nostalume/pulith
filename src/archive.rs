@@ -6,8 +6,10 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
+use crate::evidence::ApplyEvidence;
+use crate::local::{LocalApply, LocalMaterial, LocalTarget, MaterialKind};
 use crate::{
-    EvidenceChain, LocalMaterial, MaterialKind, PrepareNode, Prepared, PulithError, Verified,
+    Acquired, Applied, Apply, EvidenceChain, Materialize, Prepare, Prepared, PulithError, Verified,
 };
 
 type ArchivePrepared<I, E, A> = Prepared<I, ArchiveTree<A>, EvidenceChain<E, ArchiveEvidence<A>>>;
@@ -115,7 +117,7 @@ pub struct Tar<C = Plain> {
 /// a struct literal.
 ///
 /// ```compile_fail
-/// use pulith::ArchivePolicy;
+/// use pulith::archive::ArchivePolicy;
 ///
 /// let _ = ArchivePolicy {
 ///     strip_components: 0,
@@ -179,34 +181,13 @@ impl Default for ArchivePolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveNeed<A> {
-    pub policy: ArchivePolicy,
-    _archive: PhantomData<A>,
-}
-
-impl<A> ArchiveNeed<A> {
-    pub fn new(policy: ArchivePolicy) -> Self {
-        Self {
-            policy,
-            _archive: PhantomData,
-        }
-    }
-}
-
-impl<A> Default for ArchiveNeed<A> {
-    fn default() -> Self {
-        Self::new(ArchivePolicy::default())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveTree<A> {
     pub root: PathBuf,
     _archive: PhantomData<A>,
 }
 
 impl<A> ArchiveTree<A> {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             _archive: PhantomData,
@@ -264,127 +245,113 @@ impl ExtractWorkspace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivePrepare<A, R = ExtractWorkspace> {
-    pub resources: R,
+pub struct ArchivePrepare<A> {
+    workspace: ExtractWorkspace,
     _archive: PhantomData<A>,
 }
 
-impl<A, R> ArchivePrepare<A, R> {
-    pub fn new(resources: R) -> Self {
+impl<A> ArchivePrepare<A> {
+    pub fn new(workspace: ExtractWorkspace) -> Self {
         Self {
-            resources,
+            workspace,
             _archive: PhantomData,
         }
     }
 }
 
+impl<I, S, E, A> Apply<Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, E>> for LocalApply {
+    type Error = PulithError;
+    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+
+    fn apply(
+        &self,
+        node: Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, E>,
+    ) -> Result<Self::Output, Self::Error> {
+        crate::local::apply_material(
+            node.input,
+            LocalMaterial {
+                path: node.prepared.root,
+                kind: MaterialKind::Directory,
+            },
+            node.evidence,
+        )
+    }
+}
+
+macro_rules! impl_archive_prepare {
+    ($archive:ty, $extract:path) => {
+        impl<I, E> Prepare<Acquired<I, LocalMaterial, E>, ArchivePolicy>
+            for ArchivePrepare<$archive>
+        {
+            type Error = PulithError;
+            type Output = ArchivePrepared<I, E, $archive>;
+
+            fn prepare(
+                &self,
+                node: Acquired<I, LocalMaterial, E>,
+                policy: ArchivePolicy,
+            ) -> Result<Self::Output, Self::Error> {
+                prepare_archive(
+                    node.input,
+                    node.material,
+                    node.evidence,
+                    &self.workspace.root,
+                    policy,
+                    $extract,
+                )
+            }
+        }
+
+        impl<I, E> Prepare<Verified<I, LocalMaterial, E>, ArchivePolicy>
+            for ArchivePrepare<$archive>
+        {
+            type Error = PulithError;
+            type Output = ArchivePrepared<I, E, $archive>;
+
+            fn prepare(
+                &self,
+                node: Verified<I, LocalMaterial, E>,
+                policy: ArchivePolicy,
+            ) -> Result<Self::Output, Self::Error> {
+                prepare_archive(
+                    node.input,
+                    node.material,
+                    node.evidence,
+                    &self.workspace.root,
+                    policy,
+                    $extract,
+                )
+            }
+        }
+    };
+}
+
 #[cfg(feature = "zip")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>> for ArchivePrepare<Zip, ExtractWorkspace> {
-    type Need = ArchiveNeed<Zip>;
-    type Prepared = ArchiveTree<Zip>;
-    type Evidence = ArchiveEvidence<Zip>;
-    type Error = PulithError;
-    type Output = Prepared<I, ArchiveTree<Zip>, EvidenceChain<E, ArchiveEvidence<Zip>>>;
-
-    fn prepare_node(
-        &self,
-        node: Verified<I, LocalMaterial, E>,
-        need: Self::Need,
-    ) -> Result<Self::Output, Self::Error> {
-        prepare_archive(node, &self.resources.root, need.policy, extract_zip)
-    }
-}
-
+impl_archive_prepare!(Zip, extract_zip);
 #[cfg(feature = "tar")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Plain>, ExtractWorkspace>
-{
-    type Need = ArchiveNeed<Tar<Plain>>;
-    type Prepared = ArchiveTree<Tar<Plain>>;
-    type Evidence = ArchiveEvidence<Tar<Plain>>;
-    type Error = PulithError;
-    type Output =
-        Prepared<I, ArchiveTree<Tar<Plain>>, EvidenceChain<E, ArchiveEvidence<Tar<Plain>>>>;
-
-    fn prepare_node(
-        &self,
-        node: Verified<I, LocalMaterial, E>,
-        need: Self::Need,
-    ) -> Result<Self::Output, Self::Error> {
-        prepare_archive(node, &self.resources.root, need.policy, extract_tar_plain)
-    }
-}
-
+impl_archive_prepare!(Tar<Plain>, extract_tar_plain);
 #[cfg(feature = "gzip")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Gzip>, ExtractWorkspace>
-{
-    type Need = ArchiveNeed<Tar<Gzip>>;
-    type Prepared = ArchiveTree<Tar<Gzip>>;
-    type Evidence = ArchiveEvidence<Tar<Gzip>>;
-    type Error = PulithError;
-    type Output = Prepared<I, ArchiveTree<Tar<Gzip>>, EvidenceChain<E, ArchiveEvidence<Tar<Gzip>>>>;
-
-    fn prepare_node(
-        &self,
-        node: Verified<I, LocalMaterial, E>,
-        need: Self::Need,
-    ) -> Result<Self::Output, Self::Error> {
-        prepare_archive(node, &self.resources.root, need.policy, extract_tar_gzip)
-    }
-}
-
+impl_archive_prepare!(Tar<Gzip>, extract_tar_gzip);
 #[cfg(feature = "xz")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Xz>, ExtractWorkspace>
-{
-    type Need = ArchiveNeed<Tar<Xz>>;
-    type Prepared = ArchiveTree<Tar<Xz>>;
-    type Evidence = ArchiveEvidence<Tar<Xz>>;
-    type Error = PulithError;
-    type Output = Prepared<I, ArchiveTree<Tar<Xz>>, EvidenceChain<E, ArchiveEvidence<Tar<Xz>>>>;
-
-    fn prepare_node(
-        &self,
-        node: Verified<I, LocalMaterial, E>,
-        need: Self::Need,
-    ) -> Result<Self::Output, Self::Error> {
-        prepare_archive(node, &self.resources.root, need.policy, extract_tar_xz)
-    }
-}
-
+impl_archive_prepare!(Tar<Xz>, extract_tar_xz);
 #[cfg(feature = "zstd")]
-impl<I, E> PrepareNode<Verified<I, LocalMaterial, E>>
-    for ArchivePrepare<Tar<Zstd>, ExtractWorkspace>
-{
-    type Need = ArchiveNeed<Tar<Zstd>>;
-    type Prepared = ArchiveTree<Tar<Zstd>>;
-    type Evidence = ArchiveEvidence<Tar<Zstd>>;
-    type Error = PulithError;
-    type Output = Prepared<I, ArchiveTree<Tar<Zstd>>, EvidenceChain<E, ArchiveEvidence<Tar<Zstd>>>>;
-
-    fn prepare_node(
-        &self,
-        node: Verified<I, LocalMaterial, E>,
-        need: Self::Need,
-    ) -> Result<Self::Output, Self::Error> {
-        prepare_archive(node, &self.resources.root, need.policy, extract_tar_zstd)
-    }
-}
+impl_archive_prepare!(Tar<Zstd>, extract_tar_zstd);
 
 fn prepare_archive<I, E, A>(
-    node: Verified<I, LocalMaterial, E>,
+    input: I,
+    material: LocalMaterial,
+    previous_evidence: E,
     root: &Path,
     policy: ArchivePolicy,
     extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence<A>, PulithError>,
 ) -> Result<ArchivePrepared<I, E, A>, PulithError> {
-    if node.material.kind != MaterialKind::File {
-        return Err(PulithError::ArchiveRequiresFile(node.material.path));
+    if material.kind != MaterialKind::File {
+        return Err(PulithError::ArchiveRequiresFile(material.path));
     }
 
     let root = root.to_path_buf();
     reset_extract_root(&root)?;
-    let evidence = match extract(&node.material.path, &root, &policy) {
+    let evidence = match extract(&material.path, &root, &policy) {
         Ok(evidence) => evidence,
         Err(error) => {
             let cleanup = reset_extract_root(&root);
@@ -393,9 +360,9 @@ fn prepare_archive<I, E, A>(
     };
 
     Ok(Prepared::from_prepare(
-        node.input,
+        input,
         ArchiveTree::new(root),
-        EvidenceChain::new(node.evidence, evidence),
+        EvidenceChain::new(previous_evidence, evidence),
     ))
 }
 
@@ -931,103 +898,6 @@ fn is_zip_symlink(mode: Option<u32>) -> bool {
     mode.is_some_and(|mode| mode & 0o170000 == 0o120000)
 }
 
-#[cfg(all(any(feature = "zip", feature = "tar"), feature = "local"))]
-mod local_apply {
-    use crate::local::LocalApplied;
-    use crate::{
-        Applied, ApplyEvidence, ApplyNode, ArchiveTree, Create, CreateOrReplace, EvidenceChain,
-        Intent, Item, LocalApply, LocalPrepared, LocalTarget, MaterialKind, Prepared, PulithError,
-        Receipt, Replace,
-    };
-
-    impl<A, E> ApplyNode<Prepared<Intent<Item, LocalTarget, Create>, ArchiveTree<A>, E>>
-        for LocalApply<Create>
-    {
-        type Receipt = Receipt<Create>;
-        type Evidence = ApplyEvidence;
-        type Error = PulithError;
-        type Output = Applied<
-            Intent<Item, LocalTarget, Create>,
-            Receipt<Create>,
-            EvidenceChain<E, ApplyEvidence>,
-        >;
-
-        fn apply_node(
-            &self,
-            node: Prepared<Intent<Item, LocalTarget, Create>, ArchiveTree<A>, E>,
-        ) -> Result<Self::Output, Self::Error> {
-            apply_archive_tree(node)
-        }
-    }
-
-    impl<A, E> ApplyNode<Prepared<Intent<Item, LocalTarget, Replace>, ArchiveTree<A>, E>>
-        for LocalApply<Replace>
-    {
-        type Receipt = Receipt<Replace>;
-        type Evidence = ApplyEvidence;
-        type Error = PulithError;
-        type Output = Applied<
-            Intent<Item, LocalTarget, Replace>,
-            Receipt<Replace>,
-            EvidenceChain<E, ApplyEvidence>,
-        >;
-
-        fn apply_node(
-            &self,
-            node: Prepared<Intent<Item, LocalTarget, Replace>, ArchiveTree<A>, E>,
-        ) -> Result<Self::Output, Self::Error> {
-            apply_archive_tree(node)
-        }
-    }
-
-    impl<A, E> ApplyNode<Prepared<Intent<Item, LocalTarget, CreateOrReplace>, ArchiveTree<A>, E>>
-        for LocalApply<CreateOrReplace>
-    {
-        type Receipt = Receipt<CreateOrReplace>;
-        type Evidence = ApplyEvidence;
-        type Error = PulithError;
-        type Output = Applied<
-            Intent<Item, LocalTarget, CreateOrReplace>,
-            Receipt<CreateOrReplace>,
-            EvidenceChain<E, ApplyEvidence>,
-        >;
-
-        fn apply_node(
-            &self,
-            node: Prepared<Intent<Item, LocalTarget, CreateOrReplace>, ArchiveTree<A>, E>,
-        ) -> Result<Self::Output, Self::Error> {
-            apply_archive_tree(node)
-        }
-    }
-
-    fn apply_archive_tree<A, O, E>(
-        node: Prepared<Intent<Item, LocalTarget, O>, ArchiveTree<A>, E>,
-    ) -> Result<LocalApplied<O, E>, PulithError>
-    where
-        LocalApply<O>: ApplyNode<
-                Prepared<Intent<Item, LocalTarget, O>, LocalPrepared, E>,
-                Receipt = Receipt<O>,
-                Evidence = ApplyEvidence,
-                Error = PulithError,
-                Output = Applied<
-                    Intent<Item, LocalTarget, O>,
-                    Receipt<O>,
-                    EvidenceChain<E, ApplyEvidence>,
-                >,
-            >,
-    {
-        let local_node = Prepared::from_prepare(
-            node.input,
-            LocalPrepared {
-                path: node.prepared.root,
-                kind: MaterialKind::Directory,
-            },
-            node.evidence,
-        );
-        LocalApply::<O>::new().apply_node(local_node)
-    }
-}
-
 #[cfg(all(test, feature = "zip", feature = "local"))]
 mod tests {
     use std::error::Error as _;
@@ -1035,13 +905,11 @@ mod tests {
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
 
-    use super::combine_archive_failure;
-
-    use crate::{
-        AcquireNode, ApplyNode, ArchiveNeed, ArchivePolicy, ArchivePrepare, CreateOrReplace,
-        ExtractWorkspace, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
-        LocalPath, LocalTarget, PrepareNode, PulithError, VerifyNode, Zip,
+    use super::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip, combine_archive_failure};
+    use crate::local::{
+        LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
     };
+    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare, PulithError};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1162,22 +1030,25 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
-    fn verified_archive(
+    fn acquired_archive(
         root: &Path,
         zip_path: &Path,
         target: &Path,
-    ) -> crate::Verified<
-        crate::Intent<crate::Item, crate::LocalTarget, crate::CreateOrReplace>,
-        crate::LocalMaterial,
-        crate::AcquireEvidence,
+    ) -> Acquired<
+        Materialize<&'static str, LocalPath, LocalTarget>,
+        LocalMaterial,
+        LocalAcquireEvidence,
     > {
-        let chosen = Intent::new(Item::new("archive"), LocalTarget::new(target))
-            .with_source(LocalPath::new(zip_path))
-            .select_first()
+        let acquired = LocalAcquire
+            .acquire(Materialize::new(
+                "archive",
+                LocalPath::new(zip_path),
+                LocalTarget::new(target),
+                MaterializeMode::CreateOrReplace,
+            ))
             .unwrap();
-        let acquired = LocalAcquire.acquire_node(chosen).unwrap();
         assert!(root.exists());
-        IdentityVerify.verify_node(acquired, Identity).unwrap()
+        acquired
     }
 
     #[test]
@@ -1189,9 +1060,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
-        let verified = verified_archive(&root, &zip_path, &target);
+        let verified = acquired_archive(&root, &zip_path, &target);
         let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(prepared.prepared.root, extract_root);
@@ -1214,9 +1085,9 @@ mod tests {
         fs::write(extract_root.join("old/stale.txt"), "stale").unwrap();
         write_zip(&zip_path, &[("fresh.txt", b"fresh")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(
@@ -1236,12 +1107,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip_with_directory(&zip_path);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
-            )
+            .prepare(verified, ArchivePolicy::new().strip_components(1))
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 2);
@@ -1262,12 +1130,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("a.txt", b"a"), ("b.txt", b"b")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_entries(1)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_entries(1))
             .unwrap_err();
 
         assert!(matches!(
@@ -1287,9 +1152,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("../escape.txt", b"nope")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
@@ -1304,9 +1169,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip_with_symlink(&zip_path);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(err, PulithError::UnsupportedArchiveEntry(_)));
@@ -1320,12 +1185,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("a.txt", b"abcd")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
             .unwrap_err();
 
         assert!(matches!(
@@ -1346,12 +1208,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip_with_understated_size(&zip_path);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(4)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_total_bytes(4))
             .unwrap_err();
 
         assert!(matches!(
@@ -1374,9 +1233,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("foo", b"file"), ("foo/child.txt", b"child")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(
@@ -1395,9 +1254,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("Foo", b"file"), ("foo/child.txt", b"child")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(
@@ -1426,9 +1285,9 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             write_zip(&zip_path, &[(name, b"unsafe")]);
 
-            let verified = verified_archive(&root, &zip_path, &root.join("target"));
+            let verified = acquired_archive(&root, &zip_path, &root.join("target"));
             let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-                .prepare_node(verified, ArchiveNeed::default())
+                .prepare(verified, ArchivePolicy::default())
                 .unwrap_err();
 
             assert!(matches!(err, PulithError::ArchiveInvalidPath(_)), "{name}");
@@ -1445,12 +1304,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("payload.txt", b"1234")]);
 
-        let verified = verified_archive(&root, &zip_path, &root.join("target"));
+        let verified = acquired_archive(&root, &zip_path, &root.join("target"));
         let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_entry_bytes(3)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_entry_bytes(3))
             .unwrap_err();
 
         assert!(matches!(
@@ -1474,13 +1330,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
-        let verified = verified_archive(&root, &zip_path, &target);
+        let verified = acquired_archive(&root, &zip_path, &target);
         let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
-        LocalApply::<CreateOrReplace>::new()
-            .apply_node(prepared)
-            .unwrap();
+        LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
             fs::read_to_string(target.join("bin/tool.txt")).unwrap(),
@@ -1497,16 +1351,16 @@ mod tar_tests {
     use std::path::{Path, PathBuf};
 
     #[cfg(feature = "gzip")]
-    use crate::Gzip;
+    use super::Gzip;
     #[cfg(feature = "xz")]
-    use crate::Xz;
+    use super::Xz;
     #[cfg(feature = "zstd")]
-    use crate::Zstd;
-    use crate::{
-        AcquireNode, ApplyNode, ArchiveNeed, ArchivePolicy, ArchivePrepare, CreateOrReplace,
-        ExtractWorkspace, Identity, IdentityVerify, Intent, Item, LocalAcquire, LocalApply,
-        LocalPath, LocalTarget, PrepareNode, PulithError, Tar, VerifyNode,
+    use super::Zstd;
+    use super::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Tar};
+    use crate::local::{
+        LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
     };
+    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare, PulithError};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1621,22 +1475,25 @@ mod tar_tests {
         bytes[148..156].copy_from_slice(encoded.as_bytes());
     }
 
-    fn verified_archive(
+    fn acquired_archive(
         root: &Path,
         tar_path: &Path,
         target: &Path,
-    ) -> crate::Verified<
-        crate::Intent<crate::Item, crate::LocalTarget, crate::CreateOrReplace>,
-        crate::LocalMaterial,
-        crate::AcquireEvidence,
+    ) -> Acquired<
+        Materialize<&'static str, LocalPath, LocalTarget>,
+        LocalMaterial,
+        LocalAcquireEvidence,
     > {
-        let chosen = Intent::new(Item::new("archive"), LocalTarget::new(target))
-            .with_source(LocalPath::new(tar_path))
-            .select_first()
+        let acquired = LocalAcquire
+            .acquire(Materialize::new(
+                "archive",
+                LocalPath::new(tar_path),
+                LocalTarget::new(target),
+                MaterializeMode::CreateOrReplace,
+            ))
             .unwrap();
-        let acquired = LocalAcquire.acquire_node(chosen).unwrap();
         assert!(root.exists());
-        IdentityVerify.verify_node(acquired, Identity).unwrap()
+        acquired
     }
 
     #[test]
@@ -1649,9 +1506,9 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
@@ -1674,12 +1531,9 @@ mod tar_tests {
             append_file(builder, "root/bin/tool.txt", b"pulith");
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
-            )
+            .prepare(verified, ArchivePolicy::new().strip_components(1))
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 2);
@@ -1703,12 +1557,9 @@ mod tar_tests {
             append_file(builder, "payload.txt", b"x")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(0)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(0))
             .unwrap_err();
 
         assert!(matches!(
@@ -1733,9 +1584,9 @@ mod tar_tests {
         });
 
         let measured = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("measure")))
-            .prepare_node(
-                verified_archive(&root, &tar_path, &root.join("target")),
-                ArchiveNeed::default(),
+            .prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                ArchivePolicy::default(),
             )
             .unwrap()
             .evidence
@@ -1743,17 +1594,17 @@ mod tar_tests {
             .decoded_bytes;
 
         ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("exact")))
-            .prepare_node(
-                verified_archive(&root, &tar_path, &root.join("target")),
-                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(measured)),
+            .prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                ArchivePolicy::new().max_decoded_bytes(measured),
             )
             .unwrap();
 
         let below_root = root.join("below");
         let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&below_root))
-            .prepare_node(
-                verified_archive(&root, &tar_path, &root.join("target")),
-                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(measured - 1)),
+            .prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                ArchivePolicy::new().max_decoded_bytes(measured - 1),
             )
             .unwrap_err();
         assert!(matches!(
@@ -1778,12 +1629,9 @@ mod tar_tests {
             append_file(builder, "payload.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(512)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(512))
             .unwrap_err();
 
         assert!(matches!(
@@ -1808,12 +1656,9 @@ mod tar_tests {
             append_file(builder, "b.txt", b"b");
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_entries(1)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_entries(1))
             .unwrap_err();
 
         assert!(matches!(
@@ -1836,9 +1681,9 @@ mod tar_tests {
         });
         patch_first_tar_path(&tar_path, b"../escape.txt");
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
@@ -1861,9 +1706,9 @@ mod tar_tests {
             });
 
             let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-                .prepare_node(
-                    verified_archive(&root, &tar_path, &root.join("target")),
-                    ArchiveNeed::default(),
+                .prepare(
+                    acquired_archive(&root, &tar_path, &root.join("target")),
+                    ArchivePolicy::default(),
                 )
                 .unwrap_err();
 
@@ -1889,9 +1734,9 @@ mod tar_tests {
             });
 
             let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-                .prepare_node(
-                    verified_archive(&root, &tar_path, &root.join("target")),
-                    ArchiveNeed::default(),
+                .prepare(
+                    acquired_archive(&root, &tar_path, &root.join("target")),
+                    ArchivePolicy::default(),
                 )
                 .unwrap_err();
 
@@ -1910,9 +1755,9 @@ mod tar_tests {
             append_symlink(builder, "link", "target")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(err, PulithError::UnsupportedArchiveEntry(_)));
@@ -1926,12 +1771,9 @@ mod tar_tests {
         fs::create_dir_all(&root).unwrap();
         write_tar(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
             .unwrap_err();
 
         assert!(matches!(
@@ -1955,9 +1797,9 @@ mod tar_tests {
             append_file(builder, "payload.txt", b"second");
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(
@@ -1976,9 +1818,9 @@ mod tar_tests {
         fs::create_dir_all(&root).unwrap();
         write_truncated_tar(&tar_path);
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(
@@ -2002,9 +1844,9 @@ mod tar_tests {
         write_truncated_tar(&tar_path);
 
         let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified_archive(&root, &tar_path, &root.join("target")),
-                ArchiveNeed::new(ArchivePolicy::new().strip_components(1)),
+            .prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                ArchivePolicy::new().strip_components(1),
             )
             .unwrap_err();
 
@@ -2024,13 +1866,11 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &target);
+        let verified = acquired_archive(&root, &tar_path, &target);
         let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
-        LocalApply::<CreateOrReplace>::new()
-            .apply_node(prepared)
-            .unwrap();
+        LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
             fs::read_to_string(target.join("bin/tool.txt")).unwrap(),
@@ -2050,9 +1890,9 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
@@ -2074,9 +1914,9 @@ mod tar_tests {
         patch_first_tar_path_bytes(&mut bytes, b"../escape.txt");
         write_gzip_bytes(&tar_path, &bytes);
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
         assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
@@ -2092,12 +1932,9 @@ mod tar_tests {
         fs::create_dir_all(&root).unwrap();
         write_tar_gzip(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_total_bytes(3)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
             .unwrap_err();
 
         assert!(matches!(
@@ -2122,15 +1959,13 @@ mod tar_tests {
             append_file(builder, "stripped/payload.bin", &payload)
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
+            .prepare(
                 verified,
-                ArchiveNeed::new(
-                    ArchivePolicy::new()
-                        .strip_components(2)
-                        .max_decoded_bytes(1024),
-                ),
+                ArchivePolicy::new()
+                    .strip_components(2)
+                    .max_decoded_bytes(1024),
             )
             .unwrap_err();
 
@@ -2164,12 +1999,9 @@ mod tar_tests {
             append_file(builder, "payload.txt", b"ok");
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(
-                verified,
-                ArchiveNeed::new(ArchivePolicy::new().max_decoded_bytes(1024)),
-            )
+            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(1024))
             .unwrap_err();
 
         assert!(matches!(
@@ -2196,13 +2028,11 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &target);
+        let verified = acquired_archive(&root, &tar_path, &target);
         let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
-        LocalApply::<CreateOrReplace>::new()
-            .apply_node(prepared)
-            .unwrap();
+        LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
             fs::read_to_string(target.join("bin/tool.txt")).unwrap(),
@@ -2222,9 +2052,9 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let prepared = ArchivePrepare::<Tar<Xz>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
@@ -2246,9 +2076,9 @@ mod tar_tests {
             append_file(builder, "bin/tool.txt", b"pulith")
         });
 
-        let verified = verified_archive(&root, &tar_path, &root.join("target"));
+        let verified = acquired_archive(&root, &tar_path, &root.join("target"));
         let prepared = ArchivePrepare::<Tar<Zstd>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare_node(verified, ArchiveNeed::default())
+            .prepare(verified, ArchivePolicy::default())
             .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);

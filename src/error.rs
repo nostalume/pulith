@@ -1,6 +1,8 @@
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "local")]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(feature = "net")]
 use crate::net::AcquireError;
@@ -62,8 +64,9 @@ pub enum PulithError {
     },
 }
 
+#[cfg(feature = "local")]
 impl PulithError {
-    pub fn io(action: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
+    pub(crate) fn io(action: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
         Self::Io {
             action,
             path: path.as_ref().to_path_buf(),

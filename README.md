@@ -7,23 +7,26 @@ behaviors without a hidden package-manager or implementation-specific policy lay
 > release is implied by the `0.1.0` manifest version.
 
 ```text
-materialize: Intent -> WithSource -> Chosen -> Acquired -> Verified -> Prepared -> Applied -> Remembered
-forget:      Intent<Forget> -------------------------------------------------> Applied -> Remembered
-observe:     LocalTarget -> Inspected -> Reconciled
-             RemoteUrl  -> Inspected
+Materialize -> Acquired -> Applied
+                        -> Verified -> Applied
+                        -> Prepared -> Applied
+                        -> Verified -> Prepared -> Applied
+Forget -----------------------------> Applied
+LocalTarget -> Inspected -> Reconciled
+RemoteUrl  --> Inspected
 ```
 
-Each behavior explicitly declares the associated contracts it uses: policy `Need` where required,
-plus its `Evidence`, `Error`, and `Output`. Callers choose policy and compose concrete effects.
+Each behavior passes policy `Need` as a trait type parameter where required and declares associated
+`Error` and `Output` contracts. The typed output carries its evidence. Callers choose policy and
+compose concrete effects.
 
 ## Scope
 
 | Module | Behavior |
 | --- | --- |
-| `application` | Typed intent, item, target, and operation vocabulary |
+| `application` | Typed `Materialize` and `Forget` requests |
 | `behavior` | Transition traits and state nodes |
-| `evidence` | Evidence chains carried across transitions |
-| `local` | Local acquire, prepare, staged apply, inspect, pure reconcile, and in-memory remember |
+| `local` | Local acquire, staged apply, inspect, and pure reconcile |
 | `hash` | Typed digest and exact digest-plus-size descriptor verification |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP HEAD inspection plus acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
@@ -40,8 +43,8 @@ behavior law
         x concrete adapter
 ```
 
-A behavior law declares its input, policy `Need` where required, `Evidence`, `Error`, `Output`,
-effect boundary, and failure law. Resource semantics define what those terms mean for a filesystem,
+A behavior law declares its input, policy `Need` where required, output-carried `Evidence`, `Error`,
+`Output`, effect boundary, and failure law. Resource semantics define what those terms mean for a filesystem,
 HTTP representation, archive, digest, trust system, durable store, or another external resource. An
 adapter implements one demonstrated behavior/resource intersection. Callers retain application
 identity, desired state, trust/admission policy, durable aggregates, orchestration, and rollback or
@@ -51,10 +54,8 @@ The behavior vocabulary is not a universal lifecycle. Current and candidate fami
 
 | Family | Behaviors | Boundary |
 | --- | --- | --- |
-| Choice | attach, select; offer remains caller vocabulary | no acquisition or authorization claim |
-| Materialization | acquire, verify, prepare | transfer, factual proof, and transformation stay separate |
+| Materialization | acquire, optional verify, optional prepare | transfer, factual proof, and transformation stay separate |
 | Mutation | apply, forget | explicit target effect; `Forget` does not claim ownership |
-| Memory | remember | durability only when a concrete adapter proves it |
 | Observation | inspect | read-only resource facts; filesystem absence and HTTP status retain resource-specific meaning |
 | Convergence | reconcile | caller expectation plus observation; never repairs or adopts |
 | Future gated families | admit, recover, activate, prune | require a demonstrated authority and adapter before public vocabulary |
@@ -63,16 +64,14 @@ Concrete behavior contracts currently admitted to the public surface are:
 
 | Behavior | Need / authority | Evidence and output | Effect and failure law |
 | --- | --- | --- | --- |
-| explicit select | caller-attached typed source | `Chosen` source | no provider discovery, trust, or I/O claim |
-| local acquire | chosen `LocalPath`; filesystem adapter | observed source metadata and `LocalMaterial` | missing/unsupported source fails before later transitions |
-| HTTP acquire | request, retry, admission, resume, and pacing policy | per-attempt transfer/resume/wait evidence and staged material | each attempt admitted separately; complete validated stage precedes persistence |
-| HTTP inspect | `RemoteUrl`; adapter-owned HEAD policy | status, declared content length, requested/final URL, method, and per-attempt evidence | HEAD only; every received final status is an observation; no body copy, destination, or GET fallback |
-| identity/descriptor verify | caller expectation or explicit identity pass-through | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
-| identity/archive prepare | preparation Need and exclusive workspace where required | prepared material/tree and observed preparation evidence | final destination remains untouched |
-| local apply | typed create/replace intent and target | receipt plus observed files/directories/bytes/placement | staged publication with an explicit single-target commit boundary |
+| local acquire | `Materialize<_, LocalPath, _>`; filesystem adapter | source path and `LocalMaterial` classification | a missing source fails acquisition; unsupported entry types are rejected before publication by downstream concrete behavior |
+| HTTP acquire | request/retry/resume/limit policy plus adapter-owned admission and pacing resources | per-attempt transfer/resume/wait evidence and staged material | each attempt is admitted separately when admission is configured; complete validated stage precedes persistence |
+| HTTP inspect | `RemoteUrl`; adapter-owned HEAD policy | status, declared content length, requested/final URL, and per-attempt evidence | HEAD only; every received final status is an observation; no body copy, destination, or GET fallback |
+| digest/descriptor verify | caller-supplied digest or exact descriptor | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
+| archive prepare | `ArchivePolicy` and exclusive workspace | prepared tree and observed extraction evidence | final destination remains untouched |
+| local apply | `MaterializeMode` and exact target | typed `Applied` result plus files/directories/bytes/placement evidence | staged publication with an explicit single-target commit boundary |
 | local forget | exact caller-authorized target | removed/no-op apply evidence | direct idempotent removal; no ownership or uninstall claim |
-| memory remember | applied result | receipt and evidence carried in `Remembered` | process-local only; no durability claim |
-| local inspect | `LocalTarget`; local adapter owns observed facts | entry observation plus no-follow method evidence | read-only; `NotFound` is `Missing`, other I/O failures remain errors |
+| local inspect | `LocalTarget`; local adapter owns observed facts | no-follow entry observation and evidence | read-only; `NotFound` is `Missing`, other I/O failures remain errors |
 | local reconcile | caller-owned `LocalExpectation` | preserved inspect evidence, expected/observed evidence, and typed classification | pure comparison; no repair, adoption, deletion, or persistence |
 
 Resource semantics remain bounded and cross through typed anti-corruption mappings:
@@ -98,19 +97,17 @@ manager. The concrete path currently supplied by this crate is:
 
 | Transition | Concrete behavior today |
 | --- | --- |
-| `Intent -> WithSource -> Chosen` | caller-provided typed source selected by `SelectFirst` |
-| `Chosen -> Acquired` | local material or staged HTTP download |
-| `Acquired -> Verified` | explicit identity pass-through, typed digest, or exact digest-plus-size descriptor |
-| `Verified -> Prepared` | identity preparation or guarded ZIP/TAR extraction |
-| `Prepared -> Applied` | staged local file/tree publication for create and replace operations |
-| `Intent<Forget> -> Applied` | direct idempotent local target removal; no artificial source acquisition |
-| `Applied -> Remembered` | `MemoryRemember`, which carries the receipt and evidence in memory only |
-| `LocalTarget -> Inspected` | read-only, no-follow local entry observation with method evidence |
+| `Materialize -> Acquired` | local material or staged HTTP download |
+| `Acquired -> Verified` | typed digest or exact digest-plus-size descriptor verification |
+| `Acquired/Verified -> Prepared` | guarded ZIP/TAR extraction when the caller needs transformation |
+| `Acquired/Verified/Prepared -> Applied` | staged local file/tree publication according to `MaterializeMode` |
+| `Forget -> Applied` | direct idempotent local target removal; no artificial source acquisition |
+| `LocalTarget -> Inspected` | read-only, no-follow local entry observation |
 | `RemoteUrl -> Inspected` | sync `UreqInspect` or async `ReqwestInspect` HEAD observation with redirect and attempt evidence |
 | `Inspected -> Reconciled` | pure comparison against caller-owned local expected state |
 
-Async execution is concrete for HTTP acquisition through `AsyncAcquireNode`/`ReqwestAcquire` and
-HTTP inspection through `AsyncInspectNode`/`ReqwestInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
+Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`ReqwestAcquire` and
+HTTP inspection through `AsyncInspect`/`ReqwestInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
 transactions, automatic repair, or system package-manager integration. Those require demonstrated
 callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
@@ -154,7 +151,7 @@ There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `
 pulith = { path = "../pulith", features = ["ureq", "blake3", "zip"] }
 ```
 
-Build an `Intent`, attach a typed source, select it, then pass the node through the concrete behavior implementations required by the caller. There is no global context, plugin registry, or hidden workflow policy.
+Construct a `Materialize` request after the caller has selected a source, then compose only the concrete acquire, optional verify/prepare, and apply behaviors the request needs. Use `Forget` for a direct target-only removal. There is no global context, plugin registry, or hidden workflow policy.
 
 ## Guarantees and limits
 

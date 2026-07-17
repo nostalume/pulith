@@ -1,18 +1,12 @@
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcquireEvidence {
-    pub path: PathBuf,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrepareEvidence {
+pub struct LocalAcquireEvidence {
     pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyEvidence {
-    pub target: PathBuf,
     pub files: usize,
     pub directories: usize,
     pub bytes: u64,
@@ -20,9 +14,8 @@ pub struct ApplyEvidence {
 }
 
 impl ApplyEvidence {
-    pub fn new(target: PathBuf, stats: LocalApplyStats) -> Self {
+    pub(crate) fn new(stats: LocalApplyStats) -> Self {
         Self {
-            target,
             files: stats.files,
             directories: stats.directories,
             bytes: stats.bytes,
@@ -30,9 +23,8 @@ impl ApplyEvidence {
         }
     }
 
-    pub fn removed(target: PathBuf) -> Self {
+    pub(crate) fn removed() -> Self {
         Self {
-            target,
             files: 0,
             directories: 0,
             bytes: 0,
@@ -48,7 +40,7 @@ pub enum LocalPlacement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LocalApplyStats {
+pub(crate) struct LocalApplyStats {
     pub files: usize,
     pub directories: usize,
     pub bytes: u64,
@@ -56,7 +48,7 @@ pub struct LocalApplyStats {
 }
 
 impl LocalApplyStats {
-    pub fn copied_file(bytes: u64) -> Self {
+    pub(crate) fn copied_file(bytes: u64) -> Self {
         Self {
             files: 1,
             directories: 0,
@@ -65,7 +57,7 @@ impl LocalApplyStats {
         }
     }
 
-    pub fn copied_tree(files: usize, directories: usize, bytes: u64) -> Self {
+    pub(crate) fn copied_tree(files: usize, directories: usize, bytes: u64) -> Self {
         Self {
             files,
             directories,
@@ -73,16 +65,4 @@ impl LocalApplyStats {
             strategy: LocalPlacement::Copied,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RememberEvidence {
-    pub item: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Receipt<O> {
-    pub item: String,
-    pub target: PathBuf,
-    pub op: O,
 }
