@@ -32,6 +32,144 @@ impl LocalTarget {
     }
 }
 
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+pub(crate) enum OpenedLocalArtifact {
+    Missing,
+    File(File),
+    Directory,
+    Symlink,
+    #[cfg(windows)]
+    Reparse,
+    Other,
+}
+
+#[cfg(all(unix, any(feature = "blake3", feature = "sha2")))]
+pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, PulithError> {
+    use rustix::fs::{Mode, OFlags, open};
+    use rustix::io::Errno;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Ok(OpenedLocalArtifact::Symlink);
+        }
+        Ok(metadata) if metadata.is_dir() => return Ok(OpenedLocalArtifact::Directory),
+        Ok(metadata) if !metadata.is_file() => return Ok(OpenedLocalArtifact::Other),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(OpenedLocalArtifact::Missing);
+        }
+        Err(error) => return Err(PulithError::io("inspect exact local artifact", path, error)),
+    }
+    let descriptor = match open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::NOENT) => return Ok(OpenedLocalArtifact::Missing),
+        Err(Errno::LOOP) => return Ok(OpenedLocalArtifact::Symlink),
+        Err(error) => {
+            return Err(PulithError::io(
+                "open exact local artifact",
+                path,
+                io::Error::from(error),
+            ));
+        }
+    };
+    let file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|error| PulithError::io("inspect exact local artifact", path, error))?;
+    if metadata.is_file() {
+        Ok(OpenedLocalArtifact::File(file))
+    } else if metadata.is_dir() {
+        Ok(OpenedLocalArtifact::Directory)
+    } else {
+        Ok(OpenedLocalArtifact::Other)
+    }
+}
+
+#[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
+pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, PulithError> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, SetLastError};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        GetFileType,
+    };
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
+
+    let file = match File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(OpenedLocalArtifact::Missing);
+        }
+        Err(error) => return Err(PulithError::io("open exact local artifact", path, error)),
+    };
+    let mut information = MaybeUninit::<FILE_ATTRIBUTE_TAG_INFO>::zeroed();
+    // SAFETY: `file` owns a valid handle and `information` is correctly sized writable storage.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(PulithError::io(
+            "inspect exact local artifact",
+            path,
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: GetFileInformationByHandleEx succeeded and initialized the structure.
+    let information = unsafe { information.assume_init() };
+    if information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return if information.ReparseTag == IO_REPARSE_TAG_SYMLINK {
+            Ok(OpenedLocalArtifact::Symlink)
+        } else {
+            Ok(OpenedLocalArtifact::Reparse)
+        };
+    }
+    if information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Ok(OpenedLocalArtifact::Directory);
+    }
+    // SAFETY: setting and reading the calling thread's last-error slot surrounds one file query.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    // SAFETY: `file` owns a valid handle for the duration of the query.
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    // SAFETY: GetLastError reads the calling thread's last-error slot.
+    let last_error = unsafe { GetLastError() };
+    if !classify_windows_file_type(file_type, last_error)
+        .map_err(|error| PulithError::io("inspect exact local artifact", path, error))?
+    {
+        return Ok(OpenedLocalArtifact::Other);
+    }
+    Ok(OpenedLocalArtifact::File(file))
+}
+
+#[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
+fn classify_windows_file_type(file_type: u32, last_error: u32) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_UNKNOWN};
+
+    if file_type == FILE_TYPE_UNKNOWN && last_error != ERROR_SUCCESS {
+        Err(io::Error::from_raw_os_error(last_error as i32))
+    } else {
+        Ok(file_type == FILE_TYPE_DISK)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LocalAcquire;
 
@@ -105,6 +243,7 @@ pub enum LocalEntryKind {
     File,
     Directory,
     Symlink,
+    Reparse,
     Other,
 }
 
@@ -270,6 +409,12 @@ impl<E> Reconcile<Inspected<LocalTarget, LocalObservation, E>, LocalExpectation>
     }
 }
 
+/// Local publication adapter.
+///
+/// For regular-file [`MaterializeMode::CreateNew`], the final no-clobber persist is the authoritative
+/// execution-time `Missing` predecessor check. A late winner produces
+/// [`PulithError::ApplyWouldOverwrite`] without changing that target. Directory publication,
+/// replacement modes, and [`Forget`] do not inherit this conditional-file claim.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalApply;
 
@@ -321,7 +466,6 @@ impl<I> Apply<Forget<I, LocalTarget>> for LocalApply {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishMode {
     Create,
-    Replace,
     CreateOrReplace,
 }
 
@@ -332,19 +476,13 @@ pub(crate) fn apply_material<I, S, E>(
 ) -> Result<LocalApplied<I, S, E>, PulithError> {
     let target = input.target.path.clone();
     let mode = match input.mode {
-        MaterializeMode::Create => {
-            if target.exists() {
+        MaterializeMode::CreateNew => {
+            if target_entry_exists(&target)? {
                 return Err(PulithError::ApplyWouldOverwrite(target));
             }
             PublishMode::Create
         }
-        MaterializeMode::Replace => {
-            if !target.exists() {
-                return Err(PulithError::ApplyMissingTarget(target));
-            }
-            PublishMode::Replace
-        }
-        MaterializeMode::CreateOrReplace => PublishMode::CreateOrReplace,
+        MaterializeMode::ReplaceOrCreate => PublishMode::CreateOrReplace,
     };
     reject_unsupported_entry(material.path())?;
     reject_same_source_target(material.path(), &target)?;
@@ -360,6 +498,14 @@ pub(crate) fn apply_material<I, S, E>(
             current: ApplyEvidence::new(stats),
         },
     })
+}
+
+fn target_entry_exists(path: &Path) -> Result<bool, PulithError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PulithError::io("read target metadata", path, error)),
+    }
 }
 
 fn publish_file(
@@ -378,20 +524,29 @@ fn publish_file(
     let bytes = io::copy(&mut source_file, staged.as_file_mut())
         .map_err(|err| PulithError::io("copy file to staged file", source, err))?;
 
-    match mode {
-        PublishMode::Create => {
-            staged
-                .persist_noclobber(target)
-                .map_err(|err| PulithError::io("persist staged file", target, err.error))?;
-        }
-        PublishMode::Replace | PublishMode::CreateOrReplace => {
-            staged
-                .persist(target)
-                .map_err(|err| PulithError::io("persist staged file", target, err.error))?;
-        }
-    }
+    persist_staged_file(staged, target, mode)?;
 
     Ok(LocalApplyStats::copied_file(bytes))
+}
+
+fn persist_staged_file(
+    staged: tempfile::NamedTempFile,
+    target: &Path,
+    mode: PublishMode,
+) -> Result<(), PulithError> {
+    match mode {
+        PublishMode::Create => match staged.persist_noclobber(target) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(PulithError::ApplyWouldOverwrite(target.to_path_buf()))
+            }
+            Err(error) => Err(PulithError::io("persist staged file", target, error.error)),
+        },
+        PublishMode::CreateOrReplace => staged
+            .persist(target)
+            .map(|_| ())
+            .map_err(|error| PulithError::io("persist staged file", target, error.error)),
+    }
 }
 
 fn publish_directory(
@@ -414,7 +569,6 @@ fn publish_directory(
 
     let result = match mode {
         PublishMode::Create => rename_dir(&staged_path, target),
-        PublishMode::Replace => replace_directory_with_backup(&staged_path, target),
         PublishMode::CreateOrReplace if target.exists() => {
             replace_directory_with_backup(&staged_path, target)
         }
@@ -619,6 +773,38 @@ mod tests {
         ))
     }
 
+    #[cfg(any(feature = "blake3", feature = "sha2"))]
+    #[test]
+    fn exact_local_handle_is_not_redirected_by_path_replacement() {
+        use std::io::Read;
+
+        let root = temp_root("exact-open-replacement");
+        let path = root.join("artifact");
+        let archived = root.join("opened-artifact");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&path, b"opened").unwrap();
+        let OpenedLocalArtifact::File(mut file) = open_local_artifact(&path).unwrap() else {
+            panic!("regular file was not opened as a file");
+        };
+
+        fs::rename(&path, &archived).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let mut observed = Vec::new();
+        file.read_to_end(&mut observed).unwrap();
+
+        assert_eq!(observed, b"opened");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
+    #[test]
+    fn windows_unknown_file_type_with_error_is_failure() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN;
+
+        let error = classify_windows_file_type(FILE_TYPE_UNKNOWN, 5).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
     #[test]
     fn local_tree_runs_create_or_replace_file() {
         let root = temp_root("tree-file");
@@ -628,7 +814,7 @@ mod tests {
         fs::write(&source, "pulith").unwrap();
 
         let applied = LocalApply
-            .apply(acquire(MaterializeMode::CreateOrReplace, &source, &target))
+            .apply(acquire(MaterializeMode::ReplaceOrCreate, &source, &target))
             .unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
@@ -651,7 +837,7 @@ mod tests {
                 "demo",
                 LocalPath::new(&staged_path),
                 LocalTarget::new(&target),
-                MaterializeMode::Create,
+                MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
                 path: staged.into_temp_path(),
@@ -680,7 +866,7 @@ mod tests {
                 "demo",
                 LocalPath::new(&staged_path),
                 LocalTarget::new(&target),
-                MaterializeMode::Create,
+                MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
                 path: staged.into_temp_path(),
@@ -688,8 +874,12 @@ mod tests {
             evidence: (),
         };
 
-        assert!(LocalApply.apply(node).is_err());
+        let error = LocalApply.apply(node).unwrap_err();
 
+        assert!(matches!(
+            error,
+            PulithError::ApplyWouldOverwrite(path) if path == target
+        ));
         assert_eq!(fs::read(&target).unwrap(), b"original");
         assert!(!staged_path.exists());
         fs::remove_dir_all(root).unwrap();
@@ -710,7 +900,7 @@ mod tests {
                 "demo",
                 LocalPath::new(&staged_path),
                 LocalTarget::new(&target),
-                MaterializeMode::Create,
+                MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
                 path: staged.into_temp_path(),
@@ -737,13 +927,13 @@ mod tests {
 
         assert!(
             LocalApply
-                .apply(acquire(MaterializeMode::Create, &source, &target))
+                .apply(acquire(MaterializeMode::CreateNew, &source, &target))
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
 
         let replaced = LocalApply
-            .apply(acquire(MaterializeMode::Replace, &source, &target))
+            .apply(acquire(MaterializeMode::ReplaceOrCreate, &source, &target))
             .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "first");
         assert_eq!(replaced.evidence.current.files, 1);
@@ -751,6 +941,76 @@ mod tests {
         assert_eq!(replaced.evidence.current.bytes, 5);
         assert_eq!(replaced.evidence.current.strategy, LocalPlacement::Copied);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_file_commit_reports_late_target_as_conflict_without_overwrite() {
+        use std::io::Write;
+
+        let root = temp_root("create-late-conflict");
+        let target = root.join("target.txt");
+        fs::create_dir_all(&root).unwrap();
+        let mut staged = tempfile::NamedTempFile::new_in(&root).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        staged.write_all(b"replacement").unwrap();
+
+        // This target appeared after the replacement was completely staged.
+        fs::write(&target, b"winner").unwrap();
+
+        let error = persist_staged_file(staged, &target, PublishMode::Create).unwrap_err();
+        assert!(matches!(
+            error,
+            PulithError::ApplyWouldOverwrite(path) if path == target
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"winner");
+        assert!(!staged_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_treats_dangling_final_symlink_as_conflict_without_following() {
+        let root = temp_root("create-dangling-conflict");
+        let source = root.join("source.txt");
+        let target = root.join("target-link");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        symlink_file(root.join("missing-target"), &target).unwrap();
+
+        let error = LocalApply
+            .apply(acquire(MaterializeMode::CreateNew, &source, &target))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PulithError::ApplyWouldOverwrite(path) if path == target
+        ));
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_treats_existing_directory_as_typed_conflict() {
+        let root = temp_root("create-directory-conflict");
+        let source = root.join("source.txt");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+
+        let error = LocalApply
+            .apply(acquire(MaterializeMode::CreateNew, &source, &target))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PulithError::ApplyWouldOverwrite(path) if path == target
+        ));
+        assert!(target.is_dir());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -837,7 +1097,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "same").unwrap();
 
-        let acquired = acquire(MaterializeMode::CreateOrReplace, &source, &source);
+        let acquired = acquire(MaterializeMode::ReplaceOrCreate, &source, &source);
         assert!(LocalApply.apply(acquired).is_err());
         assert_eq!(fs::read_to_string(&source).unwrap(), "same");
 
@@ -857,7 +1117,7 @@ mod tests {
                 "demo",
                 LocalPath::new(&source),
                 LocalTarget::new(&target),
-                MaterializeMode::Replace,
+                MaterializeMode::ReplaceOrCreate,
             ),
             material: LocalMaterial::File { path: source },
             evidence: LocalAcquireEvidence {
@@ -881,7 +1141,7 @@ mod tests {
         fs::write(source.join("nested").join("b.txt"), "beta").unwrap();
 
         let applied = LocalApply
-            .apply(acquire(MaterializeMode::Create, &source, &target))
+            .apply(acquire(MaterializeMode::CreateNew, &source, &target))
             .unwrap();
 
         assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "alpha");
@@ -906,7 +1166,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("old.txt"), "old").unwrap();
 
-        let result = LocalApply.apply(acquire(MaterializeMode::Replace, &source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::ReplaceOrCreate, &source, &target));
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(target.join("old.txt")).unwrap(), "old");
 
@@ -923,7 +1183,7 @@ mod tests {
         fs::write(&target, "old").unwrap();
 
         LocalApply
-            .apply(acquire(MaterializeMode::Replace, &source, &target))
+            .apply(acquire(MaterializeMode::ReplaceOrCreate, &source, &target))
             .unwrap();
 
         assert_eq!(fs::read_to_string(target.join("new.txt")).unwrap(), "new");
@@ -945,7 +1205,7 @@ mod tests {
         let target = source.join("nested").join("target");
         fs::create_dir_all(&source).unwrap();
 
-        let result = LocalApply.apply(acquire(MaterializeMode::Create, &source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::CreateNew, &source, &target));
         assert!(result.is_err());
         assert!(!target.exists());
 
@@ -1069,7 +1329,7 @@ mod tests {
         fs::write(source.join("real.txt"), "real").unwrap();
         symlink("real.txt", source.join("link.txt")).unwrap();
 
-        let result = LocalApply.apply(acquire(MaterializeMode::Create, &source, &target));
+        let result = LocalApply.apply(acquire(MaterializeMode::CreateNew, &source, &target));
         assert!(result.is_err());
         assert!(!target.exists());
 

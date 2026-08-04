@@ -41,10 +41,12 @@
 //!
 //! - `local` owns local materialization, staged publication, read-only no-follow inspection, and
 //!   pure expected/observed reconciliation.
-//! - `blake3` and `sha2` provide typed hash verification.
+//! - `blake3` and `sha2` provide typed verification and, with `local`, opt-in full-read exact
+//!   artifact inspection/reconciliation. The existing local inspector remains metadata-only.
 //! - `zip`, `tar`, `gzip`, `xz`, and `zstd` use mature format/codec crates while Pulith owns path,
 //!   resource, evidence, scratch, and composition policy.
-//! - `ureq` and `reqwest` provide sync and Tokio-backed async HTTP acquisition and HEAD inspection.
+//! - `http-sync` and `http-async` provide sync and Tokio-backed async HTTP acquisition and HEAD
+//!   inspection. Their HTTP-client crates are private implementation dependencies.
 //!
 //! Archive preparation writes only to an exclusive disposable extraction root; final destination
 //! publication remains a separate local apply behavior. Network request admission and decoded-body
@@ -57,13 +59,19 @@
 //! state removes disposable custody. Caller-owned local sources and resume partials are not cleaned
 //! implicitly; only apply owns final-target publication.
 //!
+//! For local regular files, `MaterializeMode::CreateNew` means the expected target predecessor is
+//! missing. The staged file's no-clobber persist is the execution-time commit check; a target that
+//! already exists is a typed conflict and is not changed. This law does not extend to directory
+//! publication, replacement modes, `Forget`, or digest-based compare-and-swap.
+//!
 //! # Current maturity
 //!
 //! The state types are composition vocabulary, not an implicit package-manager implementation.
 //! Pulith currently supplies concrete local/HTTP acquisition, digest or exact digest-plus-size
 //! descriptor verification, archive preparation, staged local publication, direct local forgetting,
-//! local/HTTP inspection, and local
-//! reconciliation. Inspection is read-only; HTTP inspection reports status and declared response
+//! local/HTTP inspection, exact local artifact inspection, and local reconciliation. Inspection is
+//! read-only; exact artifact descriptors count bytes in the digest read loop but are not atomic
+//! snapshots under concurrent writes. HTTP inspection reports status and declared response
 //! length without GET fallback or body materialization. Reconciliation consumes caller-owned expected state
 //! and produces only a classification plus evidence. A descriptor proves byte identity with a
 //! supplied expectation; it does not authenticate that expectation. Source discovery, trust
@@ -86,7 +94,7 @@ pub mod local;
 pub mod net;
 
 pub use application::{Forget, Materialize, MaterializeMode};
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 pub use behavior::AsyncInspect;
 pub use behavior::{
     Acquire, Acquired, Applied, Apply, AsyncAcquire, EvidenceChain, Inspect, Inspected, Prepare,

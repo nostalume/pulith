@@ -37,7 +37,7 @@ fn public_api_materializes_local_file_without_synthetic_transitions() {
         AppId("demo"),
         LocalPath::new(&source),
         LocalTarget::new(&target),
-        MaterializeMode::CreateOrReplace,
+        MaterializeMode::ReplaceOrCreate,
     );
     let acquired = LocalAcquire.acquire(request).unwrap();
     let applied = LocalApply.apply(acquired).unwrap();
@@ -46,6 +46,34 @@ fn public_api_materializes_local_file_without_synthetic_transitions() {
     assert_eq!(applied.input.item, AppId("demo"));
     assert_eq!(applied.evidence.current.strategy, LocalPlacement::Copied);
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn public_create_conflict_is_typed_and_non_mutating() {
+    let root = temp_root("create-conflict");
+    let source = root.join("source.txt");
+    let target = root.join("target.txt");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&source, "replacement").unwrap();
+    fs::write(&target, "winner").unwrap();
+
+    let request = Materialize::new(
+        "demo",
+        LocalPath::new(&source),
+        LocalTarget::new(&target),
+        MaterializeMode::CreateNew,
+    );
+    let error = LocalApply
+        .apply(LocalAcquire.acquire(request).unwrap())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pulith::PulithError::ApplyWouldOverwrite(path) if path == target
+    ));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "winner");
+    assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -66,7 +94,7 @@ fn public_api_verifies_then_applies_exact_artifact() {
         "demo",
         LocalPath::new(&source),
         LocalTarget::new(&target),
-        MaterializeMode::Create,
+        MaterializeMode::CreateNew,
     );
     let acquired = LocalAcquire.acquire(request).unwrap();
     let expected = ArtifactDescriptor::<Blake3>::new(digest, 6);

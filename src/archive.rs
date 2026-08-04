@@ -1067,7 +1067,7 @@ mod tests {
                 "archive",
                 LocalPath::new(zip_path),
                 LocalTarget::new(target),
-                MaterializeMode::CreateOrReplace,
+                MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
         assert!(root.exists());
@@ -1567,7 +1567,7 @@ mod tar_tests {
                 "archive",
                 LocalPath::new(tar_path),
                 LocalTarget::new(target),
-                MaterializeMode::CreateOrReplace,
+                MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
         assert!(root.exists());

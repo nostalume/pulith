@@ -4,9 +4,10 @@
 /// ownership, or imply rollback across multiple targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterializeMode {
-    Create,
-    Replace,
-    CreateOrReplace,
+    /// Publish only when the target predecessor is missing.
+    CreateNew,
+    /// Permit either creation or replacement without a predecessor condition.
+    ReplaceOrCreate,
 }
 
 /// A caller-owned request to materialize one selected source at one target.

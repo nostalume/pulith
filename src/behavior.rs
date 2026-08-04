@@ -1,7 +1,7 @@
 #![cfg_attr(
-    not(feature = "reqwest"),
+    not(feature = "http-async"),
     doc = r#"
-`AsyncInspect` is admitted only with the concrete `reqwest` adapter:
+`AsyncInspect` is admitted only with the concrete Tokio async HTTP adapter:
 
 ```compile_fail
 use pulith::behavior::AsyncInspect;
@@ -95,7 +95,8 @@ pub struct Reconciled<I, R, E> {
 ///
 /// The associated `Output` encodes material and evidence; `Error` preserves the adapter's failure
 /// law. Acquisition may perform source I/O but has no authority to publish the final target. Source
-/// semantics belong to the concrete adapter, currently local paths, `ureq`, or `reqwest`.
+/// semantics belong to the concrete adapter, currently local paths or the built-in sync/async HTTP
+/// adapters.
 pub trait Acquire<N> {
     type Error;
     type Output;
@@ -121,8 +122,8 @@ pub trait AsyncAcquire<N> {
 /// Asynchronously observes resource-specific facts without mutation or desired-state decisions.
 ///
 /// `Output` carries the observation and evidence, while `Error` reports failures that produced no
-/// observation. The current concrete adapter is reqwest HTTP HEAD inspection.
-#[cfg(feature = "reqwest")]
+/// observation. The current concrete adapter is asynchronous HTTP HEAD inspection.
+#[cfg(feature = "http-async")]
 pub trait AsyncInspect<N> {
     type Error;
     type Output;
@@ -161,7 +162,9 @@ pub trait Prepare<N, Need> {
 ///
 /// `Output` carries the applied request and evidence; `Error` means the requested effect did not
 /// complete. Resource-specific commit and failure laws belong to the adapter. Local apply is the
-/// current concrete implementation, including direct target-only [`crate::Forget`].
+/// current concrete implementation, including direct target-only [`crate::Forget`]. For local
+/// regular files, [`crate::MaterializeMode::CreateNew`] uses an execution-time no-clobber commit;
+/// an existing predecessor is a typed conflict rather than a completed application.
 pub trait Apply<N> {
     type Error;
     type Output;

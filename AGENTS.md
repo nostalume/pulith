@@ -52,8 +52,8 @@ database, trust, or deployment implementation into Pulith's universal domain mod
 ```text
 default = local
 net
-ureq -> net + local
-reqwest -> net + local + tokio
+http-sync -> net + local
+http-async -> net + local + tokio
 blake3 -> hash
 sha2 -> hash
 zip -> local
@@ -80,6 +80,10 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Use mature crates for codecs and container parsing; Pulith owns policy, evidence, staging, and composition.
 - Delete speculative abstractions and compatibility shells.
 - Keep observation read-only, reconciliation non-mutating, and repair as a separate explicit behavior.
+- Keep metadata-only `LocalInspect` O(metadata); hash-backed exact local inspection is opt-in at
+  `local + blake3` or `local + sha2`, reads only regular-file handles, and counts bytes in the digest
+  loop. It protects only the final component, assumes trusted parents, and is not an atomic snapshot.
+- Classify Windows symbolic links separately from other reparse points; never hash either kind.
 - Treat canonical evidence as the caller-selected adapter's attestation, not provenance,
   authorization, or an unforgeable capability. State records are open for external composition;
   invariant-bearing resource outputs may restrict construction separately.
@@ -93,6 +97,11 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 ## Filesystem and archive invariants
 
 - Stage before publishing a final destination.
+- For local regular files, `MaterializeMode::CreateNew` means expected predecessor `Missing` and
+  `persist_noclobber` is the authoritative execution-time commit check. `AlreadyExists` is
+  `ApplyWouldOverwrite`, not generic I/O; conflict must not change the winner target.
+- Do not generalize that conditional-file law to directories, replacement modes, `Forget`, or
+  digest-based compare-and-swap.
 - `LocalMaterial::File` and `Directory` are caller-owned; `StagedFile` owns a `TempPath` and removes
   it on drop. Do not make staged custody cloneable.
 - Reject same-file, directory-cycle, traversal, and symlink hazards where promised.
@@ -108,6 +117,9 @@ Every public feature must enable real behavior or shared vocabulary, compile in 
 - Never implement ZIP/TAR/DEFLATE/gzip/xz/zstd algorithms in Pulith.
 - Never report failure after successful publication merely because best-effort cleanup failed.
 - Local path safety assumes trusted parent directories; Pulith is not a hostile concurrent-filesystem sandbox.
+
+Required runtime evidence covers Windows and Linux. macOS is best-effort and unverified; it is not a
+phase-admission or completion gate.
 
 ## Network invariants
 
@@ -139,8 +151,8 @@ For a changed feature, also run its smallest combination:
 ```bash
 cargo check --no-default-features --features local
 cargo check --no-default-features --features net
-cargo check --no-default-features --features ureq
-cargo check --no-default-features --features reqwest
+cargo check --no-default-features --features http-sync
+cargo check --no-default-features --features http-async
 cargo check --no-default-features --features hash
 cargo check --no-default-features --features blake3
 cargo check --no-default-features --features sha2

@@ -49,6 +49,7 @@ pub enum PulithError {
     },
     UnsupportedArchiveEntry(PathBuf),
     InvalidPreparation(String),
+    /// A CreateNew publication found an existing predecessor and did not commit the target.
     ApplyWouldOverwrite(PathBuf),
     ApplyMissingTarget(PathBuf),
     ApplySameFile(PathBuf),

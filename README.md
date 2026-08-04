@@ -27,7 +27,7 @@ the adapter, decide whether to trust its evidence, and compose concrete effects.
 | `application` | Typed `Materialize` and `Forget` requests |
 | `behavior` | Transition traits and state nodes |
 | `local` | Local acquire, staged apply, inspect, and pure reconcile |
-| `hash` | Typed digest and exact digest-plus-size descriptor verification |
+| `hash` | Typed descriptor verification plus opt-in exact local artifact inspection/reconciliation |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP HEAD inspection plus acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
 
@@ -117,18 +117,18 @@ manager. The concrete path currently supplied by this crate is:
 | `Acquired/Verified -> Prepared` | guarded ZIP/TAR extraction when the caller needs transformation |
 | `Acquired/Verified/Prepared -> Applied` | staged local file/tree publication according to `MaterializeMode` |
 | `Forget -> Applied` | direct idempotent local target removal; no artificial source acquisition |
-| `LocalTarget -> Inspected` | read-only, no-follow local entry observation |
-| `RemoteUrl -> Inspected` | sync `UreqInspect` or async `ReqwestInspect` HEAD observation with redirect and attempt evidence |
-| `Inspected -> Reconciled` | pure comparison against caller-owned local expected state |
+| `LocalTarget -> Inspected` | cheap metadata observation, or opt-in hash-backed full-read artifact observation |
+| `RemoteUrl -> Inspected` | sync `SyncHttpInspect` or async `AsyncHttpInspect` HEAD observation with redirect and attempt evidence |
+| `Inspected -> Reconciled` | pure metadata or exact-descriptor comparison against caller-owned expected state |
 
-Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`ReqwestAcquire` and
-HTTP inspection through `AsyncInspect`/`ReqwestInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
+Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`AsyncHttpAcquire` and
+HTTP inspection through `AsyncInspect`/`AsyncHttpInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
 transactions, automatic repair, or system package-manager integration. Those require demonstrated
 callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
 
 `ArtifactDescriptor<A>` identifies one exact raw representation by digest and byte size, independent
-of whether it came from a local path, `ureq`, or `reqwest`. Descriptor equality proves only that the
+of whether it came from a local path, synchronous HTTP, or asynchronous HTTP. Descriptor equality proves only that the
 material matches the supplied expectation. It does not authenticate who supplied that expectation,
 authorize a publisher, or establish provenance; those remain separate caller-owned policy/trust
 behaviors until a concrete adapter justifies them.
@@ -143,8 +143,8 @@ default = local
 
 network:
   net
-  ureq -> net + local
-  reqwest -> net + local + tokio
+  http-sync -> net + local
+  http-async -> net + local + tokio
 
 hashing:
   hash
@@ -159,11 +159,32 @@ archives:
 
 There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `json` capability feature.
 
+### Feature selections
+
+Features are additive capabilities, not mutually exclusive modes. Select only the concrete behavior
+or shared vocabulary a consumer needs; Pulith never chooses a global transport, runtime, digest, or
+archive adapter.
+
+| Consumer need | Selection |
+| --- | --- |
+| local materialization and observation | default features, or `default-features = false, features = ["local"]` |
+| network URL/policy/attempt vocabulary only | `default-features = false, features = ["net"]` |
+| synchronous HTTP HEAD/acquire | `default-features = false, features = ["http-sync"]` |
+| Tokio asynchronous HTTP HEAD/acquire | `default-features = false, features = ["http-async"]` |
+| typed digest/descriptor vocabulary only | `default-features = false, features = ["hash"]` |
+| exact local BLAKE3 or SHA-256 artifact observation | `default-features = false, features = ["local", "blake3"]` or `features = ["local", "sha2"]` |
+| ZIP or plain TAR preparation | `default-features = false, features = ["zip"]` or `features = ["tar"]` |
+| gzip, xz, or zstd TAR preparation | `default-features = false, features = ["gzip"]`, `features = ["xz"]`, or `features = ["zstd"]` |
+
+`--all-features` is an integration-validation profile, not a consumer-facing `full` feature. A
+consumer may combine an HTTP adapter, digest algorithm, and archive adapter in one dependency
+declaration; it must select each concrete adapter in its own composition code.
+
 ## Use
 
 ```toml
 [dependencies]
-pulith = { path = "../pulith", features = ["ureq", "blake3", "zip"] }
+pulith = { path = "../pulith", features = ["http-sync", "blake3", "zip"] }
 ```
 
 Construct a `Materialize` request after the caller has selected a source, then compose only the concrete acquire, optional verify/prepare, and apply behaviors the request needs. Use `Forget` for a direct target-only removal. There is no global context, plugin registry, or hidden workflow policy.
@@ -176,6 +197,11 @@ caller that wants a durable cache composes `LocalApply` with that cache path as 
 ## Guarantees and limits
 
 - final destination writes are staged before publication where the concrete behavior supports it;
+- for local regular files, `MaterializeMode::CreateNew` means the expected predecessor is missing;
+  the final no-clobber persist is authoritative, and an early or late existing target returns
+  `ApplyWouldOverwrite` without changing that target;
+- that conditional-file law does not cover directory publication, `ReplaceOrCreate`,
+  `Forget`, or digest-based compare-and-swap;
 - archive traversal, symlink, hardlink, and unsupported entry types are rejected by default;
 - archive path collisions are rejected with portable case-folded identity on every platform;
 - archive extraction uses an exclusive destructive `ExtractWorkspace` before final `LocalApply` publication;
@@ -193,7 +219,9 @@ caller that wants a durable cache composes `LocalApply` with that cache path as 
 - caller-owned local sources and resume partial files are never removed implicitly;
 - request admission and decoded-body pacing are separate shared resources;
 - decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
-- local path safety assumes trusted parent directories, not a hostile concurrent filesystem;
+- local path safety assumes trusted parent directories and does not claim a hostile concurrent-filesystem sandbox;
+- required runtime evidence covers Windows and Linux; macOS is currently best-effort and unverified,
+  and does not gate phase admission;
 - local inspection uses `symlink_metadata`, treats `NotFound` as `Missing`, reports dangling
   symlinks without following them, and performs no mutation;
 - local reconciliation compares caller-owned expectation with an observation and returns only a

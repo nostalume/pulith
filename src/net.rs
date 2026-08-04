@@ -7,31 +7,31 @@
 //! Inspection never falls back to GET, copies a response body, stages a file, or publishes a target.
 
 use std::fmt;
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 use std::future::Future;
 use std::io;
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 use std::pin::Pin;
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 use governor::clock::Clock;
 
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 use crate::local::LocalMaterial;
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 use crate::{Acquire, Inspect};
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 use crate::{Acquired, Inspected, Materialize};
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 use crate::{AsyncAcquire, AsyncInspect};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +165,7 @@ impl std::error::Error for AcquireError {
 }
 
 impl AcquireError {
-    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "http-sync", feature = "http-async"))]
     fn local(
         url: Option<&RemoteUrl>,
         action: &'static str,
@@ -180,7 +180,7 @@ impl AcquireError {
         }
     }
 
-    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "http-sync", feature = "http-async"))]
     fn transport(
         url: &RemoteUrl,
         phase: TransportPhase,
@@ -309,18 +309,18 @@ impl AttemptRate {
 /// This is an attempt-rate gate, not a semaphore or body-copy byte pacer.
 pub struct RateAdmission {
     rate: AttemptRate,
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     limiter: governor::DefaultDirectRateLimiter,
 }
 
 impl RateAdmission {
     pub fn new(rate: AttemptRate) -> Self {
-        #[cfg(any(feature = "reqwest", feature = "ureq"))]
+        #[cfg(any(feature = "http-async", feature = "http-sync"))]
         let quota = governor::Quota::per_second(rate.attempts_per_second())
             .allow_burst(rate.burst_attempts());
         Self {
             rate,
-            #[cfg(any(feature = "reqwest", feature = "ureq"))]
+            #[cfg(any(feature = "http-async", feature = "http-sync"))]
             limiter: governor::RateLimiter::direct(quota),
         }
     }
@@ -329,7 +329,7 @@ impl RateAdmission {
         self.rate
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn check(&self) -> Option<Duration> {
         match self.limiter.check() {
             Ok(_) => None,
@@ -337,7 +337,7 @@ impl RateAdmission {
         }
     }
 
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn enter_sync(&self) -> Duration {
         let mut waited = Duration::ZERO;
         while let Some(wait) = self.check() {
@@ -347,7 +347,7 @@ impl RateAdmission {
         waited
     }
 
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     async fn enter_async(&self) -> Duration {
         let mut waited = Duration::ZERO;
         while let Some(wait) = self.check() {
@@ -412,18 +412,18 @@ impl ByteRate {
 /// without staging the chunk; it cannot permit an overrun.
 pub struct ByteRatePacer {
     rate: ByteRate,
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     limiter: governor::DefaultDirectRateLimiter,
 }
 
 impl ByteRatePacer {
     pub fn new(rate: ByteRate) -> Self {
-        #[cfg(any(feature = "reqwest", feature = "ureq"))]
+        #[cfg(any(feature = "http-async", feature = "http-sync"))]
         let quota =
             governor::Quota::per_second(rate.bytes_per_second()).allow_burst(rate.burst_bytes());
         Self {
             rate,
-            #[cfg(any(feature = "reqwest", feature = "ureq"))]
+            #[cfg(any(feature = "http-async", feature = "http-sync"))]
             limiter: governor::RateLimiter::direct(quota),
         }
     }
@@ -432,12 +432,12 @@ impl ByteRatePacer {
         self.rate
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn next_batch(&self, remaining: u64) -> Option<NonZeroU32> {
         NonZeroU32::new(remaining.min(u64::from(self.rate.burst_bytes().get())) as u32)
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn check_batch(&self, batch: NonZeroU32) -> Option<Duration> {
         match self.limiter.check_n(batch) {
             Ok(Ok(_)) => None,
@@ -446,7 +446,7 @@ impl ByteRatePacer {
         }
     }
 
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn before_chunk_sync(&self, bytes: u64) -> Duration {
         let mut remaining = bytes;
         let mut waited = Duration::ZERO;
@@ -460,7 +460,7 @@ impl ByteRatePacer {
         waited
     }
 
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     async fn before_chunk_async(&self, bytes: u64) -> Duration {
         let mut remaining = bytes;
         let mut waited = Duration::ZERO;
@@ -562,7 +562,7 @@ pub struct HttpInspectAttemptEvidence {
     pub planned_delay: Option<Duration>,
 }
 
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 impl HttpInspectAttemptEvidence {
     fn new(attempt: u32, status: Option<u16>, admission_wait: Option<Duration>) -> Self {
         Self {
@@ -686,7 +686,7 @@ impl Validator {
             })
     }
 
-    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(test, feature = "http-sync", feature = "http-async"))]
     fn if_range_value(&self) -> String {
         match &self.kind {
             ValidatorKind::StrongEtag(value) => value.clone(),
@@ -694,7 +694,7 @@ impl Validator {
         }
     }
 
-    #[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(test, feature = "http-sync", feature = "http-async"))]
     fn permits_response(&self, etag: Option<&str>, last_modified: Option<&str>) -> bool {
         match &self.kind {
             ValidatorKind::StrongEtag(expected) => etag
@@ -772,7 +772,7 @@ pub struct AttemptEvidence {
     pub outcome: AttemptOutcome,
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 impl AttemptEvidence {
     fn new(attempt: u32, outcome: AttemptOutcome) -> Self {
         Self {
@@ -801,7 +801,7 @@ impl AttemptEvidence {
             .with_admission_wait(admission_wait)
     }
 
-    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "http-sync", feature = "http-async"))]
     fn transfer(
         attempt: u32,
         status: u16,
@@ -818,7 +818,7 @@ impl AttemptEvidence {
         self
     }
 
-    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "http-sync", feature = "http-async"))]
     fn with_bytes(mut self, bytes: u64) -> Self {
         self.bytes = bytes;
         self
@@ -844,7 +844,7 @@ impl AttemptEvidence {
         self
     }
 
-    #[cfg(any(feature = "ureq", feature = "reqwest"))]
+    #[cfg(any(feature = "http-sync", feature = "http-async"))]
     fn with_pacing_wait(mut self, pacing_wait: Duration) -> Self {
         self.pacing_wait = pacing_wait;
         self
@@ -862,26 +862,26 @@ pub enum AttemptOutcome {
     LimitExceeded,
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 type SyncSleep = Arc<dyn Fn(Duration) + Send + Sync>;
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 type AsyncSleepFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 type AsyncSleep = Arc<dyn Fn(Duration) -> AsyncSleepFuture + Send + Sync>;
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 #[derive(Clone)]
-pub struct UreqResource {
+pub struct SyncHttpResources {
     agent: ureq::Agent,
     delay: SyncSleep,
     admission: Option<Arc<RateAdmission>>,
     byte_pacer: Option<Arc<ByteRatePacer>>,
 }
 
-#[cfg(feature = "ureq")]
-impl Default for UreqResource {
+#[cfg(feature = "http-sync")]
+impl Default for SyncHttpResources {
     fn default() -> Self {
         Self {
             agent: ureq::Agent::new_with_defaults(),
@@ -892,8 +892,8 @@ impl Default for UreqResource {
     }
 }
 
-#[cfg(feature = "ureq")]
-impl UreqResource {
+#[cfg(feature = "http-sync")]
+impl SyncHttpResources {
     pub fn from_agent(agent: ureq::Agent) -> Self {
         Self {
             agent,
@@ -918,39 +918,39 @@ impl UreqResource {
     }
 }
 
-#[cfg(feature = "ureq")]
-impl std::fmt::Debug for UreqResource {
+#[cfg(feature = "http-sync")]
+impl std::fmt::Debug for SyncHttpResources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("UreqResource")
+            .debug_struct("SyncHttpResources")
             .finish_non_exhaustive()
     }
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 /// Synchronous HEAD inspection implemented by `ureq`.
 #[derive(Clone, Debug)]
-pub struct UreqInspect {
-    resources: UreqResource,
+pub struct SyncHttpInspect {
+    resources: SyncHttpResources,
     policy: HttpInspectPolicy,
 }
 
-#[cfg(feature = "ureq")]
-impl Default for UreqInspect {
+#[cfg(feature = "http-sync")]
+impl Default for SyncHttpInspect {
     fn default() -> Self {
-        Self::new(UreqResource::default(), HttpInspectPolicy::default())
+        Self::new(SyncHttpResources::default(), HttpInspectPolicy::default())
     }
 }
 
-#[cfg(feature = "ureq")]
-impl UreqInspect {
-    pub fn new(resources: UreqResource, policy: HttpInspectPolicy) -> Self {
+#[cfg(feature = "http-sync")]
+impl SyncHttpInspect {
+    pub fn new(resources: SyncHttpResources, policy: HttpInspectPolicy) -> Self {
         Self { resources, policy }
     }
 }
 
-#[cfg(feature = "ureq")]
-impl Inspect<RemoteUrl> for UreqInspect {
+#[cfg(feature = "http-sync")]
+impl Inspect<RemoteUrl> for SyncHttpInspect {
     type Error = HttpInspectError;
     type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
 
@@ -1048,21 +1048,21 @@ impl Inspect<RemoteUrl> for UreqInspect {
     }
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 #[derive(Clone, Debug, Default)]
-pub struct UreqAcquire {
-    resources: UreqResource,
+pub struct SyncHttpAcquire {
+    resources: SyncHttpResources,
 }
 
-#[cfg(feature = "ureq")]
-impl UreqAcquire {
-    pub fn new(resources: UreqResource) -> Self {
+#[cfg(feature = "http-sync")]
+impl SyncHttpAcquire {
+    pub fn new(resources: SyncHttpResources) -> Self {
         Self { resources }
     }
 }
 
-#[cfg(feature = "ureq")]
-impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
+#[cfg(feature = "http-sync")]
+impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
     type Error = AcquireError;
     type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
 
@@ -1429,17 +1429,17 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for UreqAcquire {
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 #[derive(Clone)]
-pub struct ReqwestResource {
+pub struct AsyncHttpResources {
     client: reqwest::Client,
     delay: AsyncSleep,
     admission: Option<Arc<RateAdmission>>,
     byte_pacer: Option<Arc<ByteRatePacer>>,
 }
 
-#[cfg(feature = "reqwest")]
-impl Default for ReqwestResource {
+#[cfg(feature = "http-async")]
+impl Default for AsyncHttpResources {
     fn default() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -1450,8 +1450,8 @@ impl Default for ReqwestResource {
     }
 }
 
-#[cfg(feature = "reqwest")]
-impl ReqwestResource {
+#[cfg(feature = "http-async")]
+impl AsyncHttpResources {
     pub fn from_client(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -1476,39 +1476,39 @@ impl ReqwestResource {
     }
 }
 
-#[cfg(feature = "reqwest")]
-impl std::fmt::Debug for ReqwestResource {
+#[cfg(feature = "http-async")]
+impl std::fmt::Debug for AsyncHttpResources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ReqwestResource")
+            .debug_struct("AsyncHttpResources")
             .finish_non_exhaustive()
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 /// Tokio-backed asynchronous HEAD inspection implemented by `reqwest`.
 #[derive(Clone, Debug)]
-pub struct ReqwestInspect {
-    resources: ReqwestResource,
+pub struct AsyncHttpInspect {
+    resources: AsyncHttpResources,
     policy: HttpInspectPolicy,
 }
 
-#[cfg(feature = "reqwest")]
-impl Default for ReqwestInspect {
+#[cfg(feature = "http-async")]
+impl Default for AsyncHttpInspect {
     fn default() -> Self {
-        Self::new(ReqwestResource::default(), HttpInspectPolicy::default())
+        Self::new(AsyncHttpResources::default(), HttpInspectPolicy::default())
     }
 }
 
-#[cfg(feature = "reqwest")]
-impl ReqwestInspect {
-    pub fn new(resources: ReqwestResource, policy: HttpInspectPolicy) -> Self {
+#[cfg(feature = "http-async")]
+impl AsyncHttpInspect {
+    pub fn new(resources: AsyncHttpResources, policy: HttpInspectPolicy) -> Self {
         Self { resources, policy }
     }
 }
 
-#[cfg(feature = "reqwest")]
-impl AsyncInspect<RemoteUrl> for ReqwestInspect {
+#[cfg(feature = "http-async")]
+impl AsyncInspect<RemoteUrl> for AsyncHttpInspect {
     type Error = HttpInspectError;
     type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
 
@@ -1529,7 +1529,11 @@ impl AsyncInspect<RemoteUrl> for ReqwestInspect {
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
+#[allow(
+    clippy::result_large_err,
+    reason = "HttpInspectError keeps URL and attempt evidence direct; this async boundary does not establish future-layout pressure"
+)]
 async fn inspect_reqwest(
     client: reqwest::Client,
     delay: AsyncSleep,
@@ -1610,21 +1614,21 @@ async fn inspect_reqwest(
     unreachable!("HTTP inspection retry loop always returns")
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 #[derive(Clone, Debug, Default)]
-pub struct ReqwestAcquire {
-    resources: ReqwestResource,
+pub struct AsyncHttpAcquire {
+    resources: AsyncHttpResources,
 }
 
-#[cfg(feature = "reqwest")]
-impl ReqwestAcquire {
-    pub fn new(resources: ReqwestResource) -> Self {
+#[cfg(feature = "http-async")]
+impl AsyncHttpAcquire {
+    pub fn new(resources: AsyncHttpResources) -> Self {
         Self { resources }
     }
 }
 
-#[cfg(feature = "reqwest")]
-impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for ReqwestAcquire {
+#[cfg(feature = "http-async")]
+impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for AsyncHttpAcquire {
     type Error = AcquireError;
     type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
 
@@ -1643,7 +1647,11 @@ impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for ReqwestAcquire {
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
+#[allow(
+    clippy::result_large_err,
+    reason = "AcquireError keeps URL, retry, and resume evidence direct; this async boundary does not establish future-layout pressure"
+)]
 async fn acquire_reqwest<I, T>(
     client: reqwest::Client,
     delay: AsyncSleep,
@@ -1976,7 +1984,7 @@ async fn acquire_reqwest<I, T>(
     unreachable!("retry loop always returns")
 }
 
-#[cfg(any(feature = "reqwest", feature = "ureq"))]
+#[cfg(any(feature = "http-async", feature = "http-sync"))]
 fn reject_known_oversize(
     content_length: Option<u64>,
     max_bytes: Option<u64>,
@@ -1989,7 +1997,7 @@ fn reject_known_oversize(
     Ok(())
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     let delay = policy
         .base_delay
@@ -1997,7 +2005,7 @@ fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     policy.max_delay.map_or(delay, |max| delay.min(max))
 }
 
-#[cfg(any(feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "http-sync", feature = "http-async"))]
 fn planned_retry_delay(
     policy: RetryPolicy,
     retry_index: u32,
@@ -2011,12 +2019,12 @@ fn planned_retry_delay(
     retry_delay(policy, retry_index)
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 fn should_retry_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -2026,7 +2034,7 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
         .and_then(|retry_at| retry_at.duration_since(now).ok())
 }
 
-#[cfg(any(feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "http-sync", feature = "http-async"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PlannedResume {
     partial_path: PathBuf,
@@ -2034,7 +2042,7 @@ struct PlannedResume {
     validator: Validator,
 }
 
-#[cfg(any(feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "http-sync", feature = "http-async"))]
 impl PlannedResume {
     fn into_evidence(self, outcome: ResumeOutcome) -> ResumeEvidence {
         ResumeEvidence {
@@ -2046,7 +2054,7 @@ impl PlannedResume {
     }
 }
 
-#[cfg(any(feature = "ureq", feature = "reqwest"))]
+#[cfg(any(feature = "http-sync", feature = "http-async"))]
 fn planned_resume(policy: &ResumePolicy) -> Option<PlannedResume> {
     let (partial_path, validator) = match policy {
         ResumePolicy::RestartOnly => return None,
@@ -2085,7 +2093,7 @@ fn parse_strong_etag(value: &str) -> Option<String> {
         .then(|| value.to_string())
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 fn selected_response_validator(
     etag: Option<&str>,
     last_modified: Option<&str>,
@@ -2099,14 +2107,14 @@ fn selected_response_validator(
     })
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParsedContentRange {
     end: u64,
     total: u64,
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 impl ParsedContentRange {
     fn matches_materialized_bytes(self, start: u64, materialized_bytes: u64) -> bool {
         let Some(fragment_bytes) = self
@@ -2121,7 +2129,7 @@ impl ParsedContentRange {
     }
 }
 
-#[cfg(any(test, feature = "ureq", feature = "reqwest"))]
+#[cfg(any(test, feature = "http-sync", feature = "http-async"))]
 fn parse_content_range(value: &str, expected_start: u64) -> Option<ParsedContentRange> {
     let range = value.trim().strip_prefix("bytes ")?;
     let (span, total) = range.split_once('/')?;
@@ -2138,13 +2146,13 @@ fn parse_content_range(value: &str, expected_start: u64) -> Option<ParsedContent
     Some(ParsedContentRange { end, total })
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 struct BodyCopyProgress {
     bytes: u64,
     pacing_wait: Duration,
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 enum BodyCopyError {
     Transport {
         message: String,
@@ -2163,7 +2171,7 @@ enum BodyCopyError {
     },
 }
 
-#[cfg(feature = "ureq")]
+#[cfg(feature = "http-sync")]
 fn copy_response_body(
     mut reader: impl Read,
     writer: &mut impl Write,
@@ -2205,7 +2213,7 @@ fn copy_response_body(
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 enum StageWriteError {
     LimitExceeded {
         max: u64,
@@ -2218,15 +2226,15 @@ enum StageWriteError {
     },
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 struct Open {
     file: tokio::fs::File,
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 struct Closed;
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 struct StagedDownload<State> {
     temp: tempfile::NamedTempFile,
     bytes: u64,
@@ -2234,7 +2242,7 @@ struct StagedDownload<State> {
     writer: State,
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 impl StagedDownload<Open> {
     #[allow(
         clippy::result_large_err,
@@ -2255,6 +2263,10 @@ impl StagedDownload<Open> {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "AcquireError keeps complete local staging context direct; this async boundary does not establish future-layout pressure"
+    )]
     async fn from_partial(partial_path: &Path) -> Result<Self, AcquireError> {
         let temp = tempfile::NamedTempFile::new().map_err(|err| {
             AcquireError::local(None, "create download temp file", std::env::temp_dir(), err)
@@ -2305,6 +2317,10 @@ impl StagedDownload<Open> {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "AcquireError keeps complete local staging context direct; this async boundary does not establish future-layout pressure"
+    )]
     async fn finish(mut self) -> Result<StagedDownload<Closed>, AcquireError> {
         use tokio::io::AsyncWriteExt;
         self.writer.file.flush().await.map_err(|err| {
@@ -2320,7 +2336,7 @@ impl StagedDownload<Open> {
     }
 }
 
-#[cfg(feature = "reqwest")]
+#[cfg(feature = "http-async")]
 impl StagedDownload<Closed> {
     fn into_temp_path(self) -> tempfile::TempPath {
         self.temp.into_temp_path()
@@ -2331,47 +2347,47 @@ impl StagedDownload<Closed> {
 mod tests {
     use super::*;
     #[cfg(all(
-        any(feature = "reqwest", feature = "ureq"),
+        any(feature = "http-async", feature = "http-sync"),
         feature = "hash",
         feature = "blake3"
     ))]
     use crate::hash::{ArtifactDescriptor, Blake3, DigestValue, HashVerify};
     #[cfg(all(
-        any(feature = "reqwest", feature = "ureq"),
+        any(feature = "http-async", feature = "http-sync"),
         feature = "hash",
         feature = "blake3"
     ))]
     use crate::local::LocalApply;
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use crate::local::LocalTarget;
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     use crate::{Acquire, Inspect};
     #[cfg(all(
-        any(feature = "reqwest", feature = "ureq"),
+        any(feature = "http-async", feature = "http-sync"),
         feature = "hash",
         feature = "blake3"
     ))]
     use crate::{Apply, Verify};
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     use crate::{AsyncAcquire, AsyncInspect};
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use crate::{Materialize, MaterializeMode};
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::io::Write as TestWrite;
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::io::{BufRead, BufReader};
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::net::{TcpListener, TcpStream};
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::sync::{Arc as TestArc, Mutex, mpsc};
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::thread;
 
     fn test_validator() -> Validator {
         Validator::strong_etag("\"abc\"").unwrap()
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn materialize(
         source: RemoteSource,
         target: impl Into<PathBuf>,
@@ -2380,7 +2396,7 @@ mod tests {
             "artifact",
             source,
             LocalTarget::new(target),
-            MaterializeMode::CreateOrReplace,
+            MaterializeMode::ReplaceOrCreate,
         )
     }
 
@@ -2456,7 +2472,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn sync_rate_admission_shares_attempt_budget() {
         let admission = RateAdmission::new(AttemptRate::new(
             NonZeroU32::new(20).unwrap(),
@@ -2471,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn async_rate_admission_shares_attempt_budget() {
         block_on_reqwest(async {
             let admission = RateAdmission::new(AttemptRate::new(
@@ -2506,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn sync_byte_rate_pacer_zero_bytes_is_immediate() {
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(1).unwrap(),
@@ -2517,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn sync_byte_rate_pacer_splits_chunks_larger_than_burst() {
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(1_000).unwrap(),
@@ -2530,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn sync_byte_rate_pacer_shares_budget_across_calls() {
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(10).unwrap(),
@@ -2545,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn async_byte_rate_pacer_zero_bytes_is_immediate() {
         block_on_reqwest(async {
             let pacer = ByteRatePacer::new(ByteRate::new(
@@ -2558,7 +2574,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn async_byte_rate_pacer_splits_chunks_larger_than_burst() {
         block_on_reqwest(async {
             let pacer = ByteRatePacer::new(ByteRate::new(
@@ -2573,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn async_byte_rate_pacer_shares_budget_across_calls() {
         block_on_reqwest(async {
             let pacer = ByteRatePacer::new(ByteRate::new(
@@ -2760,10 +2776,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
-        let inspected = UreqInspect::default()
+        let inspected = SyncHttpInspect::default()
             .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         let request = server.next_request();
@@ -2783,10 +2799,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
-        let inspected = UreqInspect::default()
+        let inspected = SyncHttpInspect::default()
             .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         let request = server.next_request();
@@ -2798,19 +2814,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_inspect_retries_status_and_returns_final_observation() {
         let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
-        let resources = UreqResource::default().with_admission(TestArc::new(RateAdmission::new(
-            AttemptRate::new(NonZeroU32::new(1_000).unwrap(), NonZeroU32::new(2).unwrap()),
-        )));
+        let resources =
+            SyncHttpResources::default().with_admission(TestArc::new(RateAdmission::new(
+                AttemptRate::new(NonZeroU32::new(1_000).unwrap(), NonZeroU32::new(2).unwrap()),
+            )));
         let policy = HttpInspectPolicy::default().retry(RetryPolicy {
             max_retries: 1,
             base_delay: Duration::ZERO,
             max_delay: None,
             respect_retry_after: false,
         });
-        let inspected = UreqInspect::new(resources, policy)
+        let inspected = SyncHttpInspect::new(resources, policy)
             .inspect(RemoteUrl::parse(&server.url).unwrap())
             .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
@@ -2832,11 +2849,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
-        let inspected = UreqInspect::default().inspect(requested.clone()).unwrap();
+        let inspected = SyncHttpInspect::default()
+            .inspect(requested.clone())
+            .unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
@@ -2846,13 +2865,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_inspect_preserves_transport_attempt_evidence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let error = UreqInspect::default()
+        let error = SyncHttpInspect::default()
             .inspect(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap())
             .unwrap_err();
 
@@ -2866,11 +2885,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
         let inspected = block_on_reqwest(
-            ReqwestInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
+            AsyncHttpInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
         let request = server.next_request();
@@ -2890,11 +2909,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
         let inspected = block_on_reqwest(
-            ReqwestInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
+            AsyncHttpInspect::default().inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
         let request = server.next_request();
@@ -2906,11 +2925,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_inspect_retries_status_and_returns_final_observation() {
         let server = serve_sequence(vec![(503, b"retry", &[]), (404, b"missing", &[])]);
         let resources =
-            ReqwestResource::default().with_admission(TestArc::new(RateAdmission::new(
+            AsyncHttpResources::default().with_admission(TestArc::new(RateAdmission::new(
                 AttemptRate::new(NonZeroU32::new(1_000).unwrap(), NonZeroU32::new(2).unwrap()),
             )));
         let policy = HttpInspectPolicy::default().retry(RetryPolicy {
@@ -2920,7 +2939,7 @@ mod tests {
             respect_retry_after: false,
         });
         let inspected = block_on_reqwest(
-            ReqwestInspect::new(resources, policy)
+            AsyncHttpInspect::new(resources, policy)
                 .inspect_async(RemoteUrl::parse(&server.url).unwrap()),
         )
         .unwrap();
@@ -2943,12 +2962,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
         let inspected =
-            block_on_reqwest(ReqwestInspect::default().inspect_async(requested.clone())).unwrap();
+            block_on_reqwest(AsyncHttpInspect::default().inspect_async(requested.clone())).unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
@@ -2958,14 +2977,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_inspect_preserves_transport_attempt_evidence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
 
         let error = block_on_reqwest(
-            ReqwestInspect::default()
+            AsyncHttpInspect::default()
                 .inspect_async(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap()),
         )
         .unwrap_err();
@@ -2980,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquire_downloads_file_to_local_material() {
         let body = b"downloaded bytes";
         let server = serve_once(200, body, &[]);
@@ -2988,7 +3007,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert!(matches!(
@@ -3002,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquire_does_not_publish_materialize_target() {
         let server = serve_once(200, b"replacement", &[]);
         let temp = tempfile::tempdir().unwrap();
@@ -3010,7 +3029,7 @@ mod tests {
         std::fs::write(&target, b"original").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = UreqAcquire::default()
+        let acquired = SyncHttpAcquire::default()
             .acquire(materialize(source, &target))
             .unwrap();
         server.join();
@@ -3020,14 +3039,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquire_does_not_create_target_parent() {
         let server = serve_once(200, b"staged", &[]);
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("absent/target.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = UreqAcquire::default()
+        let acquired = SyncHttpAcquire::default()
             .acquire(materialize(source, &target))
             .unwrap();
         server.join();
@@ -3037,13 +3056,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquired_material_is_removed_when_abandoned() {
         let server = serve_once(200, b"temporary", &[]);
         let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = UreqAcquire::default()
+        let acquired = SyncHttpAcquire::default()
             .acquire(materialize(source, temp.path().join("target.bin")))
             .unwrap();
         server.join();
@@ -3055,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquire_rejects_non_success_status_without_touching_target() {
         let server = serve_once(404, b"not found", &[]);
         let temp = tempfile::tempdir().unwrap();
@@ -3064,7 +3083,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, &destination);
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3079,7 +3098,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_acquire_enforces_max_bytes_without_publishing_target() {
         let server = serve_once(200, b"too large", &[]);
         let temp = tempfile::tempdir().unwrap();
@@ -3088,7 +3107,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, &destination);
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
@@ -3096,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_limit_evidence_records_materialized_partial_bytes() {
         let server = serve_once(206, b" world", &[("Content-Range", "bytes 5-10/11")]);
         let temp = tempfile::tempdir().unwrap();
@@ -3107,7 +3126,7 @@ mod tests {
             .resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = UreqAcquire::default()
+        let error = SyncHttpAcquire::default()
             .acquire(materialize(source, temp.path().join("out")))
             .unwrap_err();
         server.join();
@@ -3121,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_retries_retryable_status_and_records_attempts() {
         let server = serve_sequence(vec![
             (503, b"busy", &[("Retry-After", "2")]),
@@ -3132,13 +3151,13 @@ mod tests {
             AcquirePolicy::default().retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let sleeps = TestArc::new(Mutex::new(Vec::new()));
-        let resources = UreqResource::default().with_delay({
+        let resources = SyncHttpResources::default().with_delay({
             let sleeps = TestArc::clone(&sleeps);
             TestArc::new(move |duration| sleeps.lock().unwrap().push(duration))
         });
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"ok");
@@ -3156,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_concrete_byte_rate_pacer_downloads() {
         let server = serve_once(200, b"concrete paced", &[]);
         let temp = tempfile::tempdir().unwrap();
@@ -3166,10 +3185,10 @@ mod tests {
             NonZeroU32::new(1_000_000).unwrap(),
             NonZeroU32::new(16_384).unwrap(),
         ));
-        let resources = UreqResource::default().with_byte_pacer(TestArc::new(pacer));
+        let resources = SyncHttpResources::default().with_byte_pacer(TestArc::new(pacer));
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(
@@ -3184,7 +3203,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_concrete_rate_admission_downloads() {
         let server = serve_once(200, b"rate admitted", &[]);
         let temp = tempfile::tempdir().unwrap();
@@ -3194,10 +3213,10 @@ mod tests {
             NonZeroU32::new(1_000).unwrap(),
             NonZeroU32::new(1).unwrap(),
         ));
-        let resources = UreqResource::default().with_admission(TestArc::new(admission));
+        let resources = SyncHttpResources::default().with_admission(TestArc::new(admission));
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::new(resources).acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(
@@ -3215,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_206_appends_after_valid_content_range() {
         let server = serve_sequence(vec![(
             206,
@@ -3230,7 +3249,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(
@@ -3246,7 +3265,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_200_to_range_restarts_full_with_fresh_stage() {
         let server = serve_sequence(vec![(200, b"fresh", &[])]);
         let temp = tempfile::tempdir().unwrap();
@@ -3257,7 +3276,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
@@ -3269,7 +3288,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_416_restarts_once_without_range_headers() {
         let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
         let temp = tempfile::tempdir().unwrap();
@@ -3280,7 +3299,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         let first_request = server.next_request();
         let second_request = server.next_request();
         server.join();
@@ -3298,7 +3317,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_missing_content_range_rejects_without_publishing_target() {
         let server = serve_sequence(vec![(206, b" world", &[])]);
         let temp = tempfile::tempdir().unwrap();
@@ -3310,7 +3329,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3325,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_rejects_body_shorter_than_declared_range() {
         let server = serve_sequence(vec![(206, b" wo", &[("Content-Range", "bytes 5-10/11")])]);
         let temp = tempfile::tempdir().unwrap();
@@ -3337,7 +3356,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3352,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_resume_rejects_partial_changed_after_request() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
@@ -3370,7 +3389,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3385,7 +3404,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_if_range_resume_sends_range_and_if_range_and_appends_206() {
         let server = serve_sequence(vec![(
             206,
@@ -3401,7 +3420,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         let request = server.next_request();
         server.join();
 
@@ -3418,7 +3437,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ureq")]
+    #[cfg(feature = "http-sync")]
     fn ureq_if_range_rejects_conflicting_response_validator() {
         let server = serve_sequence(vec![(
             206,
@@ -3434,7 +3453,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let chosen = materialize(source, temp.path().join("out"));
 
-        let error = UreqAcquire::default().acquire(chosen).unwrap_err();
+        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3449,7 +3468,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquire_downloads_file_to_local_material() {
         block_on_reqwest(async {
             let body = b"async downloaded bytes";
@@ -3458,7 +3477,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3476,7 +3495,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquire_does_not_publish_materialize_target() {
         block_on_reqwest(async {
             let server = serve_once(200, b"replacement", &[]);
@@ -3485,7 +3504,7 @@ mod tests {
             std::fs::write(&target, b"original").unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(materialize(source, &target))
                 .await
                 .unwrap();
@@ -3497,7 +3516,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquire_does_not_create_target_parent() {
         block_on_reqwest(async {
             let server = serve_once(200, b"staged", &[]);
@@ -3505,7 +3524,7 @@ mod tests {
             let target = temp.path().join("absent/target.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(materialize(source, &target))
                 .await
                 .unwrap();
@@ -3517,14 +3536,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquired_material_is_removed_when_abandoned() {
         block_on_reqwest(async {
             let server = serve_once(200, b"temporary", &[]);
             let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(materialize(source, temp.path().join("target.bin")))
                 .await
                 .unwrap();
@@ -3538,7 +3557,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquire_rejects_non_success_status_without_touching_target() {
         block_on_reqwest(async {
             let server = serve_once(404, b"not found", &[]);
@@ -3548,7 +3567,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, &destination);
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap_err();
@@ -3567,7 +3586,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_acquire_enforces_max_bytes_without_publishing_target() {
         block_on_reqwest(async {
             let server = serve_once(200, b"too large", &[]);
@@ -3577,7 +3596,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, &destination);
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap_err();
@@ -3589,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_limit_evidence_records_materialized_partial_bytes() {
         block_on_reqwest(async {
             let server = serve_once(206, b" world", &[("Content-Range", "bytes 5-10/11")]);
@@ -3601,7 +3620,7 @@ mod tests {
                 .resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(materialize(source, temp.path().join("out")))
                 .await
                 .unwrap_err();
@@ -3617,7 +3636,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_retries_retryable_status_and_records_attempts() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![
@@ -3629,7 +3648,7 @@ mod tests {
                 .retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let sleeps = TestArc::new(Mutex::new(Vec::new()));
-            let resources = ReqwestResource::default().with_delay({
+            let resources = AsyncHttpResources::default().with_delay({
                 let sleeps = TestArc::clone(&sleeps);
                 TestArc::new(move |duration| {
                     sleeps.lock().unwrap().push(duration);
@@ -3638,7 +3657,7 @@ mod tests {
             });
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new(resources)
+            let acquired = AsyncHttpAcquire::new(resources)
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3660,7 +3679,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_concrete_byte_rate_pacer_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async concrete paced", &[]);
@@ -3671,10 +3690,10 @@ mod tests {
                 NonZeroU32::new(1_000_000).unwrap(),
                 NonZeroU32::new(16_384).unwrap(),
             ));
-            let resources = ReqwestResource::default().with_byte_pacer(TestArc::new(pacer));
+            let resources = AsyncHttpResources::default().with_byte_pacer(TestArc::new(pacer));
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new(resources)
+            let acquired = AsyncHttpAcquire::new(resources)
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3693,7 +3712,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_concrete_rate_admission_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async rate admitted", &[]);
@@ -3704,10 +3723,10 @@ mod tests {
                 NonZeroU32::new(1_000).unwrap(),
                 NonZeroU32::new(1).unwrap(),
             ));
-            let resources = ReqwestResource::default().with_admission(TestArc::new(admission));
+            let resources = AsyncHttpResources::default().with_admission(TestArc::new(admission));
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::new(resources)
+            let acquired = AsyncHttpAcquire::new(resources)
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3729,7 +3748,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_206_appends_after_valid_content_range() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(
@@ -3745,7 +3764,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3765,7 +3784,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_missing_content_range_rejects_without_publishing_target() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(206, b" world", &[])]);
@@ -3777,7 +3796,7 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(materialize(source, &target))
                 .await
                 .unwrap_err();
@@ -3796,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_rejects_body_shorter_than_declared_range() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(206, b" wo", &[("Content-Range", "bytes 5-10/11")])]);
@@ -3809,7 +3828,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap_err();
@@ -3828,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_rejects_partial_changed_after_request() {
         block_on_reqwest(async {
             let temp = tempfile::tempdir().unwrap();
@@ -3847,7 +3866,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap_err();
@@ -3866,7 +3885,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_if_range_resume_sends_range_and_if_range_and_appends_206() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(
@@ -3883,7 +3902,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3904,7 +3923,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_if_range_rejects_conflicting_response_validator() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(
@@ -3921,7 +3940,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let error = ReqwestAcquire::default()
+            let error = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap_err();
@@ -3940,7 +3959,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_200_to_range_restarts_full_with_fresh_stage() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(200, b"fresh", &[])]);
@@ -3952,7 +3971,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -3968,7 +3987,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn reqwest_resume_416_restarts_once_without_modifying_partial() {
         block_on_reqwest(async {
             let server = serve_sequence(vec![(416, b"", &[]), (200, b"fresh", &[])]);
@@ -3980,7 +3999,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -4002,7 +4021,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "reqwest", feature = "hash", feature = "blake3"))]
+    #[cfg(all(feature = "http-async", feature = "hash", feature = "blake3"))]
     fn reqwest_acquire_flows_into_descriptor_verify() {
         block_on_reqwest(async {
             let body = b"reqwest verified bytes";
@@ -4012,7 +4031,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -4032,7 +4051,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "reqwest", feature = "hash", feature = "blake3"))]
+    #[cfg(all(feature = "http-async", feature = "hash", feature = "blake3"))]
     fn reqwest_acquire_flows_into_local_apply_after_verify() {
         block_on_reqwest(async {
             let body = b"reqwest apply bytes";
@@ -4043,7 +4062,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
             let chosen = materialize(source, &final_path);
 
-            let acquired = ReqwestAcquire::default()
+            let acquired = AsyncHttpAcquire::default()
                 .acquire_async(chosen)
                 .await
                 .unwrap();
@@ -4059,7 +4078,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "ureq", feature = "hash", feature = "blake3"))]
+    #[cfg(all(feature = "http-sync", feature = "hash", feature = "blake3"))]
     fn ureq_acquire_flows_into_descriptor_verify() {
         let body = b"verified bytes";
         let expected = blake3::hash(body).to_hex().to_string();
@@ -4068,7 +4087,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
         let verified = HashVerify::<Blake3>::new()
             .verify(
@@ -4084,7 +4103,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "ureq", feature = "hash", feature = "blake3"))]
+    #[cfg(all(feature = "http-sync", feature = "hash", feature = "blake3"))]
     fn ureq_acquire_flows_into_local_apply_after_verify() {
         let body = b"apply bytes";
         let expected = blake3::hash(body).to_hex().to_string();
@@ -4094,7 +4113,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
         let chosen = materialize(source, &final_path);
 
-        let acquired = UreqAcquire::default().acquire(chosen).unwrap();
+        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
         let verified = HashVerify::<Blake3>::new()
             .verify(acquired, DigestValue::new(expected))
@@ -4105,14 +4124,14 @@ mod tests {
         assert_eq!(applied.evidence.current.files, 1);
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     struct TestServer {
         url: String,
         handle: thread::JoinHandle<()>,
         requests: mpsc::Receiver<String>,
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     impl TestServer {
         fn next_request(&self) -> String {
             self.requests.recv().unwrap()
@@ -4123,7 +4142,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "reqwest")]
+    #[cfg(feature = "http-async")]
     fn block_on_reqwest<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4132,7 +4151,7 @@ mod tests {
             .block_on(future)
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn serve_once(
         status: u16,
         body: &'static [u8],
@@ -4141,7 +4160,7 @@ mod tests {
         serve_sequence(vec![(status, body, headers)])
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn request_has_header(request: &str, name: &str, value: &str) -> bool {
         request.lines().any(|line| {
             line.split_once(':')
@@ -4151,7 +4170,7 @@ mod tests {
         })
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn request_has_header_name(request: &str, name: &str) -> bool {
         request.lines().any(|line| {
             line.split_once(':')
@@ -4159,10 +4178,10 @@ mod tests {
         })
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     type TestResponse = (u16, &'static [u8], &'static [(&'static str, &'static str)]);
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn serve_once_with_before_response(
         status: u16,
         body: &'static [u8],
@@ -4190,7 +4209,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn serve_sequence(responses: Vec<TestResponse>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4208,7 +4227,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn serve_redirect_then(status: u16, body: &'static [u8]) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4234,7 +4253,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "reqwest", feature = "ureq"))]
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn handle_request(
         mut stream: TcpStream,
         status: u16,

@@ -9,15 +9,14 @@ use std::path::Path;
 #[cfg(feature = "local")]
 use crate::PulithError;
 #[cfg(feature = "local")]
-use crate::{Acquired, EvidenceChain, Verified, Verify};
+use crate::{Acquired, EvidenceChain, Inspect, Inspected, Reconcile, Reconciled, Verified, Verify};
 
 #[cfg(feature = "local")]
 trait DigestAlgorithm {
-    fn digest_file_with_size(path: &Path) -> Result<(String, u64), PulithError>;
-
-    fn digest_file(path: &Path) -> Result<String, PulithError> {
-        Self::digest_file_with_size(path).map(|(digest, _)| digest)
-    }
+    fn digest_opened_file_with_size(
+        file: &mut File,
+        path: &Path,
+    ) -> Result<(String, u64), PulithError>;
 }
 
 #[cfg(feature = "local")]
@@ -104,12 +103,250 @@ impl<A> HashVerify<A> {
     }
 }
 
+#[cfg(feature = "local")]
+/// Exact, hash-backed observation of one local artifact target.
+///
+/// File descriptors contain bytes counted by the same read loop as the digest. Other variants are
+/// valid read-only observations; open, attribute-query, and read failures remain errors. Entry-kind
+/// observations can become stale immediately after their metadata or handle query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalArtifactObservation<A> {
+    Missing,
+    File { descriptor: ArtifactDescriptor<A> },
+    Directory,
+    Symlink,
+    Reparse,
+    Other,
+}
+
+#[cfg(feature = "local")]
+impl<A> LocalArtifactObservation<A> {
+    fn kind(&self) -> crate::local::LocalEntryKind {
+        match self {
+            Self::Missing => crate::local::LocalEntryKind::Missing,
+            Self::File { .. } => crate::local::LocalEntryKind::File,
+            Self::Directory => crate::local::LocalEntryKind::Directory,
+            Self::Symlink => crate::local::LocalEntryKind::Symlink,
+            Self::Reparse => crate::local::LocalEntryKind::Reparse,
+            Self::Other => crate::local::LocalEntryKind::Other,
+        }
+    }
+}
+
+#[cfg(feature = "local")]
+/// Evidence that a selected hash adapter produced an exact local artifact observation.
+pub struct ArtifactInspectEvidence<A> {
+    _algorithm: PhantomData<A>,
+}
+
+#[cfg(feature = "local")]
+impl<A> Clone for ArtifactInspectEvidence<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> Copy for ArtifactInspectEvidence<A> {}
+
+#[cfg(feature = "local")]
+impl<A> Default for ArtifactInspectEvidence<A> {
+    fn default() -> Self {
+        Self {
+            _algorithm: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> std::fmt::Debug for ArtifactInspectEvidence<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArtifactInspectEvidence")
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> PartialEq for ArtifactInspectEvidence<A> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> Eq for ArtifactInspectEvidence<A> {}
+
+#[cfg(feature = "local")]
+/// Opt-in full-read inspector for a local regular-file target using algorithm `A`.
+///
+/// Only the final path component is opened without following links; parent directories must be
+/// trusted. The observed byte stream is not an atomic snapshot under concurrent in-place writes.
+pub struct HashInspect<A> {
+    _algorithm: PhantomData<A>,
+}
+
+#[cfg(feature = "local")]
+impl<A> Clone for HashInspect<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> Copy for HashInspect<A> {}
+
+#[cfg(feature = "local")]
+impl<A> Default for HashInspect<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> std::fmt::Debug for HashInspect<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HashInspect")
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A> HashInspect<A> {
+    /// Creates an exact local artifact inspector for algorithm `A`.
+    pub fn new() -> Self {
+        Self {
+            _algorithm: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "local")]
+impl<A: DigestAlgorithm> Inspect<crate::local::LocalTarget> for HashInspect<A> {
+    type Error = PulithError;
+    type Output = Inspected<
+        crate::local::LocalTarget,
+        LocalArtifactObservation<A>,
+        ArtifactInspectEvidence<A>,
+    >;
+
+    fn inspect(&self, node: crate::local::LocalTarget) -> Result<Self::Output, Self::Error> {
+        use crate::local::OpenedLocalArtifact;
+        let observation = match crate::local::open_local_artifact(&node.path)? {
+            OpenedLocalArtifact::Missing => LocalArtifactObservation::Missing,
+            OpenedLocalArtifact::Directory => LocalArtifactObservation::Directory,
+            OpenedLocalArtifact::Symlink => LocalArtifactObservation::Symlink,
+            #[cfg(windows)]
+            OpenedLocalArtifact::Reparse => LocalArtifactObservation::Reparse,
+            OpenedLocalArtifact::Other => LocalArtifactObservation::Other,
+            OpenedLocalArtifact::File(mut file) => {
+                let (digest, size) = A::digest_opened_file_with_size(&mut file, &node.path)?;
+                LocalArtifactObservation::File {
+                    descriptor: ArtifactDescriptor::new(digest, size),
+                }
+            }
+        };
+        Ok(Inspected {
+            input: node,
+            observation,
+            evidence: ArtifactInspectEvidence {
+                _algorithm: PhantomData,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "local")]
+/// Pure expected-descriptor versus observed-artifact classification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactReconciliation<A> {
+    Matches,
+    Missing,
+    WrongKind {
+        observed: crate::local::LocalEntryKind,
+    },
+    SizeMismatch {
+        expected: u64,
+        observed: u64,
+    },
+    DigestMismatch {
+        expected: DigestValue<A>,
+        observed: DigestValue<A>,
+    },
+}
+
+#[cfg(feature = "local")]
+/// Evidence preserving the caller expectation and exact observation used by reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactReconcileEvidence<A> {
+    pub expected: ArtifactDescriptor<A>,
+    pub observed: LocalArtifactObservation<A>,
+}
+
+#[cfg(feature = "local")]
+/// Pure reconciler for an expected exact regular-file descriptor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ArtifactReconcile;
+
+#[cfg(feature = "local")]
+impl<A, E>
+    Reconcile<
+        Inspected<crate::local::LocalTarget, LocalArtifactObservation<A>, E>,
+        ArtifactDescriptor<A>,
+    > for ArtifactReconcile
+{
+    type Error = std::convert::Infallible;
+    type Output = Reconciled<
+        crate::local::LocalTarget,
+        ArtifactReconciliation<A>,
+        EvidenceChain<E, ArtifactReconcileEvidence<A>>,
+    >;
+
+    fn reconcile(
+        &self,
+        node: Inspected<crate::local::LocalTarget, LocalArtifactObservation<A>, E>,
+        expected: ArtifactDescriptor<A>,
+    ) -> Result<Self::Output, Self::Error> {
+        let reconciliation = match &node.observation {
+            LocalArtifactObservation::Missing => ArtifactReconciliation::Missing,
+            LocalArtifactObservation::File { descriptor } if descriptor.size != expected.size => {
+                ArtifactReconciliation::SizeMismatch {
+                    expected: expected.size,
+                    observed: descriptor.size,
+                }
+            }
+            LocalArtifactObservation::File { descriptor }
+                if descriptor.digest.as_str() != expected.digest.as_str() =>
+            {
+                ArtifactReconciliation::DigestMismatch {
+                    expected: DigestValue::new(expected.digest.as_str()),
+                    observed: DigestValue::new(descriptor.digest.as_str()),
+                }
+            }
+            LocalArtifactObservation::File { .. } => ArtifactReconciliation::Matches,
+            observation => ArtifactReconciliation::WrongKind {
+                observed: observation.kind(),
+            },
+        };
+        Ok(Reconciled {
+            input: node.input,
+            reconciliation,
+            evidence: EvidenceChain {
+                previous: node.evidence,
+                current: ArtifactReconcileEvidence {
+                    expected,
+                    observed: node.observation,
+                },
+            },
+        })
+    }
+}
+
 #[cfg(all(feature = "local", feature = "blake3"))]
 impl DigestAlgorithm for Blake3 {
-    fn digest_file_with_size(path: &Path) -> Result<(String, u64), PulithError> {
-        let mut file = open_digest_file(path)?;
+    fn digest_opened_file_with_size(
+        file: &mut File,
+        path: &Path,
+    ) -> Result<(String, u64), PulithError> {
         let mut hasher = blake3::Hasher::new();
-        let bytes = copy_into_hasher(path, &mut file, |bytes| {
+        let bytes = copy_into_hasher(path, file, |bytes| {
             hasher.update(bytes);
         })?;
         Ok((hasher.finalize().to_hex().to_string(), bytes))
@@ -118,12 +355,14 @@ impl DigestAlgorithm for Blake3 {
 
 #[cfg(all(feature = "local", feature = "sha2"))]
 impl DigestAlgorithm for Sha256 {
-    fn digest_file_with_size(path: &Path) -> Result<(String, u64), PulithError> {
+    fn digest_opened_file_with_size(
+        file: &mut File,
+        path: &Path,
+    ) -> Result<(String, u64), PulithError> {
         use sha2::{Digest, Sha256 as Sha256Hasher};
 
-        let mut file = open_digest_file(path)?;
         let mut hasher = Sha256Hasher::new();
-        let bytes = copy_into_hasher(path, &mut file, |bytes| {
+        let bytes = copy_into_hasher(path, file, |bytes| {
             hasher.update(bytes);
         })?;
         Ok((hex::encode(hasher.finalize()), bytes))
@@ -135,8 +374,10 @@ fn verify_digest<I, E, A: DigestAlgorithm>(
     node: Acquired<I, crate::local::LocalMaterial, E>,
     expected: DigestValue<A>,
 ) -> Result<DigestVerified<I, E, A>, PulithError> {
-    require_regular_digest_file(node.material.path())?;
-    let observed = DigestValue::<A>::new(A::digest_file(node.material.path())?);
+    let path = node.material.path();
+    let mut file = open_regular_digest_file(path)?;
+    let (observed_digest, _) = A::digest_opened_file_with_size(&mut file, path)?;
+    let observed = DigestValue::<A>::new(observed_digest);
     if observed.as_str() != expected.as_str() {
         return Err(PulithError::DigestMismatch {
             expected: expected.into_string(),
@@ -158,7 +399,11 @@ fn verify_descriptor<I, E, A: DigestAlgorithm>(
     node: Acquired<I, crate::local::LocalMaterial, E>,
     expected: ArtifactDescriptor<A>,
 ) -> Result<DescriptorVerified<I, E, A>, PulithError> {
-    let metadata = require_regular_digest_file(node.material.path())?;
+    let path = node.material.path();
+    let mut file = open_regular_digest_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PulithError::io("read digest material metadata", path, error))?;
     let metadata_size = metadata.len();
     if metadata_size != expected.size {
         return Err(PulithError::ArtifactSizeMismatch {
@@ -167,7 +412,7 @@ fn verify_descriptor<I, E, A: DigestAlgorithm>(
         });
     }
 
-    let (observed_digest, observed_size) = A::digest_file_with_size(node.material.path())?;
+    let (observed_digest, observed_size) = A::digest_opened_file_with_size(&mut file, path)?;
     if observed_size != expected.size {
         return Err(PulithError::ArtifactSizeMismatch {
             expected: expected.size,
@@ -242,14 +487,16 @@ impl_hash_verify!(Blake3);
 impl_hash_verify!(Sha256);
 
 #[cfg(feature = "local")]
-fn require_regular_digest_file(path: &Path) -> Result<std::fs::Metadata, PulithError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|err| PulithError::io("read digest material metadata", path, err))?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() || !file_type.is_file() {
-        return Err(PulithError::UnsupportedDigestMaterial(path.to_path_buf()));
+fn open_regular_digest_file(path: &Path) -> Result<File, PulithError> {
+    match crate::local::open_local_artifact(path)? {
+        crate::local::OpenedLocalArtifact::File(file) => Ok(file),
+        crate::local::OpenedLocalArtifact::Missing => Err(PulithError::io(
+            "open file for digest",
+            path,
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        )),
+        _ => Err(PulithError::UnsupportedDigestMaterial(path.to_path_buf())),
     }
-    Ok(metadata)
 }
 
 fn normalize_hex(value: &str) -> String {
@@ -258,11 +505,6 @@ fn normalize_hex(value: &str) -> String {
         .filter(|ch| !ch.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-fn open_digest_file(path: &Path) -> Result<File, PulithError> {
-    File::open(path).map_err(|err| PulithError::io("open file for digest", path, err))
 }
 
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
@@ -319,7 +561,7 @@ mod tests {
                 "demo",
                 LocalPath::new(source),
                 LocalTarget::new(target),
-                MaterializeMode::CreateOrReplace,
+                MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap()
     }
