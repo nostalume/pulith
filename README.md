@@ -12,6 +12,8 @@ Materialize -> Acquired -> Applied
                         -> Prepared -> Applied
                         -> Verified -> Prepared -> Applied
 Forget -----------------------------> Applied
+Applied<..., LocalTarget> + PathBuf -> Activated
+Applied<..., LocalTarget> ----------> Inspected -> Reconciled
 LocalTarget -> Inspected -> Reconciled
 RemoteUrl  --> Inspected
 ```
@@ -24,12 +26,11 @@ the adapter, decide whether to trust its evidence, and compose concrete effects.
 
 | Module | Behavior |
 | --- | --- |
-| `application` | Typed `Materialize` and `Forget` requests |
-| `behavior` | Transition traits and state nodes |
-| `local` | Local acquire, staged apply, inspect, and pure reconcile |
-| `hash` | Typed digest and exact digest-plus-size descriptor verification |
+| `local` | Local acquire, staged apply, create-only activation, explicit active-view switch, inspect, and pure reconcile |
+| `hash` | Typed descriptor verification plus opt-in exact local artifact inspection/reconciliation |
 | `archive` | ZIP/TAR preparation with path, entry-type, and resource guards |
 | `net` | HTTP HEAD inspection plus acquire with retry, resume, admission, body pacing, staging, and attempt evidence |
+| `process` | Cooperative process realization into staged-tree custody: private workspace, declared output, captured diagnostics, tree-stop on timeout/cancel, caller-initiated cancellation, input closure and source staging |
 
 Pulith uses mature libraries for HTTP, hashing, archive parsing, and compression codecs. It owns the typed behavior, policy, evidence, staging, and publication contracts around those mechanisms.
 
@@ -70,8 +71,11 @@ Concrete behavior contracts currently admitted to the public surface are:
 | digest/descriptor verify | caller-supplied digest or exact descriptor | typed expected/observed digest and size facts | factual mismatch fails without applying a target |
 | archive prepare | `ArchivePolicy` and exclusive workspace | prepared tree and observed extraction evidence | final destination remains untouched |
 | local apply | `MaterializeMode` and exact target | typed `Applied` result plus files/directories/bytes/placement evidence | staged publication with an explicit single-target commit boundary |
+| local activation | completed materialized target plus caller-owned missing active view | typed `Activated` receipt with prior publication evidence, link strategy, and post-observation | one directory symlink; no copy, replacement, shared-prefix link, or durable active record |
+| local switch | completed materialized target plus caller-owned existing directory-symlink view | typed `Activated` receipt with prior publication, previous/current source, native backend, and post-observation | native replacement of that link only; no target publication, rollback record, shared-prefix link, or fallback |
 | local forget | exact caller-authorized target | removed/no-op apply evidence | direct idempotent removal; no ownership or uninstall claim |
 | local inspect | `LocalTarget`; local adapter owns observed facts | no-follow entry observation and evidence | read-only; `NotFound` is `Missing`, other I/O failures remain errors |
+| local post-inspect | completed local `Materialize` or `Forget` receipt; local adapter | `Inspected` with preserved apply evidence plus no-follow metadata evidence | read-only later observation; unavailable inspection preserves the completed receipt and does not retry or alter apply |
 | local reconcile | caller-owned `LocalExpectation` | preserved inspect evidence, expected/observed evidence, and typed classification | pure comparison; no repair, adoption, deletion, or persistence |
 
 Resource semantics remain bounded and cross through typed anti-corruption mappings:
@@ -112,23 +116,39 @@ manager. The concrete path currently supplied by this crate is:
 
 | Transition | Concrete behavior today |
 | --- | --- |
-| `Materialize -> Acquired` | local material or staged HTTP download |
+| `Materialize -> Acquired` | local material, staged HTTP download, or cooperative process realization into a staged tree |
 | `Acquired -> Verified` | typed digest or exact digest-plus-size descriptor verification |
 | `Acquired/Verified -> Prepared` | guarded ZIP/TAR extraction when the caller needs transformation |
 | `Acquired/Verified/Prepared -> Applied` | staged local file/tree publication according to `MaterializeMode` |
 | `Forget -> Applied` | direct idempotent local target removal; no artificial source acquisition |
-| `LocalTarget -> Inspected` | read-only, no-follow local entry observation |
-| `RemoteUrl -> Inspected` | sync `UreqInspect` or async `ReqwestInspect` HEAD observation with redirect and attempt evidence |
-| `Inspected -> Reconciled` | pure comparison against caller-owned local expected state |
+| `Applied<..., LocalTarget> -> Inspected` | optional metadata-only `LocalPostInspect`; retains the prior apply receipt/evidence and does not prove convergence |
+| `LocalTarget -> Inspected` | cheap metadata observation, or opt-in hash-backed full-read artifact observation |
+| `RemoteUrl -> Inspected` | sync `SyncHttpInspect` or async `AsyncHttpInspect` HEAD observation with redirect and attempt evidence |
+| `Inspected -> Reconciled` | pure metadata or exact-descriptor comparison against caller-owned expected state |
 
-Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`ReqwestAcquire` and
-HTTP inspection through `AsyncInspect`/`ReqwestInspect`; the other transitions currently expose synchronous behavior laws only. Pulith does
+A caller can compose an unlinked prebuilt artifact tree by acquiring a local or HTTP archive,
+optionally verifying its raw bytes, preparing its guarded tree, and applying it to an exact local
+target. This is caller composition, not a package-manager installation: it neither links an active
+view nor creates durable state. For directory `CreateNew`, the caller owns the existing target parent
+and target serialization; a quiescent existing target is a preflight conflict, not an atomic
+directory-store commit guarantee.
+
+A caller may separately activate a published local directory into one missing caller-owned path by
+creating a directory symbolic link. This is a distinct effect and receipt from publication: it never
+copies the tree, creates the view parent, replaces/switches a view, links a shared prefix, or records
+durable ownership. Windows reports an unavailable directory-symlink capability rather than silently
+using a junction, copy, or elevation fallback.
+
+Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`AsyncHttpAcquire`,
+HTTP inspection through `AsyncInspect`/`AsyncHttpInspect`, and process realization through
+`AsyncAcquire`/`ProcessAcquire` under `process-async`; the other transitions currently expose
+synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
 transactions, automatic repair, or system package-manager integration. Those require demonstrated
 callers and explicit storage/rollback laws; they are not hidden behind the existing state names.
 
 `ArtifactDescriptor<A>` identifies one exact raw representation by digest and byte size, independent
-of whether it came from a local path, `ureq`, or `reqwest`. Descriptor equality proves only that the
+of whether it came from a local path, synchronous HTTP, or asynchronous HTTP. Descriptor equality proves only that the
 material matches the supplied expectation. It does not authenticate who supplied that expectation,
 authorize a publisher, or establish provenance; those remain separate caller-owned policy/trust
 behaviors until a concrete adapter justifies them.
@@ -143,8 +163,8 @@ default = local
 
 network:
   net
-  ureq -> net + local
-  reqwest -> net + local + tokio
+  http-sync -> net + local
+  http-async -> net + local + tokio
 
 hashing:
   hash
@@ -155,15 +175,42 @@ archives:
   zip -> local
   tar -> local
   gzip/xz/zstd -> tar
+
+process:
+  process
+  process-async -> process + tokio
 ```
 
 There is deliberately no empty `archive`, `object`, `compress`, `fs-extra`, or `json` capability feature.
+
+### Feature selections
+
+Features are additive capabilities, not mutually exclusive modes. Select only the concrete behavior
+or shared vocabulary a consumer needs; Pulith never chooses a global transport, runtime, digest, or
+archive adapter.
+
+| Consumer need | Selection |
+| --- | --- |
+| local materialization and observation | default features, or `default-features = false, features = ["local"]` |
+| network URL/policy/attempt vocabulary only | `default-features = false, features = ["net"]` |
+| synchronous HTTP HEAD/acquire | `default-features = false, features = ["http-sync"]` |
+| Tokio asynchronous HTTP HEAD/acquire | `default-features = false, features = ["http-async"]` |
+| typed digest/descriptor vocabulary only | `default-features = false, features = ["hash"]` |
+| exact local BLAKE3 or SHA-256 artifact observation | `default-features = false, features = ["local", "blake3"]` or `features = ["local", "sha2"]` |
+| ZIP or plain TAR preparation | `default-features = false, features = ["zip"]` or `features = ["tar"]` |
+| gzip, xz, or zstd TAR preparation | `default-features = false, features = ["gzip"]`, `features = ["xz"]`, or `features = ["zstd"]` |
+| cooperative process realization | `default-features = false, features = ["process"]` |
+| async process realization (tokio) | `default-features = false, features = ["process-async"]` |
+
+`--all-features` is an integration-validation profile, not a consumer-facing `full` feature. A
+consumer may combine an HTTP adapter, digest algorithm, and archive adapter in one dependency
+declaration; it must select each concrete adapter in its own composition code.
 
 ## Use
 
 ```toml
 [dependencies]
-pulith = { path = "../pulith", features = ["ureq", "blake3", "zip"] }
+pulith = { path = "../pulith", features = ["http-sync", "blake3", "zip"] }
 ```
 
 Construct a `Materialize` request after the caller has selected a source, then compose only the concrete acquire, optional verify/prepare, and apply behaviors the request needs. Use `Forget` for a direct target-only removal. There is no global context, plugin registry, or hidden workflow policy.
@@ -176,6 +223,11 @@ caller that wants a durable cache composes `LocalApply` with that cache path as 
 ## Guarantees and limits
 
 - final destination writes are staged before publication where the concrete behavior supports it;
+- for local regular files, `MaterializeMode::CreateNew` means the expected predecessor is missing;
+  the final no-clobber persist is authoritative, and an early or late existing target returns
+  `ApplyWouldOverwrite` without changing that target;
+- that conditional-file law does not cover directory publication, `ReplaceOrCreate`,
+  `Forget`, or digest-based compare-and-swap;
 - archive traversal, symlink, hardlink, and unsupported entry types are rejected by default;
 - archive path collisions are rejected with portable case-folded identity on every platform;
 - archive extraction uses an exclusive destructive `ExtractWorkspace` before final `LocalApply` publication;
@@ -193,9 +245,13 @@ caller that wants a durable cache composes `LocalApply` with that cache path as 
 - caller-owned local sources and resume partial files are never removed implicitly;
 - request admission and decoded-body pacing are separate shared resources;
 - decoded-body pacing does not control kernel, TLS, or HTTP flow-control timing;
-- local path safety assumes trusted parent directories, not a hostile concurrent filesystem;
+- local path safety assumes trusted parent directories and does not claim a hostile concurrent-filesystem sandbox;
+- required runtime evidence covers Windows and Linux; macOS is currently best-effort and unverified,
+  and does not gate phase admission;
 - local inspection uses `symlink_metadata`, treats `NotFound` as `Missing`, reports dangling
   symlinks without following them, and performs no mutation;
+- local post-inspection is a separate read after a completed local effect; its unavailable-observation
+  error retains that completed receipt, while successful output still requires caller reconciliation;
 - local reconciliation compares caller-owned expectation with an observation and returns only a
   classification plus evidence; it never repairs, adopts, deletes, or persists state;
 - dependency solving, lifecycle stores, installation policy, and package-manager orchestration are out of scope.
@@ -209,7 +265,27 @@ cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 ```
 
-Feature-gated behavior must also compile with `--no-default-features` and its smallest supported feature combination. Engineering rules and the current tech stack are in [`AGENTS.md`](AGENTS.md).
+Feature-gated behavior must also compile with `--no-default-features` and its smallest supported feature combination. Engineering rules and the current tech stack are in [`docs/AGENTS.md`](docs/AGENTS.md).
+
+## Current development state
+
+- **Kernel and local vertical (P1–P3, S2.1–S2.5):** the crate is a single root (`lib.rs` owns the
+  behavior traits and application vocabulary); the local adapter is split into `local.rs` (facade),
+  `local/apply.rs` (publication/forget), and `local/view.rs` (activation/switch). Post-apply
+  observation (`LocalPostInspect`), unlinked artifact trees, create-only activation, native
+  active-view switch, and exact hash-backed artifact inspection (`HashMaterializeInspect`) are
+  landed and covered by public contract tests.
+- **Process vertical (S2.6–S2.10):** cooperative process realization lands workspace custody,
+  declared output identity, captured diagnostics, tree-stop on timeout and caller-initiated
+  cancellation (`CancellationToken`), and input closure with source staging (`InputSpec`,
+  `PULITH_INPUT_ROOT`). The async adapter (`process-async`) shares the same laws.
+- **Stage-2 axis closures (S2.11–S2.13):** configuration interpretation, the durable manager
+  aggregate, and the repair/controller decision are frozen as caller-owned boundaries: Pulith
+  defines no data contract, program type, script engine, durable vocabulary, or controller loop.
+- **Audit (P4):** the integration suite runs on a shared `tests/common.rs` fixture frame (process
+  harness, mock HTTP server, zip/tar writers, local publish helpers); trivial unit tests were
+  removed and constructor validation moved into crate unit tests.
+- Nothing is versioned as stable; the `0.1.0` pre-release status above still applies.
 
 ## License
 

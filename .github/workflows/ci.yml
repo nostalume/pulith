@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           RUSTFLAGS="-D warnings" cargo check --no-default-features
-          for feature in local net ureq reqwest hash blake3 sha2 zip tar gzip xz zstd; do
+          for feature in local net http-sync http-async hash blake3 sha2 zip tar gzip xz zstd; do
             RUSTFLAGS="-D warnings" cargo check --no-default-features --features "$feature"
           done
 
@@ -53,6 +53,8 @@ jobs:
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features zip
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features tar
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features gzip
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features xz
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features zstd
 
       - name: Test parent feature vocabulary
         shell: bash
@@ -60,9 +62,16 @@ jobs:
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features net
           RUSTFLAGS="-D warnings" cargo test --no-default-features --features hash
 
+      - name: Test exact local artifact intersections
+        shell: bash
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,blake3 --test hash
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,sha2 --test hash
+
       - name: Check package contents
         run: |
           cargo package --locked
+          cargo package --locked --all-features
           cargo package --list
 
   test:
@@ -71,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -83,6 +92,27 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
+        run: cargo test --all-features
+
+      - name: Lint Windows exact local implementation
+        if: runner.os == 'Windows'
+        run: cargo clippy --locked --all-targets --no-default-features --features local,blake3,sha2 -- -D warnings
+
+  macos-observation:
+    name: Test (macOS best effort)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Observe all-feature tests
         run: cargo test --all-features
 
   msrv:

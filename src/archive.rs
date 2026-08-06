@@ -1,3 +1,9 @@
+//! ZIP/TAR preparation into an exclusive guarded scratch tree.
+//!
+//! Owns archive-extraction semantics: entry paths, entry types, decoded and materialized limits,
+//! and path-escape guards. Preparation returns a crate-constructed `ArchiveTree` whose root is
+//! readable by reference; the final destination is never touched. Feature-gated on `zip`/`tar`
+//! (with gzip/xz/zstd codecs composing tar).
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -6,11 +12,104 @@ use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
-use crate::evidence::ApplyEvidence;
-use crate::local::{LocalApply, LocalMaterial, LocalTarget};
-use crate::{
-    Acquired, Applied, Apply, EvidenceChain, Materialize, Prepare, Prepared, PulithError, Verified,
-};
+use crate::local::ApplyEvidence;
+use crate::local::{LocalApply, LocalError, LocalMaterial, LocalTarget};
+use crate::{Acquired, Applied, Apply, EvidenceChain, Materialize, Prepare, Prepared, Verified};
+
+/// Errors produced by archive preparation and extraction.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ArchiveError {
+    ArchiveRequiresFile(PathBuf),
+    ArchiveInvalidPath(String),
+    ArchiveLimitExceeded {
+        limit: &'static str,
+        actual: u64,
+        max: u64,
+    },
+    ArchiveSizeMismatch {
+        path: PathBuf,
+        declared: u64,
+        observed: u64,
+    },
+    ArchivePathConflict(PathBuf),
+    /// Extraction failed and resetting the exclusive workspace also failed.
+    ///
+    /// `extraction` is the primary source. `cleanup` remains available for callers that need to
+    /// detect a contaminated workspace.
+    ArchiveCleanupFailed {
+        workspace: PathBuf,
+        extraction: Box<ArchiveError>,
+        cleanup: Box<ArchiveError>,
+    },
+    UnsupportedArchiveEntry(PathBuf),
+    InvalidPreparation(String),
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl ArchiveError {
+    fn io(action: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
+        Self::Io {
+            action,
+            path: path.as_ref().to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArchiveRequiresFile(path) => {
+                write!(f, "archive preparation requires a file: {}", path.display())
+            }
+            Self::ArchiveInvalidPath(path) => write!(f, "archive entry path is invalid: {path}"),
+            Self::ArchiveLimitExceeded { limit, actual, max } => {
+                write!(f, "archive {limit} limit exceeded: {actual} > {max}")
+            }
+            Self::ArchiveSizeMismatch {
+                path,
+                declared,
+                observed,
+            } => write!(
+                f,
+                "archive entry size mismatch for {}: declared {declared}, observed {observed}",
+                path.display()
+            ),
+            Self::ArchivePathConflict(path) => {
+                write!(f, "archive entries conflict at path: {}", path.display())
+            }
+            Self::ArchiveCleanupFailed { workspace, .. } => write!(
+                f,
+                "archive extraction and cleanup both failed for {}",
+                workspace.display()
+            ),
+            Self::UnsupportedArchiveEntry(path) => {
+                write!(f, "archive entry is unsupported: {}", path.display())
+            }
+            Self::InvalidPreparation(message) => write!(f, "invalid preparation: {message}"),
+            Self::Io {
+                action,
+                path,
+                source,
+            } => write!(f, "failed to {action} {}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for ArchiveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArchiveCleanupFailed { extraction, .. } => Some(extraction.as_ref()),
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 type ArchivePrepared<I, E, A> = Prepared<I, ArchiveTree<A>, EvidenceChain<E, ArchiveEvidence<A>>>;
 
@@ -281,7 +380,7 @@ impl<A> ArchivePrepare<A> {
 }
 
 impl<I, S, E, A> Apply<Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, E>> for LocalApply {
-    type Error = PulithError;
+    type Error = LocalError;
     type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
 
     fn apply(
@@ -303,7 +402,7 @@ macro_rules! impl_archive_prepare {
         impl<I, E> Prepare<Acquired<I, LocalMaterial, E>, ArchivePolicy>
             for ArchivePrepare<$archive>
         {
-            type Error = PulithError;
+            type Error = ArchiveError;
             type Output = ArchivePrepared<I, E, $archive>;
 
             fn prepare(
@@ -325,7 +424,7 @@ macro_rules! impl_archive_prepare {
         impl<I, E> Prepare<Verified<I, LocalMaterial, E>, ArchivePolicy>
             for ArchivePrepare<$archive>
         {
-            type Error = PulithError;
+            type Error = ArchiveError;
             type Output = ArchivePrepared<I, E, $archive>;
 
             fn prepare(
@@ -363,10 +462,10 @@ fn prepare_archive<I, E, A>(
     previous_evidence: E,
     root: &Path,
     policy: ArchivePolicy,
-    extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence<A>, PulithError>,
-) -> Result<ArchivePrepared<I, E, A>, PulithError> {
+    extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence<A>, ArchiveError>,
+) -> Result<ArchivePrepared<I, E, A>, ArchiveError> {
     if let LocalMaterial::Directory { path } = &material {
-        return Err(PulithError::ArchiveRequiresFile(path.clone()));
+        return Err(ArchiveError::ArchiveRequiresFile(path.clone()));
     }
 
     let root = root.to_path_buf();
@@ -391,12 +490,12 @@ fn prepare_archive<I, E, A>(
 
 fn combine_archive_failure(
     workspace: &Path,
-    extraction: PulithError,
-    cleanup: Result<(), PulithError>,
-) -> PulithError {
+    extraction: ArchiveError,
+    cleanup: Result<(), ArchiveError>,
+) -> ArchiveError {
     match cleanup {
         Ok(()) => extraction,
-        Err(cleanup) => PulithError::ArchiveCleanupFailed {
+        Err(cleanup) => ArchiveError::ArchiveCleanupFailed {
             workspace: workspace.to_path_buf(),
             extraction: Box::new(extraction),
             cleanup: Box::new(cleanup),
@@ -409,11 +508,11 @@ fn extract_zip(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Zip>, PulithError> {
+) -> Result<ArchiveEvidence<Zip>, ArchiveError> {
     let file = File::open(archive_path)
-        .map_err(|err| PulithError::io("open zip archive", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open zip archive", archive_path, err))?;
     let mut archive = zip::ZipArchive::new(file)
-        .map_err(|err| PulithError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
+        .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
     let mut evidence = ArchiveEvidence::empty(root);
     let mut paths = BTreeMap::new();
 
@@ -423,10 +522,10 @@ fn extract_zip(
 
         let mut file = archive
             .by_index(index)
-            .map_err(|err| PulithError::InvalidPreparation(format!("invalid zip entry: {err}")))?;
+            .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip entry: {err}")))?;
         let enclosed = file
             .enclosed_name()
-            .ok_or_else(|| PulithError::ArchiveInvalidPath(file.name().to_string()))?;
+            .ok_or_else(|| ArchiveError::ArchiveInvalidPath(file.name().to_string()))?;
         let Some(relative) = sanitize_relative(&enclosed, policy.strip_components)? else {
             continue;
         };
@@ -436,7 +535,7 @@ fn extract_zip(
 
         if is_zip_symlink(file.unix_mode()) {
             evidence.symlinks += 1;
-            return Err(PulithError::UnsupportedArchiveEntry(relative));
+            return Err(ArchiveError::UnsupportedArchiveEntry(relative));
         }
 
         let kind = if file.is_dir() {
@@ -449,14 +548,14 @@ fn extract_zip(
         if kind == ArchiveEntryKind::Directory {
             evidence.directories += 1;
             fs::create_dir_all(&target)
-                .map_err(|err| PulithError::io("create archive directory", &target, err))?;
+                .map_err(|err| ArchiveError::io("create archive directory", &target, err))?;
             continue;
         }
 
         let declared = file.size();
         check_limit("entry-bytes", declared, policy.max_entry_bytes)?;
         let declared_total = evidence.total_bytes.checked_add(declared).ok_or(
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual: u64::MAX,
                 max: policy.max_total_bytes.unwrap_or(u64::MAX),
@@ -466,7 +565,7 @@ fn extract_zip(
 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
-                .map_err(|err| PulithError::io("create archive file parent", parent, err))?;
+                .map_err(|err| ArchiveError::io("create archive file parent", parent, err))?;
         }
         let observed = copy_archive_file(
             &mut file,
@@ -482,7 +581,7 @@ fn extract_zip(
         )?;
         evidence.files += 1;
         evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual: u64::MAX,
                 max: policy.max_total_bytes.unwrap_or(u64::MAX),
@@ -499,9 +598,9 @@ fn extract_tar_plain(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Plain>>, PulithError> {
+) -> Result<ArchiveEvidence<Tar<Plain>>, ArchiveError> {
     let file = File::open(archive_path)
-        .map_err(|err| PulithError::io("open tar archive", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open tar archive", archive_path, err))?;
     extract_tar_reader(file, root, policy)
 }
 
@@ -510,9 +609,9 @@ fn extract_tar_gzip(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Gzip>>, PulithError> {
+) -> Result<ArchiveEvidence<Tar<Gzip>>, ArchiveError> {
     let file = File::open(archive_path)
-        .map_err(|err| PulithError::io("open gzip tar archive", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open gzip tar archive", archive_path, err))?;
     extract_tar_reader(flate2::read::GzDecoder::new(file), root, policy)
 }
 
@@ -521,9 +620,9 @@ fn extract_tar_xz(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Xz>>, PulithError> {
+) -> Result<ArchiveEvidence<Tar<Xz>>, ArchiveError> {
     let file = File::open(archive_path)
-        .map_err(|err| PulithError::io("open xz tar archive", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open xz tar archive", archive_path, err))?;
     extract_tar_reader(xz2::read::XzDecoder::new(file), root, policy)
 }
 
@@ -532,11 +631,11 @@ fn extract_tar_zstd(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Zstd>>, PulithError> {
+) -> Result<ArchiveEvidence<Tar<Zstd>>, ArchiveError> {
     let file = File::open(archive_path)
-        .map_err(|err| PulithError::io("open zstd tar archive", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open zstd tar archive", archive_path, err))?;
     let decoder = zstd::stream::Decoder::new(file)
-        .map_err(|err| PulithError::io("open zstd tar decoder", archive_path, err))?;
+        .map_err(|err| ArchiveError::io("open zstd tar decoder", archive_path, err))?;
     extract_tar_reader(decoder, root, policy)
 }
 
@@ -545,7 +644,7 @@ fn extract_tar_reader<A, R: Read>(
     reader: R,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<A>, PulithError> {
+) -> Result<ArchiveEvidence<A>, ArchiveError> {
     let reader = DecodedLimitReader::new(reader, policy.max_decoded_bytes);
     let mut archive = tar::Archive::new(reader);
     let mut evidence = ArchiveEvidence::empty(root);
@@ -573,7 +672,7 @@ fn extract_tar_reader<A, R: Read>(
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             evidence.symlinks += 1;
-            return Err(PulithError::UnsupportedArchiveEntry(relative));
+            return Err(ArchiveError::UnsupportedArchiveEntry(relative));
         }
 
         let kind = if entry_type.is_dir() {
@@ -581,21 +680,21 @@ fn extract_tar_reader<A, R: Read>(
         } else if entry_type.is_file() {
             ArchiveEntryKind::File
         } else {
-            return Err(PulithError::UnsupportedArchiveEntry(relative));
+            return Err(ArchiveError::UnsupportedArchiveEntry(relative));
         };
         record_archive_path(&mut paths, &relative, kind)?;
 
         if kind == ArchiveEntryKind::Directory {
             evidence.directories += 1;
             fs::create_dir_all(&target)
-                .map_err(|err| PulithError::io("create archive directory", &target, err))?;
+                .map_err(|err| ArchiveError::io("create archive directory", &target, err))?;
             continue;
         }
 
         let declared = entry.size();
         check_limit("entry-bytes", declared, policy.max_entry_bytes)?;
         let declared_total = evidence.total_bytes.checked_add(declared).ok_or(
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual: u64::MAX,
                 max: policy.max_total_bytes.unwrap_or(u64::MAX),
@@ -605,7 +704,7 @@ fn extract_tar_reader<A, R: Read>(
 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
-                .map_err(|err| PulithError::io("create archive file parent", parent, err))?;
+                .map_err(|err| ArchiveError::io("create archive file parent", parent, err))?;
         }
         let observed = copy_archive_file(
             &mut entry,
@@ -621,7 +720,7 @@ fn extract_tar_reader<A, R: Read>(
         )?;
         evidence.files += 1;
         evidence.total_bytes = evidence.total_bytes.checked_add(observed).ok_or(
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual: u64::MAX,
                 max: policy.max_total_bytes.unwrap_or(u64::MAX),
@@ -642,10 +741,10 @@ fn record_archive_path(
     paths: &mut BTreeMap<PathBuf, ArchiveEntryKind>,
     path: &Path,
     kind: ArchiveEntryKind,
-) -> Result<(), PulithError> {
+) -> Result<(), ArchiveError> {
     let key = archive_collision_key(path);
     if paths.contains_key(&key) {
-        return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+        return Err(ArchiveError::ArchivePathConflict(path.to_path_buf()));
     }
 
     for ancestor in key
@@ -654,7 +753,7 @@ fn record_archive_path(
         .filter(|ancestor| !ancestor.as_os_str().is_empty())
     {
         if paths.get(ancestor) == Some(&ArchiveEntryKind::File) {
-            return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+            return Err(ArchiveError::ArchivePathConflict(path.to_path_buf()));
         }
     }
 
@@ -663,7 +762,7 @@ fn record_archive_path(
             .keys()
             .any(|existing| existing != &key && existing.starts_with(&key))
     {
-        return Err(PulithError::ArchivePathConflict(path.to_path_buf()));
+        return Err(ArchiveError::ArchivePathConflict(path.to_path_buf()));
     }
 
     paths.insert(key, kind);
@@ -685,7 +784,7 @@ fn copy_archive_file<R: Read>(
     relative: &Path,
     declared: u64,
     limits: ArchiveCopyLimits,
-) -> Result<u64, PulithError> {
+) -> Result<u64, ArchiveError> {
     let ArchiveCopyLimits {
         observed_total,
         max_entry,
@@ -693,7 +792,7 @@ fn copy_archive_file<R: Read>(
         max_decoded,
     } = limits;
     let mut output =
-        File::create(target).map_err(|err| PulithError::io("create archive file", target, err))?;
+        File::create(target).map_err(|err| ArchiveError::io("create archive file", target, err))?;
     let total_remaining = max_total.map(|max| max.saturating_sub(observed_total));
     let decoded_remaining = max_decoded.map(|max| max.saturating_sub(observed_total));
     let remaining = match (max_entry, total_remaining, decoded_remaining) {
@@ -724,7 +823,7 @@ fn copy_archive_file<R: Read>(
     {
         drop(output);
         let _ = fs::remove_file(target);
-        return Err(PulithError::ArchiveLimitExceeded {
+        return Err(ArchiveError::ArchiveLimitExceeded {
             limit: "entry-bytes",
             actual: observed,
             max,
@@ -736,7 +835,7 @@ fn copy_archive_file<R: Read>(
         if actual > max {
             drop(output);
             let _ = fs::remove_file(target);
-            return Err(PulithError::ArchiveLimitExceeded {
+            return Err(ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual,
                 max,
@@ -749,7 +848,7 @@ fn copy_archive_file<R: Read>(
         if actual > max {
             drop(output);
             let _ = fs::remove_file(target);
-            return Err(PulithError::ArchiveLimitExceeded {
+            return Err(ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual,
                 max,
@@ -760,7 +859,7 @@ fn copy_archive_file<R: Read>(
     if observed != declared {
         drop(output);
         let _ = fs::remove_file(target);
-        return Err(PulithError::ArchiveSizeMismatch {
+        return Err(ArchiveError::ArchiveSizeMismatch {
             path: relative.to_path_buf(),
             declared,
             observed,
@@ -770,12 +869,12 @@ fn copy_archive_file<R: Read>(
     Ok(observed)
 }
 
-fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> PulithError {
+fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> ArchiveError {
     if let Some(limit) = error
         .get_ref()
         .and_then(|source| source.downcast_ref::<DecodedLimitExceeded>())
     {
-        return PulithError::ArchiveLimitExceeded {
+        return ArchiveError::ArchiveLimitExceeded {
             limit: "decoded-bytes",
             actual: limit.actual,
             max: limit.max,
@@ -785,7 +884,7 @@ fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> Puli
     let mut source: &(dyn std::error::Error + 'static) = &error;
     loop {
         if let Some(limit) = source.downcast_ref::<DecodedLimitExceeded>() {
-            return PulithError::ArchiveLimitExceeded {
+            return ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual: limit.actual,
                 max: limit.max,
@@ -796,36 +895,39 @@ fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> Puli
         };
         source = next;
     }
-    PulithError::io(action, path, error)
+    ArchiveError::io(action, path, error)
 }
 
-fn check_limit(limit: &'static str, actual: u64, max: Option<u64>) -> Result<(), PulithError> {
+fn check_limit(limit: &'static str, actual: u64, max: Option<u64>) -> Result<(), ArchiveError> {
     if let Some(max) = max
         && actual > max
     {
-        return Err(PulithError::ArchiveLimitExceeded { limit, actual, max });
+        return Err(ArchiveError::ArchiveLimitExceeded { limit, actual, max });
     }
     Ok(())
 }
 
-fn reset_extract_root(root: &Path) -> Result<(), PulithError> {
+fn reset_extract_root(root: &Path) -> Result<(), ArchiveError> {
     if let Ok(metadata) = fs::symlink_metadata(root) {
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            return Err(PulithError::UnsupportedArchiveEntry(root.to_path_buf()));
+            return Err(ArchiveError::UnsupportedArchiveEntry(root.to_path_buf()));
         }
         if file_type.is_dir() {
             fs::remove_dir_all(root)
-                .map_err(|err| PulithError::io("clear archive root", root, err))?;
+                .map_err(|err| ArchiveError::io("clear archive root", root, err))?;
         } else {
             fs::remove_file(root)
-                .map_err(|err| PulithError::io("clear archive root file", root, err))?;
+                .map_err(|err| ArchiveError::io("clear archive root file", root, err))?;
         }
     }
-    fs::create_dir_all(root).map_err(|err| PulithError::io("create archive root", root, err))
+    fs::create_dir_all(root).map_err(|err| ArchiveError::io("create archive root", root, err))
 }
 
-fn sanitize_relative(path: &Path, strip_components: usize) -> Result<Option<PathBuf>, PulithError> {
+fn sanitize_relative(
+    path: &Path,
+    strip_components: usize,
+) -> Result<Option<PathBuf>, ArchiveError> {
     let mut relative = PathBuf::new();
     let mut seen = 0usize;
 
@@ -839,7 +941,7 @@ fn sanitize_relative(path: &Path, strip_components: usize) -> Result<Option<Path
                 seen += 1;
             }
             Component::CurDir => {}
-            other => return Err(PulithError::ArchiveInvalidPath(format!("{other:?}"))),
+            other => return Err(ArchiveError::ArchiveInvalidPath(format!("{other:?}"))),
         }
     }
 
@@ -851,7 +953,7 @@ fn sanitize_relative(path: &Path, strip_components: usize) -> Result<Option<Path
 }
 
 #[cfg(windows)]
-fn validate_archive_component(component: &OsStr) -> Result<(), PulithError> {
+fn validate_archive_component(component: &OsStr) -> Result<(), ArchiveError> {
     let value = component.to_string_lossy();
     let has_forbidden_character = value
         .chars()
@@ -879,29 +981,29 @@ fn validate_archive_component(component: &OsStr) -> Result<(), PulithError> {
     });
 
     if has_forbidden_character || has_unsafe_suffix || is_device {
-        return Err(PulithError::ArchiveInvalidPath(value.into_owned()));
+        return Err(ArchiveError::ArchiveInvalidPath(value.into_owned()));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn validate_archive_component(_component: &std::ffi::OsStr) -> Result<(), PulithError> {
+fn validate_archive_component(_component: &std::ffi::OsStr) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-fn ensure_under_root(root: &Path, target: &Path) -> Result<(), PulithError> {
+fn ensure_under_root(root: &Path, target: &Path) -> Result<(), ArchiveError> {
     if !target.starts_with(root) {
-        return Err(PulithError::ArchiveInvalidPath(
+        return Err(ArchiveError::ArchiveInvalidPath(
             target.display().to_string(),
         ));
     }
     Ok(())
 }
 
-fn reject_existing_symlink_path(root: &Path, target: &Path) -> Result<(), PulithError> {
+fn reject_existing_symlink_path(root: &Path, target: &Path) -> Result<(), ArchiveError> {
     let relative = target
         .strip_prefix(root)
-        .map_err(|_| PulithError::ArchiveInvalidPath(target.display().to_string()))?;
+        .map_err(|_| ArchiveError::ArchiveInvalidPath(target.display().to_string()))?;
     let mut cursor = root.to_path_buf();
     for component in relative.components() {
         if let Component::Normal(part) = component {
@@ -909,7 +1011,7 @@ fn reject_existing_symlink_path(root: &Path, target: &Path) -> Result<(), Pulith
             if let Ok(metadata) = fs::symlink_metadata(&cursor)
                 && metadata.file_type().is_symlink()
             {
-                return Err(PulithError::UnsupportedArchiveEntry(cursor));
+                return Err(ArchiveError::UnsupportedArchiveEntry(cursor));
             }
         }
     }
@@ -928,11 +1030,13 @@ mod tests {
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
 
-    use super::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip, combine_archive_failure};
+    use super::{
+        ArchiveError, ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip, combine_archive_failure,
+    };
     use crate::local::{
         LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
     };
-    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare, PulithError};
+    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -947,8 +1051,8 @@ mod tests {
     #[test]
     fn archive_failure_preserves_cleanup_error() {
         let workspace = PathBuf::from("extract");
-        let extraction = PulithError::InvalidPreparation("broken archive".into());
-        let cleanup = PulithError::io(
+        let extraction = ArchiveError::InvalidPreparation("broken archive".into());
+        let cleanup = ArchiveError::io(
             "clear archive root",
             &workspace,
             io::Error::new(io::ErrorKind::PermissionDenied, "locked"),
@@ -967,13 +1071,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            PulithError::ArchiveCleanupFailed {
+            ArchiveError::ArchiveCleanupFailed {
                 workspace: path,
                 extraction,
                 cleanup,
             } if path == workspace
-                && matches!(*extraction, PulithError::InvalidPreparation(_))
-                && matches!(*cleanup, PulithError::Io { .. })
+                && matches!(*extraction, ArchiveError::InvalidPreparation(_))
+                && matches!(*cleanup, ArchiveError::Io { .. })
         ));
     }
 
@@ -1067,7 +1171,7 @@ mod tests {
                 "archive",
                 LocalPath::new(zip_path),
                 LocalTarget::new(target),
-                MaterializeMode::CreateOrReplace,
+                MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
         assert!(root.exists());
@@ -1215,7 +1319,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "entry-count",
                 ..
             }
@@ -1235,7 +1339,7 @@ mod tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
-        assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
+        assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1252,7 +1356,7 @@ mod tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
-        assert!(matches!(err, PulithError::UnsupportedArchiveEntry(_)));
+        assert!(matches!(err, ArchiveError::UnsupportedArchiveEntry(_)));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1270,7 +1374,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 ..
             }
@@ -1293,7 +1397,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 actual: 5,
                 max: 4,
@@ -1318,7 +1422,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
+            ArchiveError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
         ));
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
@@ -1339,7 +1443,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
+            ArchiveError::ArchivePathConflict(path) if path == Path::new("foo/child.txt")
         ));
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
@@ -1368,7 +1472,7 @@ mod tests {
                 .prepare(verified, ArchivePolicy::default())
                 .unwrap_err();
 
-            assert!(matches!(err, PulithError::ArchiveInvalidPath(_)), "{name}");
+            assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)), "{name}");
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
             fs::remove_dir_all(root).unwrap();
         }
@@ -1389,7 +1493,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "entry-bytes",
                 actual: 4,
                 max: 3,
@@ -1434,11 +1538,11 @@ mod tar_tests {
     use super::Xz;
     #[cfg(feature = "zstd")]
     use super::Zstd;
-    use super::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Tar};
+    use super::{ArchiveError, ArchivePolicy, ArchivePrepare, ExtractWorkspace, Tar};
     use crate::local::{
         LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
     };
-    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare, PulithError};
+    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1567,7 +1671,7 @@ mod tar_tests {
                 "archive",
                 LocalPath::new(tar_path),
                 LocalTarget::new(target),
-                MaterializeMode::CreateOrReplace,
+                MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
         assert!(root.exists());
@@ -1642,7 +1746,7 @@ mod tar_tests {
 
         assert!(matches!(
             error,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual: 1,
                 max: 0,
@@ -1687,7 +1791,7 @@ mod tar_tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual,
                 max,
@@ -1714,7 +1818,7 @@ mod tar_tests {
 
         assert!(matches!(
             error,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual: 513,
                 max: 512,
@@ -1741,7 +1845,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "entry-count",
                 ..
             }
@@ -1764,7 +1868,7 @@ mod tar_tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
-        assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
+        assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1790,7 +1894,7 @@ mod tar_tests {
                 )
                 .unwrap_err();
 
-            assert!(matches!(error, PulithError::ArchiveInvalidPath(_)));
+            assert!(matches!(error, ArchiveError::ArchiveInvalidPath(_)));
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
             fs::remove_dir_all(root).unwrap();
         }
@@ -1818,7 +1922,7 @@ mod tar_tests {
                 )
                 .unwrap_err();
 
-            assert!(matches!(error, PulithError::ArchiveInvalidPath(_)));
+            assert!(matches!(error, ArchiveError::ArchiveInvalidPath(_)));
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
             fs::remove_dir_all(root).unwrap();
         }
@@ -1838,7 +1942,7 @@ mod tar_tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
-        assert!(matches!(err, PulithError::UnsupportedArchiveEntry(_)));
+        assert!(matches!(err, ArchiveError::UnsupportedArchiveEntry(_)));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1856,7 +1960,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 ..
             }
@@ -1882,7 +1986,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchivePathConflict(path) if path == Path::new("payload.txt")
+            ArchiveError::ArchivePathConflict(path) if path == Path::new("payload.txt")
         ));
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
@@ -1903,7 +2007,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveSizeMismatch {
+            ArchiveError::ArchiveSizeMismatch {
                 path,
                 declared: 8,
                 observed: 4,
@@ -1928,7 +2032,7 @@ mod tar_tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, PulithError::Io { .. }), "{error:?}");
+        assert!(matches!(error, ArchiveError::Io { .. }), "{error:?}");
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1997,7 +2101,7 @@ mod tar_tests {
             .prepare(verified, ArchivePolicy::default())
             .unwrap_err();
 
-        assert!(matches!(err, PulithError::ArchiveInvalidPath(_)));
+        assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2017,7 +2121,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "total-bytes",
                 ..
             }
@@ -2050,7 +2154,7 @@ mod tar_tests {
         assert!(
             matches!(
                 err,
-                PulithError::ArchiveLimitExceeded {
+                ArchiveError::ArchiveLimitExceeded {
                     limit: "decoded-bytes",
                     actual: 1025,
                     max: 1024,
@@ -2084,7 +2188,7 @@ mod tar_tests {
 
         assert!(matches!(
             err,
-            PulithError::ArchiveLimitExceeded {
+            ArchiveError::ArchiveLimitExceeded {
                 limit: "decoded-bytes",
                 actual: 1025,
                 max: 1024,

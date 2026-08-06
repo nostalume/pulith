@@ -106,7 +106,7 @@ fn external_acquire_composes_with_builtin_verify_and_apply() {
         "external",
         ExternalSource(source.clone()),
         LocalTarget::new(&target),
-        MaterializeMode::Create,
+        MaterializeMode::CreateNew,
     );
     let acquired = ExternalAcquire.acquire(request).unwrap();
     let staged_path = match &acquired.material {
@@ -149,7 +149,7 @@ fn external_middle_transition_consumes_and_rebuilds_canonical_state() {
             "external",
             ExternalSource(source),
             LocalTarget::new(&target),
-            MaterializeMode::Create,
+            MaterializeMode::CreateNew,
         ))
         .unwrap();
     let staged_path = match &acquired.material {

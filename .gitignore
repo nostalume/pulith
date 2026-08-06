@@ -1,4 +1,6 @@
 target/
 *cache*
 .tmp
-.hermes/
+.agents/
+.reasonix/
+reasonix.toml
