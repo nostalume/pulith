@@ -1,3 +1,10 @@
+//! Local publication: `LocalApply`, `Forget`, and the apply evidence records.
+//!
+//! Owns the exact single-target effect law: staged publication with an explicit `MaterializeMode`
+//! commit boundary, and direct idempotent removal for `Forget`. It never republishes, follows
+//! links, claims ownership, or retries. Evidence (`ApplyEvidence`, `LocalPlacement`,
+//! `LocalApplyStats`) is adapter-attested effect data, not an authorization. Feature-gated on
+//! `local`.
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};

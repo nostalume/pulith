@@ -1,3 +1,9 @@
+//! ZIP/TAR preparation into an exclusive guarded scratch tree.
+//!
+//! Owns archive-extraction semantics: entry paths, entry types, decoded and materialized limits,
+//! and path-escape guards. Preparation returns a crate-constructed `ArchiveTree` whose root is
+//! readable by reference; the final destination is never touched. Feature-gated on `zip`/`tar`
+//! (with gzip/xz/zstd codecs composing tar).
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::ffi::OsStr;

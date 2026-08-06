@@ -65,8 +65,8 @@ jobs:
       - name: Test exact local artifact intersections
         shell: bash
         run: |
-          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,blake3 --test hash_local_public_api
-          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,sha2 --test hash_local_public_api
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,blake3 --test hash
+          RUSTFLAGS="-D warnings" cargo test --no-default-features --features local,sha2 --test hash
 
       - name: Check package contents
         run: |

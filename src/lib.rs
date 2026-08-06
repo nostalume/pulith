@@ -97,7 +97,7 @@
 //! existing directory-symlink view and switches only that name to a completed published directory.
 //! Unix uses a same-parent native rename; Windows uses `FileRenameInfoEx` with POSIX replacement
 //! semantics. It does not publish a target, retain a prior generation, persist active state, or
-//! fall back to deletion/recreation, a junction, or a copy.//!
+//! fall back to deletion/recreation, a junction, or a copy.
 
 #![cfg_attr(
     not(feature = "http-async"),

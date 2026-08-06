@@ -1,3 +1,9 @@
+//! Local activation and active-view switch: `LocalActivate` and `LocalSwitch`.
+//!
+//! Owns the exposure law: one directory symlink per activation, native replacement of exactly one
+//! existing directory-symlink view for the switch, and read-only post-observation of the exposed
+//! view. It never copies the tree, publishes a target, retains a prior generation, or persists
+//! active state. Platform-specific link mechanics are cfg-split here. Feature-gated on `local`.
 use std::fmt;
 use std::fs;
 #[cfg(windows)]

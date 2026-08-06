@@ -1,3 +1,11 @@
+//! Local adapter facade: acquire, staged apply, activation, inspection, and pure reconciliation.
+//!
+//! This module owns the local filesystem semantics: entry-kind classification without following
+//! links, private staged-tree custody, single-target publication, create-only activation, and the
+//! explicit active-view switch. It never claims package ownership, durable manager state, or
+//! automatic repair. Concrete publication lives in `local/apply.rs` and activation in
+//! `local/view.rs`; this facade re-exports their public vocabulary. The whole module is
+//! feature-gated on `local`.
 use std::fmt;
 use std::fs;
 #[cfg(any(feature = "blake3", feature = "sha2"))]
