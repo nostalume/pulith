@@ -1,11 +1,11 @@
 #![cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 
 use pulith::Inspected;
-use pulith::hash::LocalArtifactObservation;
 use pulith::hash::{
     ArtifactDescriptor, ArtifactInspectEvidence, ArtifactReconcile, ArtifactReconciliation,
-    HashInspect,
+    HashInspect, HashMaterializeInspect,
 };
+use pulith::local::LocalArtifactObservation;
 #[cfg(feature = "blake3")]
 use pulith::local::LocalEntryKind;
 use pulith::local::LocalTarget;
@@ -26,7 +26,7 @@ fn exact_evidence_and_reconcile_do_not_require_marker_traits() {
     let inspected = Inspected {
         input: LocalTarget::new("external-target"),
         observation: LocalArtifactObservation::File {
-            descriptor: ArtifactDescriptor::<NonTraitAlgorithm>::new("observed", 1),
+            attestation: ArtifactDescriptor::<NonTraitAlgorithm>::new("observed", 1),
         },
         evidence: ExternalEvidence,
     };
@@ -61,7 +61,7 @@ fn blake3_inspect_and_reconcile_exact_regular_file() {
     assert_eq!(
         inspected.observation,
         LocalArtifactObservation::File {
-            descriptor: blake3_descriptor(b"pulith")
+            attestation: blake3_descriptor(b"pulith")
         }
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"pulith");
@@ -141,7 +141,7 @@ fn missing_and_directory_are_observations() {
 #[test]
 fn reconcile_preserves_external_inspection_evidence() {
     let observation = LocalArtifactObservation::File {
-        descriptor: blake3_descriptor(b"pulith"),
+        attestation: blake3_descriptor(b"pulith"),
     };
     let expected_observation = observation.clone();
     let inspected = Inspected {
@@ -169,8 +169,8 @@ fn final_symlink_and_dangling_symlink_are_wrong_kind() {
     let link = root.path().join("link");
     let dangling = root.path().join("dangling");
     std::fs::write(&target, b"secret").unwrap();
-    create_file_symlink(&target, &link).unwrap();
-    create_file_symlink(root.path().join("absent"), &dangling).unwrap();
+    crate::common::file_symlink(&target, &link).unwrap();
+    crate::common::file_symlink(root.path().join("absent"), &dangling).unwrap();
     for path in [link, dangling] {
         let inspected = HashInspect::<pulith::hash::Blake3>::new()
             .inspect(LocalTarget::new(path))
@@ -195,7 +195,7 @@ fn parent_symlink_is_followed_within_trusted_parent_boundary() {
     let linked = root.path().join("linked");
     std::fs::create_dir(&real).unwrap();
     std::fs::write(real.join("artifact"), b"pulith").unwrap();
-    create_dir_symlink(&real, &linked).unwrap();
+    crate::common::dir_symlink(&real, &linked).unwrap();
     let inspected = HashInspect::<pulith::hash::Blake3>::new()
         .inspect(LocalTarget::new(linked.join("artifact")))
         .unwrap();
@@ -270,31 +270,146 @@ fn sha256_inspect_and_reconcile_exact_regular_file() {
     assert_eq!(reconciled.reconciliation, ArtifactReconciliation::Matches);
 }
 
-#[cfg(all(unix, feature = "blake3"))]
-fn create_file_symlink(
-    original: impl AsRef<std::path::Path>,
-    link: impl AsRef<std::path::Path>,
-) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
+#[cfg(feature = "blake3")]
+#[test]
+fn materialize_inspection_preserves_receipt_and_observes_later_drift() {
+    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
+    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    std::fs::write(&source, b"pulith").unwrap();
+    let applied = LocalApply
+        .apply(
+            LocalAcquire
+                .acquire(Materialize::new(
+                    "hash-materialize-inspect",
+                    LocalPath::new(&source),
+                    LocalTarget::new(&target),
+                    MaterializeMode::CreateNew,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+    let apply_evidence = applied.evidence.clone();
+    std::fs::write(&target, b"PULITH").unwrap();
+
+    let inspected = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+        .inspect(applied)
+        .unwrap();
+    assert_eq!(inspected.evidence.previous, apply_evidence);
+    assert_eq!(
+        inspected.observation,
+        LocalArtifactObservation::File {
+            attestation: blake3_descriptor(b"PULITH"),
+        }
+    );
+    let reconciled = ArtifactReconcile
+        .reconcile(inspected, blake3_descriptor(b"pulith"))
+        .unwrap();
+    assert!(matches!(
+        reconciled.reconciliation,
+        ArtifactReconciliation::DigestMismatch { .. }
+    ));
 }
-#[cfg(all(windows, feature = "blake3"))]
-fn create_file_symlink(
-    original: impl AsRef<std::path::Path>,
-    link: impl AsRef<std::path::Path>,
-) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(original, link)
+
+#[cfg(feature = "blake3")]
+#[test]
+fn materialize_inspection_error_retains_completed_receipt() {
+    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
+    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    std::fs::write(&source, b"pulith").unwrap();
+    let mut applied = LocalApply
+        .apply(
+            LocalAcquire
+                .acquire(Materialize::new(
+                    "hash-materialize-inspect-error",
+                    LocalPath::new(&source),
+                    LocalTarget::new(&target),
+                    MaterializeMode::CreateNew,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+    applied.input.target.path.push("\0");
+    let invalid_target = applied.input.target.path.clone();
+
+    let error = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+        .inspect(applied)
+        .unwrap_err();
+    assert_eq!(error.applied.input.target.path, invalid_target);
+    assert!(matches!(
+        error.cause,
+        pulith::hash::HashError::LocalArtifact { path, .. } if path == invalid_target
+    ));
 }
-#[cfg(all(unix, feature = "blake3"))]
-fn create_dir_symlink(
-    original: impl AsRef<std::path::Path>,
-    link: impl AsRef<std::path::Path>,
-) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(original, link)
+#[cfg(feature = "blake3")]
+#[test]
+fn materialize_inspection_classifies_later_symlink_without_hashing_it() {
+    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
+    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    std::fs::write(&source, b"pulith").unwrap();
+    let applied = LocalApply
+        .apply(
+            LocalAcquire
+                .acquire(Materialize::new(
+                    "hash-materialize-inspect-symlink",
+                    LocalPath::new(&source),
+                    LocalTarget::new(&target),
+                    MaterializeMode::CreateNew,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+    std::fs::remove_file(&target).unwrap();
+    crate::common::file_symlink(&source, &target).unwrap();
+
+    let inspected = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+        .inspect(applied)
+        .unwrap();
+    assert_eq!(inspected.observation, LocalArtifactObservation::Symlink);
 }
-#[cfg(all(windows, feature = "blake3"))]
-fn create_dir_symlink(
-    original: impl AsRef<std::path::Path>,
-    link: impl AsRef<std::path::Path>,
-) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(original, link)
+
+#[cfg(feature = "sha2")]
+#[test]
+fn sha256_materialize_inspection_attests_final_file() {
+    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
+    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    std::fs::write(&source, b"pulith").unwrap();
+    let applied = LocalApply
+        .apply(
+            LocalAcquire
+                .acquire(Materialize::new(
+                    "sha256-hash-materialize-inspect",
+                    LocalPath::new(&source),
+                    LocalTarget::new(&target),
+                    MaterializeMode::CreateNew,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+
+    let inspected = HashMaterializeInspect::<pulith::hash::Sha256>::new()
+        .inspect(applied)
+        .unwrap();
+    assert_eq!(
+        inspected.observation,
+        LocalArtifactObservation::File {
+            attestation: ArtifactDescriptor::new(hex::encode(Sha256::digest(b"pulith")), 6),
+        }
+    );
 }

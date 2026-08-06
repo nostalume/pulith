@@ -3,7 +3,7 @@
 use pulith::net::{RemoteUrl, RemoteUrlError};
 
 #[test]
-fn public_remote_url_uses_resource_specific_errors() {
+fn remote_url_uses_resource_specific_errors() {
     assert!(matches!(
         RemoteUrl::parse("file:///tmp/pulith"),
         Err(RemoteUrlError::UnsupportedScheme { .. })
@@ -16,7 +16,7 @@ fn public_remote_url_uses_resource_specific_errors() {
 
 #[cfg(feature = "http-sync")]
 #[test]
-fn public_sync_http_inspect_implements_sync_inspection_contract() {
+fn sync_http_inspect_implements_inspection_contract() {
     use pulith::Inspect;
     use pulith::net::SyncHttpInspect;
 
@@ -27,7 +27,7 @@ fn public_sync_http_inspect_implements_sync_inspection_contract() {
 
 #[cfg(feature = "http-async")]
 #[test]
-fn public_async_http_inspect_implements_async_inspection_contract() {
+fn async_http_inspect_implements_inspection_contract() {
     use pulith::AsyncInspect;
     use pulith::net::AsyncHttpInspect;
 
@@ -38,7 +38,7 @@ fn public_async_http_inspect_implements_async_inspection_contract() {
 
 #[cfg(all(feature = "http-sync", feature = "local"))]
 #[test]
-fn public_sync_http_acquire_implements_destination_free_contract() {
+fn sync_http_acquire_implements_destination_free_contract() {
     use pulith::local::LocalTarget;
     use pulith::net::{RemoteSource, SyncHttpAcquire};
     use pulith::{Acquire, Materialize};
@@ -50,7 +50,7 @@ fn public_sync_http_acquire_implements_destination_free_contract() {
 
 #[cfg(all(feature = "http-async", feature = "local"))]
 #[test]
-fn public_async_http_acquire_implements_destination_free_contract() {
+fn async_http_acquire_implements_destination_free_contract() {
     use pulith::local::LocalTarget;
     use pulith::net::{AsyncHttpAcquire, RemoteSource};
     use pulith::{AsyncAcquire, Materialize};

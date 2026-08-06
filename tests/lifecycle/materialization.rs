@@ -1,13 +1,9 @@
 #![cfg(feature = "local")]
 
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
-use std::io::Read;
+use crate::common::HttpFixture;
 #[cfg(any(feature = "http-sync", feature = "http-async", feature = "zip"))]
 use std::io::Write;
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
-use std::net::TcpListener;
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
-use std::thread;
 
 #[cfg(any(feature = "http-sync", feature = "zip", feature = "tar"))]
 use pulith::Acquire;
@@ -36,43 +32,6 @@ use pulith::{Inspect, Reconcile};
 use pulith::{Materialize, MaterializeMode};
 
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
-struct HttpFixture {
-    url: String,
-    handle: thread::JoinHandle<()>,
-}
-
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
-impl HttpFixture {
-    fn get(body: &'static [u8]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1_024];
-            let _ = stream.read(&mut request).unwrap();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            stream.write_all(body).unwrap();
-            stream.flush().unwrap();
-        });
-        Self {
-            url: format!("http://{address}/artifact"),
-            handle,
-        }
-    }
-
-    fn join(self) {
-        self.handle.join().unwrap();
-    }
-}
-
 #[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
 fn descriptor(body: &[u8]) -> ArtifactDescriptor<Blake3> {
     ArtifactDescriptor::new(blake3::hash(body).to_hex().to_string(), body.len() as u64)
@@ -163,7 +122,7 @@ fn async_http_materialization_verification_and_reconciliation() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(AsyncHttpAcquire::default().acquire_async(request))
+        .block_on(AsyncHttpAcquire::default().acquire(request))
         .unwrap();
     server.join();
     assert!(!target.exists());

@@ -32,6 +32,8 @@ Materialize -> Acquired -> Applied
                         -> Prepared -> Applied
                         -> Verified -> Prepared -> Applied
 Forget -----------------------------> Applied
+Applied<..., LocalTarget> + PathBuf -> Activated
+Applied<..., LocalTarget> ----------> Inspected -> Reconciled
 LocalTarget -> Inspected -> Reconciled
 RemoteUrl  --> Inspected
 ```
@@ -51,6 +53,10 @@ The graph is an inductive composition vocabulary rather than one mandatory seque
 
 Verification and preparation are optional branches selected by the caller. Inspection and
 reconciliation form an observation path, not a hidden repair loop.
+
+`LocalPostInspect` is the only built-in join from a completed local effect into observation. It is
+resource-specific and optional: a failed later read preserves the completed `Applied` receipt rather
+than changing the apply result, and successful output still needs caller-owned reconciliation.
 
 ## Behavior contracts
 
@@ -128,11 +134,27 @@ target is a typed conflict and the winner remains unchanged. That conditional la
 regular-file creation; it is not generalized to directories, replacement, forgetting, or
 digest-based compare-and-swap.
 
+A caller may compose a prebuilt archive into an unlinked artifact tree through acquisition, optional
+verification, guarded preparation, and local publication. This neither selects an active view nor
+creates durable installation state. For directory `CreateNew`, callers own the existing target
+parent and target serialization; a quiescent existing target is a preflight conflict, not an atomic
+directory-store commit guarantee.
+
+Local activation is separately caller-composed from an existing materialization receipt: `LocalActivate`
+creates one missing directory symbolic link at the caller-supplied path to the published directory. It is not
+a second publication, version switch, shared-prefix linker, junction/copy fallback, or durable active
+record. The view parent and serialization remain caller-owned; a Windows directory-symlink capability
+failure is explicit. `LocalSwitch` is separately selected and requires an existing directory-symlink
+view: Unix uses same-parent native rename and Windows uses `FileRenameInfoEx` with POSIX replacement
+semantics. It changes only that name, retaining no generation and creating no durable active record;
+it never falls back to deletion/recreation, a junction, or a copy.
 ## Observation and convergence
 
 Observation preserves resource-specific meaning:
 
 - Cheap local inspection observes no-follow metadata only.
+- Local post-inspection performs that same metadata observation after a completed local apply or
+  forget receipt, preserving its prior evidence and never repairing or retrying the effect.
 - Exact local artifact inspection is an explicit full-read behavior that reports a typed digest and
   the bytes counted by the digest loop. It reads a regular-file handle, rejects links and other
   special entries, trusts parent directories, and is not an atomic snapshot under concurrent
