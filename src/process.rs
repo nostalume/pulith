@@ -1340,3 +1340,65 @@ fn fail_cleanup<T>(workspace: tempfile::TempDir, primary: ProcessError) -> Resul
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn absolute_program() -> PathBuf {
+        std::env::current_exe().expect("the test binary has a path")
+    }
+
+    #[test]
+    fn workspace_relative_path_rejects_parent_traversal() {
+        assert!(WorkspaceRelativePath::new("../outside").is_err());
+        assert!(WorkspaceRelativePath::new("tree").is_ok());
+    }
+
+    #[test]
+    fn explicit_environment_reserves_pulith_keys_and_rejects_duplicates() {
+        assert!(
+            ExplicitEnvironment::new([(
+                OsString::from("PULITH_OUTPUT_ROOT"),
+                OsString::from("outside"),
+            )])
+            .is_err()
+        );
+        assert!(
+            ExplicitEnvironment::new([(
+                OsString::from("PULITH_INPUT_ROOT"),
+                OsString::from("outside"),
+            )])
+            .is_err()
+        );
+        assert!(
+            ExplicitEnvironment::new([
+                (OsString::from("PULITH_TEST"), OsString::from("one")),
+                (OsString::from("PULITH_TEST"), OsString::from("two")),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_environment_reserves_keys_case_insensitively() {
+        assert!(
+            ExplicitEnvironment::new([(
+                OsString::from("pulith_output_root"),
+                OsString::from("outside"),
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cooperative_action_rejects_relative_program_and_zero_timeout() {
+        let output = WorkspaceRelativePath::new("tree").unwrap();
+        assert!(
+            ProcessAction::new("relative-program", output.clone(), Duration::from_secs(1)).is_err()
+        );
+        assert!(ProcessAction::new(absolute_program(), output, Duration::ZERO).is_err());
+    }
+}
