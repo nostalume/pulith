@@ -1,9 +1,10 @@
-//! Local activation and active-view switch: `LocalActivate` and `LocalSwitch`.
+//! Local activation and active-view switch: `LocalActivate`, `LocalSwitch`, and `LocalDeactivate`.
 //!
 //! Owns the exposure law: one directory symlink per activation, native replacement of exactly one
-//! existing directory-symlink view for the switch, and read-only post-observation of the exposed
-//! view. It never copies the tree, publishes a target, retains a prior generation, or persists
-//! active state. Platform-specific link mechanics are cfg-split here. Feature-gated on `local`.
+//! existing directory-symlink view for the switch, removal of exactly one directory-symlink view
+//! for the deactivation, and read-only post-observation of the exposed view. It never copies the
+//! tree, publishes a target, retains a prior generation, or persists active state.
+//! Platform-specific link mechanics are cfg-split here. Feature-gated on `local`.
 use std::fmt;
 use std::fs;
 #[cfg(windows)]
@@ -508,6 +509,213 @@ impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for 
         }
     }
 }
+/// Prior view state recorded by a deactivation: what was actually removed or absent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalDeactivatePrior {
+    /// A directory-symlink active view was removed.
+    DirectorySymlink,
+    /// No view existed at the path; the deactivation was a no-op.
+    Missing,
+}
+
+/// Evidence that one active directory-symlink view is no longer exposed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalDeactivateEvidence {
+    /// The view path that was deactivated.
+    pub view: PathBuf,
+    /// What the adapter actually removed (or that nothing existed).
+    pub prior: LocalDeactivatePrior,
+}
+
+/// Local active-view deactivation adapter: removes exactly one directory-symlink view.
+///
+/// The versioned tree the view pointed at is never touched. A missing view is an idempotent
+/// no-op (recorded as `LocalDeactivatePrior::Missing`); an entry that is not a directory-symlink
+/// view is refused with `LocalDeactivateError::NotActiveView` and left intact.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalDeactivate;
+
+type LocalDeactivated<E> = Activated<PathBuf, EvidenceChain<E, LocalDeactivateEvidence>>;
+
+/// Failure of a deliberate local active-view deactivation.
+#[derive(Debug)]
+pub enum LocalDeactivateError<N, E> {
+    /// The entry at the view path is not an active directory-symlink view; nothing was removed.
+    /// `observed` is the view observation, or for a symlink the observation of its resolved
+    /// target (a file symlink or dangling link is refused, not removed).
+    NotActiveView {
+        applied: Applied<N, E>,
+        view: PathBuf,
+        observed: LocalObservation,
+    },
+    BeforeDeactivate {
+        applied: Applied<N, E>,
+        view: PathBuf,
+        cause: LocalError,
+    },
+    AfterDeactivate {
+        deactivated: LocalDeactivated<E>,
+        cause: LocalError,
+    },
+}
+
+impl<N, E> fmt::Display for LocalDeactivateError<N, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotActiveView { .. } => f.write_str("active view is not a directory symlink"),
+            Self::BeforeDeactivate { cause, .. } => write!(f, "local deactivation failed: {cause}"),
+            Self::AfterDeactivate { cause, .. } => write!(
+                f,
+                "deactivation completed but post-observation failed: {cause}"
+            ),
+        }
+    }
+}
+
+impl<N: fmt::Debug, E: fmt::Debug> std::error::Error for LocalDeactivateError<N, E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeDeactivate { cause, .. } | Self::AfterDeactivate { cause, .. } => {
+                Some(cause)
+            }
+            Self::NotActiveView { .. } => None,
+        }
+    }
+}
+
+impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for LocalDeactivate {
+    type Error = LocalDeactivateError<Materialize<I, S, LocalTarget>, E>;
+    type Output = LocalDeactivated<E>;
+
+    fn activate(
+        &self,
+        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        view: PathBuf,
+    ) -> Result<Self::Output, Self::Error> {
+        let observed = match observe_activation_path(&view) {
+            Ok(observation) => observation,
+            Err(cause) => {
+                return Err(LocalDeactivateError::BeforeDeactivate {
+                    applied,
+                    view,
+                    cause,
+                });
+            }
+        };
+        match observed {
+            // Idempotent law: nothing to remove; record the truthful prior.
+            LocalObservation::Missing => {
+                return Ok(deactivate_receipt(
+                    view,
+                    applied.evidence,
+                    LocalDeactivatePrior::Missing,
+                ));
+            }
+            // Directory gate: only a symlink whose resolved target is a directory is a view.
+            LocalObservation::Symlink => {
+                let target = match fs::read_link(&view) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return Err(LocalDeactivateError::BeforeDeactivate {
+                            applied,
+                            view: view.clone(),
+                            cause: LocalError::io("read active directory symlink", &view, error),
+                        });
+                    }
+                };
+                match observe_activation_path(&target) {
+                    Ok(LocalObservation::Directory) => {}
+                    Ok(other) => {
+                        return Err(LocalDeactivateError::NotActiveView {
+                            applied,
+                            view,
+                            observed: other,
+                        });
+                    }
+                    Err(cause) => {
+                        return Err(LocalDeactivateError::BeforeDeactivate {
+                            applied,
+                            view,
+                            cause,
+                        });
+                    }
+                }
+            }
+            // Any other entry (file, directory, other) is refused without removal.
+            other => {
+                return Err(LocalDeactivateError::NotActiveView {
+                    applied,
+                    view,
+                    observed: other,
+                });
+            }
+        }
+
+        if let Err(error) = remove_active_view(&view) {
+            return Err(LocalDeactivateError::BeforeDeactivate {
+                applied,
+                view: view.clone(),
+                cause: LocalError::io("remove active directory symlink", &view, error),
+            });
+        }
+
+        match observe_activation_path(&view) {
+            Ok(LocalObservation::Missing) => Ok(deactivate_receipt(
+                view,
+                applied.evidence,
+                LocalDeactivatePrior::DirectorySymlink,
+            )),
+            Ok(observed) => {
+                let deactivated = deactivate_receipt(
+                    view,
+                    applied.evidence,
+                    LocalDeactivatePrior::DirectorySymlink,
+                );
+                Err(LocalDeactivateError::AfterDeactivate {
+                    cause: LocalError::io(
+                        "verify active directory symlink removal",
+                        &deactivated.input,
+                        io::Error::other(format!("expected missing, observed {observed:?}")),
+                    ),
+                    deactivated,
+                })
+            }
+            Err(cause) => Err(LocalDeactivateError::AfterDeactivate {
+                deactivated: deactivate_receipt(
+                    view,
+                    applied.evidence,
+                    LocalDeactivatePrior::DirectorySymlink,
+                ),
+                cause,
+            }),
+        }
+    }
+}
+
+fn deactivate_receipt<E>(
+    view: PathBuf,
+    previous: E,
+    prior: LocalDeactivatePrior,
+) -> LocalDeactivated<E> {
+    Activated {
+        input: view.clone(),
+        evidence: EvidenceChain {
+            previous,
+            current: LocalDeactivateEvidence { view, prior },
+        },
+    }
+}
+
+#[cfg(unix)]
+fn remove_active_view(view: &Path) -> io::Result<()> {
+    fs::remove_file(view)
+}
+
+#[cfg(windows)]
+fn remove_active_view(view: &Path) -> io::Result<()> {
+    fs::remove_dir(view)
+}
+
 fn unique_switch_stage(parent: &Path, view: &Path, source: &Path) -> Result<PathBuf, LocalError> {
     for attempt in 0..128u32 {
         let stage = parent.join(format!(".pulith-switch-{}-{attempt}", std::process::id()));

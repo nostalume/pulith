@@ -6,9 +6,11 @@
 //! per-file harnesses used to be. This module is not a test target: it declares no `#[test]`.
 #![allow(dead_code)]
 
+#[cfg(feature = "process")]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "process")]
 use std::time::Duration;
 
 #[cfg(feature = "process")]

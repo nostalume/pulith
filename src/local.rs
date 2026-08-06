@@ -26,6 +26,7 @@ pub(crate) use apply::apply_material;
 pub use apply::{ApplyEvidence, LocalApply, LocalPlacement};
 pub use view::{
     LocalActivate, LocalActivateError, LocalActivationEvidence, LocalActivationStrategy,
+    LocalDeactivate, LocalDeactivateError, LocalDeactivateEvidence, LocalDeactivatePrior,
     LocalSwitch, LocalSwitchBackend, LocalSwitchError, LocalSwitchEvidence,
 };
 
