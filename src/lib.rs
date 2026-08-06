@@ -226,7 +226,7 @@ pub trait AsyncAcquire<N> {
     type Error;
     type Output;
 
-    fn acquire_async<'a>(
+    fn acquire<'a>(
         &'a self,
         node: N,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
@@ -243,7 +243,7 @@ pub trait AsyncInspect<N> {
     type Error;
     type Output;
 
-    fn inspect_async<'a>(
+    fn inspect<'a>(
         &'a self,
         node: N,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
