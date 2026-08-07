@@ -59,3 +59,11 @@ rustix = { version = "1", features = ["fs", "process"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"], optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[[example]]
+name = "versioned_tool"
+required-features = ["local"]
