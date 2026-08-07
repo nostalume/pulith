@@ -20,16 +20,25 @@ pub struct Manifest {
     pub name: String,
     /// Resolved version; a single non-empty path component.
     pub version: String,
-    /// Where the artifact bytes come from.
-    pub source: Source,
-    /// Digest expectation used by the verify step.
-    pub hash: HashExpectation,
     /// Subpath of the materialized tree the active view links; default is the tree root.
     #[serde(default)]
     pub expose: Option<String>,
     /// Absolute path where the directory-symlink view is created; absent means no view.
     #[serde(default)]
     pub link_at: Option<PathBuf>,
+    /// Windows artifact: an atomic source+hash pair; absent means no windows artifact.
+    pub windows: Option<PlatformSpec>,
+    /// Linux artifact: an atomic source+hash pair; absent means no linux artifact.
+    pub linux: Option<PlatformSpec>,
+}
+
+/// One platform's artifact: the bytes source and the digest expectation, atomically.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct PlatformSpec {
+    /// Where the artifact bytes come from.
+    pub source: Source,
+    /// Digest expectation used by the verify step.
+    pub hash: HashExpectation,
 }
 
 impl Manifest {
@@ -53,19 +62,12 @@ impl Manifest {
                 version: self.version.clone(),
             });
         }
-        if let Source::Url { url } = &self.source
-            && !(url.starts_with("https://") || url.starts_with("http://"))
-        {
-            return Err(ManifestError::InvalidSourceUrl { url: url.clone() });
+        if self.windows.is_none() && self.linux.is_none() {
+            return Err(ManifestError::NoPlatform);
         }
-        match &self.hash {
-            HashExpectation::Blake3 { hex } | HashExpectation::Sha2 { hex } => {
-                if !valid_digest_hex(hex) {
-                    return Err(ManifestError::InvalidHash {
-                        kind: "blake3|sha2",
-                        hex: hex.clone(),
-                    });
-                }
+        for (platform, spec) in [("windows", &self.windows), ("linux", &self.linux)] {
+            if let Some(spec) = spec {
+                validate_platform(platform, spec)?;
             }
         }
         if let Some(expose) = &self.expose
@@ -110,6 +112,30 @@ fn valid_digest_hex(hex: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A platform pair is atomic: its source must be http(s) and its digest well-formed.
+fn validate_platform(platform: &str, spec: &PlatformSpec) -> Result<(), ManifestError> {
+    if let Source::Url { url } = &spec.source
+        && !(url.starts_with("https://") || url.starts_with("http://"))
+    {
+        return Err(ManifestError::InvalidSourceUrl { url: url.clone() });
+    }
+    match &spec.hash {
+        HashExpectation::Blake3 { hex } | HashExpectation::Sha2 { hex } => {
+            if !valid_digest_hex(hex) {
+                return Err(ManifestError::InvalidHash {
+                    kind: if platform == "windows" {
+                        "windows.hash"
+                    } else {
+                        "linux.hash"
+                    },
+                    hex: hex.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Source of the artifact bytes.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -130,6 +156,7 @@ pub enum HashExpectation {
 #[derive(Debug)]
 pub enum ManifestError {
     Toml { message: String },
+    NoPlatform,
     InvalidName { name: String },
     InvalidVersion { version: String },
     InvalidSourceUrl { url: String },
@@ -142,6 +169,10 @@ impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml { message } => write!(f, "invalid manifest: {message}"),
+            Self::NoPlatform => write!(
+                f,
+                "manifest must declare at least one of windows or linux source+hash"
+            ),
             Self::InvalidName { name } => write!(
                 f,
                 "manifest name {name:?} must be a single non-empty path component"
@@ -178,6 +209,9 @@ mod tests {
     #[cfg(not(windows))]
     const LINK_AT: &str = "/opt/demo-tool";
 
+    const WIN_HEX: &str = "75c251814644ed2e7b0048a25d396699851338bfb21cca3f0f1270f8952bb226";
+    const LINUX_HEX: &str = "7f86e631a80af88c0c1e724d29c4828448ec7d4b99e6b19570f81eb9733e85ee";
+
     fn valid() -> String {
         format!(
             r#"
@@ -186,13 +220,21 @@ version = "1.2.0"
 expose = "bin"
 link_at = "{LINK_AT}"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/demo-tool/1.2.0/demo-tool.zip"
+url = "https://example.com/demo-tool/1.2.0/demo-tool-win.zip"
 
-[hash]
+[windows.hash]
 kind = "blake3"
-hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+hex = "{WIN_HEX}"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/demo-tool/1.2.0/demo-tool-linux.tar.gz"
+
+[linux.hash]
+kind = "blake3"
+hex = "{LINUX_HEX}"
 "#
         )
     }
@@ -202,16 +244,18 @@ hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         let manifest = Manifest::parse(&valid()).unwrap();
         assert_eq!(manifest.name, "demo-tool");
         assert_eq!(manifest.version, "1.2.0");
-        match manifest.source {
+        let windows = manifest.windows.as_ref().unwrap();
+        match &windows.source {
             Source::Url { url } => {
-                assert_eq!(url, "https://example.com/demo-tool/1.2.0/demo-tool.zip")
+                assert_eq!(url, "https://example.com/demo-tool/1.2.0/demo-tool-win.zip")
             }
             Source::Local { .. } => panic!("expected a url source"),
         }
-        match manifest.hash {
+        match &windows.hash {
             HashExpectation::Blake3 { hex } => assert_eq!(hex.len(), 64),
             HashExpectation::Sha2 { .. } => panic!("expected blake3"),
         }
+        assert!(manifest.linux.is_some());
         assert_eq!(manifest.expose.as_deref(), Some("bin"));
         assert_eq!(manifest.link_at, Some(PathBuf::from(LINK_AT)));
     }
@@ -223,18 +267,32 @@ hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 name = "local-tool"
 version = "0.4.1"
 
-[source]
+[windows.source]
 kind = "local"
-path = "vendor/local-tool.tar"
+path = "vendor/local-tool-win.tar"
 
-[hash]
+[windows.hash]
 kind = "sha2"
 hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[linux.source]
+kind = "local"
+path = "vendor/local-tool-linux.tar"
+
+[linux.hash]
+kind = "sha2"
+hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 "#,
         )
         .unwrap();
-        assert!(matches!(manifest.source, Source::Local { .. }));
-        assert!(matches!(manifest.hash, HashExpectation::Sha2 { .. }));
+        assert!(matches!(
+            manifest.windows.as_ref().unwrap().source,
+            Source::Local { .. }
+        ));
+        assert!(matches!(
+            manifest.windows.as_ref().unwrap().hash,
+            HashExpectation::Sha2 { .. }
+        ));
         assert!(manifest.expose.is_none());
         assert!(manifest.link_at.is_none());
     }
@@ -242,6 +300,46 @@ hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     #[test]
     fn rejects_an_unknown_field() {
         let manifest = "name = \"demo-tool\"\nversion = \"1.0.0\"\nunknown = true\n";
+        let error = Manifest::parse(manifest).unwrap_err();
+        assert!(matches!(error, ManifestError::Toml { .. }));
+    }
+
+    #[test]
+    fn rejects_a_manifest_without_any_platform() {
+        let manifest = r#"
+name = "demo-tool"
+version = "1.0.0"
+
+[source]
+kind = "url"
+url = "https://example.com/tool.zip"
+
+[hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        let error = Manifest::parse(manifest).unwrap_err();
+        assert!(matches!(error, ManifestError::Toml { .. }));
+    }
+
+    #[test]
+    fn rejects_a_partial_platform_pair() {
+        let manifest = r#"
+name = "demo-tool"
+version = "1.0.0"
+
+[windows.source]
+kind = "url"
+url = "https://example.com/tool-win.zip"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
         let error = Manifest::parse(manifest).unwrap_err();
         assert!(matches!(error, ManifestError::Toml { .. }));
     }
@@ -260,11 +358,19 @@ hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 name = "{name}"
 version = "1.0.0"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#
@@ -283,11 +389,19 @@ hex = "0000000000000000000000000000000000000000000000000000000000000000"
 name = "demo-tool"
 version = "1.0/.."
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#;
@@ -301,11 +415,19 @@ hex = "0000000000000000000000000000000000000000000000000000000000000000"
 name = "demo-tool"
 version = "1.0.0"
 
-[source]
+[windows.source]
 kind = "url"
-url = "ftp://example.com/tool.zip"
+url = "ftp://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#;
@@ -321,13 +443,21 @@ hex = "0000000000000000000000000000000000000000000000000000000000000000"
 name = "demo-tool"
 version = "1.0.0"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
 kind = "blake3"
 hex = "{hex}"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#
             );
             let error = Manifest::parse(&manifest).unwrap_err();
@@ -347,11 +477,19 @@ name = "demo-tool"
 version = "1.0.0"
 expose = "{expose}"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#
@@ -372,11 +510,19 @@ name = "demo-tool"
 version = "1.0.0"
 expose = "opt/demo-tool/bin"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#
@@ -392,11 +538,19 @@ name = "demo-tool"
 version = "1.0.0"
 link_at = "opt/demo-tool"
 
-[source]
+[windows.source]
 kind = "url"
-url = "https://example.com/tool.zip"
+url = "https://example.com/tool-win.zip"
 
-[hash]
+[windows.hash]
+kind = "blake3"
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[linux.source]
+kind = "url"
+url = "https://example.com/tool-linux.zip"
+
+[linux.hash]
 kind = "blake3"
 hex = "0000000000000000000000000000000000000000000000000000000000000000"
 "#;

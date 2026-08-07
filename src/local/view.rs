@@ -200,121 +200,154 @@ impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for 
         view: PathBuf,
     ) -> Result<Self::Output, Self::Error> {
         let source = applied.input.target.path.clone();
-        let source_observation = match observe_activation_path(&source) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalActivateError::BeforeActivation {
-                    applied,
-                    view,
-                    cause,
-                });
-            }
-        };
-        if source_observation != LocalObservation::Directory {
-            return Err(LocalActivateError::SourceNotDirectory {
+        perform_activation(applied, view, source)
+    }
+}
+
+/// The activate-family error over a materialization request (receipt-preserving by law).
+type ActivationError<I, S, E> = LocalActivateError<Materialize<I, S, LocalTarget>, E>;
+/// The switch-family error over a materialization request (receipt-preserving by law).
+type SwitchError<I, S, E> = LocalSwitchError<Materialize<I, S, LocalTarget>, E>;
+
+/// Expose-aware activation: link a caller-selected subpath of the published tree.
+///
+/// Same law as the `Activate` trait entry, with `source = target.join(expose)`: the source must
+/// be a directory, the view must be missing, and the post-observation must see a symlink. The
+/// evidence records the exposed source path. This is the vertical's justified gap admission
+/// (S3.3-A1); the trait input stays `PathBuf`.
+impl LocalActivate {
+    #[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
+    pub fn activate_at<I, S, E>(
+        &self,
+        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        view: PathBuf,
+        expose: &Path,
+    ) -> Result<LocalActivated<E>, ActivationError<I, S, E>> {
+        let source = applied.input.target.path.join(expose);
+        perform_activation(applied, view, source)
+    }
+}
+
+#[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
+fn perform_activation<I, S, E>(
+    applied: Applied<Materialize<I, S, LocalTarget>, E>,
+    view: PathBuf,
+    source: PathBuf,
+) -> Result<LocalActivated<E>, ActivationError<I, S, E>> {
+    let source_observation = match observe_activation_path(&source) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalActivateError::BeforeActivation {
                 applied,
                 view,
-                observed: source_observation,
+                cause,
             });
         }
+    };
+    if source_observation != LocalObservation::Directory {
+        return Err(LocalActivateError::SourceNotDirectory {
+            applied,
+            view,
+            observed: source_observation,
+        });
+    }
 
-        let parent = match view.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => {
-                return Err(LocalActivateError::BeforeActivation {
-                    applied,
-                    view,
-                    cause: LocalError::io(
-                        "inspect active view parent",
-                        Path::new(""),
-                        io::Error::new(io::ErrorKind::InvalidInput, "active view has no parent"),
-                    ),
-                });
-            }
-        };
-        let parent_observation = match observe_activation_path(&parent) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalActivateError::BeforeActivation {
-                    applied,
-                    view,
-                    cause,
-                });
-            }
-        };
-        if parent_observation != LocalObservation::Directory {
+    let parent = match view.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => {
             return Err(LocalActivateError::BeforeActivation {
                 applied,
                 view,
                 cause: LocalError::io(
                     "inspect active view parent",
-                    parent,
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "active view parent is not a directory",
-                    ),
+                    Path::new(""),
+                    io::Error::new(io::ErrorKind::InvalidInput, "active view has no parent"),
                 ),
             });
         }
-
-        let view_observation = match observe_activation_path(&view) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalActivateError::BeforeActivation {
-                    applied,
-                    view,
-                    cause,
-                });
-            }
-        };
-        if view_observation != LocalObservation::Missing {
-            return Err(LocalActivateError::ViewAlreadyExists {
+    };
+    let parent_observation = match observe_activation_path(&parent) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalActivateError::BeforeActivation {
                 applied,
                 view,
-                observed: view_observation,
+                cause,
             });
         }
+    };
+    if parent_observation != LocalObservation::Directory {
+        return Err(LocalActivateError::BeforeActivation {
+            applied,
+            view,
+            cause: LocalError::io(
+                "inspect active view parent",
+                parent,
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "active view parent is not a directory",
+                ),
+            ),
+        });
+    }
 
-        if let Err(error) = create_directory_symlink(&source, &view) {
-            let capability_unavailable = directory_symlink_capability_unavailable(&error);
-            let cause = LocalError::io("create active directory symlink", &view, error);
-            return if capability_unavailable {
-                Err(LocalActivateError::CapabilityUnavailable {
-                    applied,
-                    view,
-                    cause,
-                })
-            } else {
-                Err(LocalActivateError::BeforeActivation {
-                    applied,
-                    view,
-                    cause,
-                })
-            };
-        }
-
-        match observe_activation_path(&view) {
-            Ok(observed) => {
-                let activated =
-                    activation_receipt(view, applied.evidence, source, Some(observed.clone()));
-                if observed == LocalObservation::Symlink {
-                    Ok(activated)
-                } else {
-                    Err(LocalActivateError::AfterActivation {
-                        cause: LocalError::io(
-                            "verify active directory symlink",
-                            &activated.input,
-                            io::Error::other(format!("expected symlink, observed {observed:?}")),
-                        ),
-                        activated,
-                    })
-                }
-            }
-            Err(cause) => Err(LocalActivateError::AfterActivation {
-                activated: activation_receipt(view, applied.evidence, source, None),
+    let view_observation = match observe_activation_path(&view) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalActivateError::BeforeActivation {
+                applied,
+                view,
                 cause,
-            }),
+            });
         }
+    };
+    if view_observation != LocalObservation::Missing {
+        return Err(LocalActivateError::ViewAlreadyExists {
+            applied,
+            view,
+            observed: view_observation,
+        });
+    }
+
+    if let Err(error) = create_directory_symlink(&source, &view) {
+        let capability_unavailable = directory_symlink_capability_unavailable(&error);
+        let cause = LocalError::io("create active directory symlink", &view, error);
+        return if capability_unavailable {
+            Err(LocalActivateError::CapabilityUnavailable {
+                applied,
+                view,
+                cause,
+            })
+        } else {
+            Err(LocalActivateError::BeforeActivation {
+                applied,
+                view,
+                cause,
+            })
+        };
+    }
+
+    match observe_activation_path(&view) {
+        Ok(observed) => {
+            let activated =
+                activation_receipt(view, applied.evidence, source, Some(observed.clone()));
+            if observed == LocalObservation::Symlink {
+                Ok(activated)
+            } else {
+                Err(LocalActivateError::AfterActivation {
+                    cause: LocalError::io(
+                        "verify active directory symlink",
+                        &activated.input,
+                        io::Error::other(format!("expected symlink, observed {observed:?}")),
+                    ),
+                    activated,
+                })
+            }
+        }
+        Err(cause) => Err(LocalActivateError::AfterActivation {
+            activated: activation_receipt(view, applied.evidence, source, None),
+            cause,
+        }),
     }
 }
 
@@ -328,185 +361,211 @@ impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for 
         view: PathBuf,
     ) -> Result<Self::Output, Self::Error> {
         let source = applied.input.target.path.clone();
-        let source_observation = match observe_activation_path(&source) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalSwitchError::BeforeSwitch {
-                    applied,
-                    view,
-                    cause,
-                });
-            }
-        };
-        if source_observation != LocalObservation::Directory {
-            return Err(LocalSwitchError::SourceNotDirectory {
+        perform_switch(applied, view, source)
+    }
+}
+
+/// Expose-aware switch: natively replace an existing view with a caller-selected subpath.
+///
+/// Same law as the `Activate` trait entry, with `source = target.join(expose)`. This is the
+/// switch twin of `LocalActivate::activate_at` (S3.3-A1).
+impl LocalSwitch {
+    #[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
+    pub fn activate_at<I, S, E>(
+        &self,
+        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        view: PathBuf,
+        expose: &Path,
+    ) -> Result<LocalSwitched<E>, SwitchError<I, S, E>> {
+        let source = applied.input.target.path.join(expose);
+        perform_switch(applied, view, source)
+    }
+}
+
+#[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
+fn perform_switch<I, S, E>(
+    applied: Applied<Materialize<I, S, LocalTarget>, E>,
+    view: PathBuf,
+    source: PathBuf,
+) -> Result<LocalSwitched<E>, SwitchError<I, S, E>> {
+    let source_observation = match observe_activation_path(&source) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalSwitchError::BeforeSwitch {
                 applied,
                 view,
-                observed: source_observation,
+                cause,
             });
         }
+    };
+    if source_observation != LocalObservation::Directory {
+        return Err(LocalSwitchError::SourceNotDirectory {
+            applied,
+            view,
+            observed: source_observation,
+        });
+    }
 
-        let parent = match view
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            Some(parent) => parent.to_path_buf(),
-            None => {
-                return Err(LocalSwitchError::BeforeSwitch {
-                    applied,
-                    view,
-                    cause: LocalError::io(
-                        "inspect active view parent",
-                        Path::new(""),
-                        io::Error::new(io::ErrorKind::InvalidInput, "active view has no parent"),
-                    ),
-                });
-            }
-        };
-        let parent_observation = match observe_activation_path(&parent) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalSwitchError::BeforeSwitch {
-                    applied,
-                    view,
-                    cause,
-                });
-            }
-        };
-        if parent_observation != LocalObservation::Directory {
+    let parent = match view
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent.to_path_buf(),
+        None => {
             return Err(LocalSwitchError::BeforeSwitch {
                 applied,
                 view,
                 cause: LocalError::io(
                     "inspect active view parent",
-                    parent,
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "active view parent is not a directory",
-                    ),
+                    Path::new(""),
+                    io::Error::new(io::ErrorKind::InvalidInput, "active view has no parent"),
                 ),
             });
         }
+    };
+    let parent_observation = match observe_activation_path(&parent) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalSwitchError::BeforeSwitch {
+                applied,
+                view,
+                cause,
+            });
+        }
+    };
+    if parent_observation != LocalObservation::Directory {
+        return Err(LocalSwitchError::BeforeSwitch {
+            applied,
+            view,
+            cause: LocalError::io(
+                "inspect active view parent",
+                parent,
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "active view parent is not a directory",
+                ),
+            ),
+        });
+    }
 
-        let observed = match observe_activation_path(&view) {
-            Ok(observation) => observation,
-            Err(cause) => {
-                return Err(LocalSwitchError::BeforeSwitch {
+    let observed = match observe_activation_path(&view) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LocalSwitchError::BeforeSwitch {
+                applied,
+                view,
+                cause,
+            });
+        }
+    };
+    if observed != LocalObservation::Symlink {
+        return Err(LocalSwitchError::ViewNotSymlink {
+            applied,
+            view,
+            observed,
+        });
+    }
+    let previous_source = match fs::read_link(&view) {
+        Ok(source) => source,
+        Err(error) => {
+            return Err(LocalSwitchError::BeforeSwitch {
+                applied,
+                view: view.clone(),
+                cause: LocalError::io("read active directory symlink", &view, error),
+            });
+        }
+    };
+    let stage = match unique_switch_stage(&parent, &view, &source) {
+        Ok(stage) => stage,
+        Err(cause) => {
+            return Err(LocalSwitchError::BeforeSwitch {
+                applied,
+                view: view.clone(),
+                cause,
+            });
+        }
+    };
+    let backend = match replace_active_view(&stage, &view) {
+        Ok(backend) => backend,
+        Err(error) => {
+            let error_code = error.raw_os_error();
+            let cause = LocalError::io("replace active directory symlink", &view, error);
+            match remove_staged_active_view(&stage) {
+                Ok(()) => {}
+                Err(ref cleanup) if cleanup.kind() == io::ErrorKind::NotFound => {}
+                Err(cleanup) => {
+                    return Err(LocalSwitchError::Cleanup {
+                        applied,
+                        view,
+                        cause,
+                        cleanup: LocalError::io(
+                            "remove staged active directory symlink",
+                            stage,
+                            cleanup,
+                        ),
+                    });
+                }
+            }
+            return if active_view_is_busy(error_code) {
+                Err(LocalSwitchError::ViewBusy {
                     applied,
                     view,
                     cause,
-                });
-            }
-        };
-        if observed != LocalObservation::Symlink {
-            return Err(LocalSwitchError::ViewNotSymlink {
-                applied,
-                view,
-                observed,
-            });
-        }
-        let previous_source = match fs::read_link(&view) {
-            Ok(source) => source,
-            Err(error) => {
-                return Err(LocalSwitchError::BeforeSwitch {
+                })
+            } else if active_view_capability_unavailable(error_code) {
+                Err(LocalSwitchError::CapabilityUnavailable {
                     applied,
-                    view: view.clone(),
-                    cause: LocalError::io("read active directory symlink", &view, error),
-                });
-            }
-        };
-        let stage = match unique_switch_stage(&parent, &view, &source) {
-            Ok(stage) => stage,
-            Err(cause) => {
-                return Err(LocalSwitchError::BeforeSwitch {
-                    applied,
-                    view: view.clone(),
+                    view,
                     cause,
-                });
-            }
-        };
-        let backend = match replace_active_view(&stage, &view) {
-            Ok(backend) => backend,
-            Err(error) => {
-                let error_code = error.raw_os_error();
-                let cause = LocalError::io("replace active directory symlink", &view, error);
-                match remove_staged_active_view(&stage) {
-                    Ok(()) => {}
-                    Err(ref cleanup) if cleanup.kind() == io::ErrorKind::NotFound => {}
-                    Err(cleanup) => {
-                        return Err(LocalSwitchError::Cleanup {
-                            applied,
-                            view,
-                            cause,
-                            cleanup: LocalError::io(
-                                "remove staged active directory symlink",
-                                stage,
-                                cleanup,
-                            ),
-                        });
-                    }
-                }
-                return if active_view_is_busy(error_code) {
-                    Err(LocalSwitchError::ViewBusy {
-                        applied,
-                        view,
-                        cause,
-                    })
-                } else if active_view_capability_unavailable(error_code) {
-                    Err(LocalSwitchError::CapabilityUnavailable {
-                        applied,
-                        view,
-                        cause,
-                    })
-                } else {
-                    Err(LocalSwitchError::BeforeSwitch {
-                        applied,
-                        view,
-                        cause,
-                    })
-                };
-            }
-        };
+                })
+            } else {
+                Err(LocalSwitchError::BeforeSwitch {
+                    applied,
+                    view,
+                    cause,
+                })
+            };
+        }
+    };
 
-        match observe_activation_path(&view) {
-            Ok(LocalObservation::Symlink) => Ok(switch_receipt(
+    match observe_activation_path(&view) {
+        Ok(LocalObservation::Symlink) => Ok(switch_receipt(
+            view,
+            applied.evidence,
+            previous_source,
+            source,
+            backend,
+            Some(LocalObservation::Symlink),
+        )),
+        Ok(observed) => {
+            let activated = switch_receipt(
                 view,
                 applied.evidence,
                 previous_source,
                 source,
                 backend,
-                Some(LocalObservation::Symlink),
-            )),
-            Ok(observed) => {
-                let activated = switch_receipt(
-                    view,
-                    applied.evidence,
-                    previous_source,
-                    source,
-                    backend,
-                    Some(observed.clone()),
-                );
-                Err(LocalSwitchError::AfterSwitch {
-                    cause: LocalError::io(
-                        "verify active directory symlink",
-                        &activated.input,
-                        io::Error::other(format!("expected symlink, observed {observed:?}")),
-                    ),
-                    activated,
-                })
-            }
-            Err(cause) => Err(LocalSwitchError::AfterSwitch {
-                activated: switch_receipt(
-                    view,
-                    applied.evidence,
-                    previous_source,
-                    source,
-                    backend,
-                    None,
+                Some(observed.clone()),
+            );
+            Err(LocalSwitchError::AfterSwitch {
+                cause: LocalError::io(
+                    "verify active directory symlink",
+                    &activated.input,
+                    io::Error::other(format!("expected symlink, observed {observed:?}")),
                 ),
-                cause,
-            }),
+                activated,
+            })
         }
+        Err(cause) => Err(LocalSwitchError::AfterSwitch {
+            activated: switch_receipt(
+                view,
+                applied.evidence,
+                previous_source,
+                source,
+                backend,
+                None,
+            ),
+            cause,
+        }),
     }
 }
 /// Prior view state recorded by a deactivation: what was actually removed or absent.
