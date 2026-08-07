@@ -3,7 +3,6 @@
 use std::fs;
 
 use crate::common::{publish_tree, receipt_for};
-use pulith::Activate;
 use pulith::local::{LocalActivate, LocalActivateError, LocalObservation};
 
 #[test]
@@ -19,7 +18,7 @@ fn activate_exposes_published_tree_without_copying() {
     assert_eq!(activated.evidence.current.source, source);
     assert_eq!(
         activated.evidence.current.view_observation,
-        Some(LocalObservation::Symlink)
+        Some(LocalObservation::SymlinkToDirectory)
     );
     assert!(
         fs::symlink_metadata(&activated.input)

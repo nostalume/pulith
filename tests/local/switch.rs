@@ -3,7 +3,6 @@
 use std::fs;
 
 use crate::common::{directory_symlink, publish_tree, receipt_for};
-use pulith::Activate;
 use pulith::local::{
     LocalActivate, LocalObservation, LocalSwitch, LocalSwitchBackend, LocalSwitchError,
 };
@@ -23,7 +22,7 @@ fn switch_replaces_only_the_active_view_and_records_the_backend() {
     assert_eq!(switched.evidence.current.current_source, second_target);
     assert_eq!(
         switched.evidence.current.view_observation,
-        Some(LocalObservation::Symlink)
+        Some(LocalObservation::SymlinkToDirectory)
     );
     #[cfg(unix)]
     assert_eq!(
@@ -155,7 +154,7 @@ fn switch_rejects_non_directory_sources_without_changing_the_old_view() {
     assert!(matches!(
         symlink_error,
         LocalSwitchError::SourceNotDirectory {
-            observed: LocalObservation::Symlink,
+            observed: LocalObservation::SymlinkToDirectory,
             ..
         }
     ));

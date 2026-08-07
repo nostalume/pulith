@@ -3,6 +3,8 @@ mod activation;
 mod common;
 #[path = "local/deactivate.rs"]
 mod deactivate;
+#[path = "local/link.rs"]
+mod link;
 #[path = "local/materialization.rs"]
 mod materialization;
 

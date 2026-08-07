@@ -3,7 +3,6 @@
 use std::fs;
 
 use crate::common::{directory_symlink, publish_tree};
-use pulith::Activate;
 use pulith::local::{
     LocalActivate, LocalDeactivate, LocalDeactivateError, LocalDeactivatePrior, LocalObservation,
 };
@@ -109,10 +108,10 @@ fn deactivate_rejects_directory_and_file_symlink_views_without_removal() {
     match error {
         LocalDeactivateError::NotActiveView {
             view: seen,
-            observed: LocalObservation::File { .. },
+            observed: LocalObservation::SymlinkToFile,
             ..
         } => assert_eq!(seen, file_symlink_view),
-        other => panic!("expected NotActiveView with the resolved target kind, got {other:?}"),
+        other => panic!("expected NotActiveView with the link-target kind, got {other:?}"),
     }
     assert!(
         fs::symlink_metadata(&file_symlink_view)

@@ -19,15 +19,20 @@ use crate::{
 };
 
 mod apply;
+#[cfg(all(feature = "hash", any(feature = "zip", feature = "tar")))]
+mod materialize;
 mod view;
 
 #[cfg(any(feature = "zip", feature = "tar"))]
 pub(crate) use apply::apply_material;
 pub use apply::{ApplyEvidence, LocalApply, LocalPlacement};
+#[cfg(all(feature = "hash", any(feature = "zip", feature = "tar")))]
+pub use materialize::{LocalMaterialize, MaterializeError, MaterializeEvidence};
 pub use view::{
-    LocalActivate, LocalActivateError, LocalActivationEvidence, LocalActivationStrategy,
-    LocalDeactivate, LocalDeactivateError, LocalDeactivateEvidence, LocalDeactivatePrior,
-    LocalSwitch, LocalSwitchBackend, LocalSwitchError, LocalSwitchEvidence,
+    LinkError, LinkOutcome, LocalActivate, LocalActivateError, LocalActivationEvidence,
+    LocalActivationStrategy, LocalDeactivate, LocalDeactivateError, LocalDeactivateEvidence,
+    LocalDeactivatePrior, LocalSwitch, LocalSwitchBackend, LocalSwitchError, LocalSwitchEvidence,
+    OccupiedViewPolicy,
 };
 
 /// Errors produced by local acquisition, observation, activation, and publication behaviors.
@@ -116,28 +121,6 @@ impl std::error::Error for LocalError {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalPath {
-    pub path: PathBuf,
-}
-
-impl LocalPath {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalTarget {
-    pub path: PathBuf,
-}
-
-impl LocalTarget {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
     }
 }
 
@@ -287,12 +270,25 @@ pub struct LocalAcquireEvidence {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalAcquire;
 
-impl<I, T> Acquire<Materialize<I, LocalPath, T>> for LocalAcquire {
-    type Error = LocalError;
-    type Output = Acquired<Materialize<I, LocalPath, T>, LocalMaterial, LocalAcquireEvidence>;
+impl LocalAcquire {
+    /// Inherent mirror of [`Acquire::acquire`] — callable without importing the trait.
+    pub fn acquire<N>(
+        &self,
+        node: N,
+    ) -> Result<<Self as Acquire<N>>::Output, <Self as Acquire<N>>::Error>
+    where
+        Self: Acquire<N>,
+    {
+        Acquire::acquire(self, node)
+    }
+}
 
-    fn acquire(&self, node: Materialize<I, LocalPath, T>) -> Result<Self::Output, Self::Error> {
-        let path = node.source.path.clone();
+impl<I, T> Acquire<Materialize<I, PathBuf, T>> for LocalAcquire {
+    type Error = LocalError;
+    type Output = Acquired<Materialize<I, PathBuf, T>, LocalMaterial, LocalAcquireEvidence>;
+
+    fn acquire(&self, node: Materialize<I, PathBuf, T>) -> Result<Self::Output, Self::Error> {
+        let path = node.source.clone();
         if !path.exists() {
             return Err(LocalError::MissingSource(path));
         }
@@ -313,6 +309,15 @@ impl<I, T> Acquire<Materialize<I, LocalPath, T>> for LocalAcquire {
 ///
 /// `File` and `Directory` paths survive drop. `StagedFile` owns its temporary path and removes it
 /// when the material or any canonical state carrying it is dropped.
+/// The local family's acquired node: an acquire receipt over a local material.
+///
+/// The shape repeated by every local acquire behavior and its consumers (materialize, apply,
+/// activation). Named once so callers and the lib never write the full typestate.
+pub type LocalAcquired<I, S, E> = Acquired<Materialize<I, S, PathBuf>, LocalMaterial, E>;
+
+/// The local family's applied node: an applied receipt over a local materialization.
+pub type LocalApplied<I, S, E> = Applied<Materialize<I, S, PathBuf>, E>;
+
 #[derive(Debug)]
 pub enum LocalMaterial {
     /// A caller-owned regular-file path. Dropping the value does not remove the file.
@@ -411,13 +416,19 @@ impl<T> LocalArtifactObservation<T> {
     }
 }
 
-/// Read-only facts observed for one [`LocalTarget`].
+/// Read-only facts observed for one [`PathBuf`].
+///
+/// A symlink is classified by its resolved target: `SymlinkToDirectory` when the link's
+/// (possibly relative) target resolves to a directory, `SymlinkToFile` when it resolves to a
+/// file or is missing/unreadable (not a directory). This is the single home of the
+/// link-target classification — callers never read links themselves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalObservation {
     Missing,
     File { bytes: u64 },
     Directory,
-    Symlink,
+    SymlinkToDirectory,
+    SymlinkToFile,
     Other,
 }
 
@@ -431,7 +442,7 @@ impl LocalObservation {
             Self::Missing => LocalEntryKind::Missing,
             Self::File { .. } => LocalEntryKind::File,
             Self::Directory => LocalEntryKind::Directory,
-            Self::Symlink => LocalEntryKind::Symlink,
+            Self::SymlinkToDirectory | Self::SymlinkToFile => LocalEntryKind::Symlink,
             Self::Other => LocalEntryKind::Other,
         }
     }
@@ -486,30 +497,56 @@ pub struct LocalReconcileEvidence {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalInspect;
 
-impl Inspect<LocalTarget> for LocalInspect {
-    type Error = LocalError;
-    type Output = Inspected<LocalTarget, LocalObservation, LocalInspectEvidence>;
+impl LocalInspect {
+    /// Inherent mirror of [`Inspect::inspect`] — callable without importing the trait.
+    pub fn inspect<N>(
+        &self,
+        node: N,
+    ) -> Result<<Self as Inspect<N>>::Output, <Self as Inspect<N>>::Error>
+    where
+        Self: Inspect<N>,
+    {
+        Inspect::inspect(self, node)
+    }
 
-    fn inspect(&self, node: LocalTarget) -> Result<Self::Output, Self::Error> {
-        let observation = match fs::symlink_metadata(&node.path) {
-            Ok(metadata) => {
-                let file_type = metadata.file_type();
-                if file_type.is_symlink() {
-                    LocalObservation::Symlink
-                } else if file_type.is_file() {
-                    LocalObservation::File {
-                        bytes: metadata.len(),
-                    }
-                } else if file_type.is_dir() {
-                    LocalObservation::Directory
-                } else {
-                    LocalObservation::Other
+    /// Observe one path directly: the observation law's direct output.
+    pub fn observe(&self, path: impl AsRef<Path>) -> Result<LocalObservation, LocalError> {
+        observe_path(path.as_ref())
+    }
+}
+
+/// The observation law: classify one path (the single home of the classification).
+///
+/// A symlink is classified by its resolved target (`SymlinkToDirectory`/`SymlinkToFile`); a
+/// missing path is `Missing`. `Inspect` builds its receipt node from this, so the observation
+/// is never produced by discarding a node's field.
+fn observe_path(path: &Path) -> Result<LocalObservation, LocalError> {
+    Ok(match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                classify_symlink(path)
+            } else if file_type.is_file() {
+                LocalObservation::File {
+                    bytes: metadata.len(),
                 }
+            } else if file_type.is_dir() {
+                LocalObservation::Directory
+            } else {
+                LocalObservation::Other
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => LocalObservation::Missing,
-            Err(error) => return Err(LocalError::io("inspect local target", &node.path, error)),
-        };
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => LocalObservation::Missing,
+        Err(error) => return Err(LocalError::io("inspect local target", path, error)),
+    })
+}
 
+impl Inspect<PathBuf> for LocalInspect {
+    type Error = LocalError;
+    type Output = Inspected<PathBuf, LocalObservation, LocalInspectEvidence>;
+
+    fn inspect(&self, node: PathBuf) -> Result<Self::Output, Self::Error> {
+        let observation = observe_path(&node)?;
         Ok(Inspected {
             input: node,
             observation,
@@ -518,9 +555,30 @@ impl Inspect<LocalTarget> for LocalInspect {
     }
 }
 
+/// Classify a symlink by its resolved target: `SymlinkToDirectory` when the (possibly relative)
+/// target resolves to a directory, `SymlinkToFile` otherwise (file target, dangling, or an
+/// unreadable link). This is the single home of the link-target classification; the no-follow
+/// metadata already confirmed the entry is a symlink.
+fn classify_symlink(path: &Path) -> LocalObservation {
+    match fs::read_link(path) {
+        Ok(target) => {
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or_else(|| Path::new("")).join(&target)
+            };
+            match fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_dir() => LocalObservation::SymlinkToDirectory,
+                _ => LocalObservation::SymlinkToFile,
+            }
+        }
+        Err(_) => LocalObservation::SymlinkToFile,
+    }
+}
+
 /// Read-only local observation performed after a completed local target effect.
 ///
-/// This adapter accepts only local [`Applied`] receipts that retain an exact [`LocalTarget`]. It
+/// This adapter accepts only local [`Applied`] receipts that retain an exact [`PathBuf`]. It
 /// preserves prior apply evidence on success, while its error preserves the completed receipt when
 /// no valid observation can be produced. It does not publish, remove, repair, or decide desired
 /// state; callers may pass the result to [`LocalReconcile`] with their own [`LocalExpectation`].
@@ -550,11 +608,11 @@ impl<N: fmt::Debug, E: fmt::Debug> std::error::Error for LocalPostInspectError<N
 }
 
 type LocalPostInspected<E> =
-    Inspected<LocalTarget, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
+    Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
 
 fn post_inspect<N, E>(
     applied: Applied<N, E>,
-    target: LocalTarget,
+    target: PathBuf,
 ) -> Result<LocalPostInspected<E>, LocalPostInspectError<N, E>> {
     match LocalInspect.inspect(target) {
         Ok(Inspected {
@@ -573,26 +631,26 @@ fn post_inspect<N, E>(
     }
 }
 
-impl<I, S, E> Inspect<Applied<Materialize<I, S, LocalTarget>, E>> for LocalPostInspect {
-    type Error = LocalPostInspectError<Materialize<I, S, LocalTarget>, E>;
-    type Output = Inspected<LocalTarget, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
+impl<I, S, E> Inspect<Applied<Materialize<I, S, PathBuf>, E>> for LocalPostInspect {
+    type Error = LocalPostInspectError<Materialize<I, S, PathBuf>, E>;
+    type Output = Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
 
     fn inspect(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: Applied<Materialize<I, S, PathBuf>, E>,
     ) -> Result<Self::Output, Self::Error> {
         let target = applied.input.target.clone();
         post_inspect(applied, target)
     }
 }
 
-impl<I, E> Inspect<Applied<Forget<I, LocalTarget>, E>> for LocalPostInspect {
-    type Error = LocalPostInspectError<Forget<I, LocalTarget>, E>;
-    type Output = Inspected<LocalTarget, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
+impl<I, E> Inspect<Applied<Forget<I, PathBuf>, E>> for LocalPostInspect {
+    type Error = LocalPostInspectError<Forget<I, PathBuf>, E>;
+    type Output = Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
 
     fn inspect(
         &self,
-        applied: Applied<Forget<I, LocalTarget>, E>,
+        applied: Applied<Forget<I, PathBuf>, E>,
     ) -> Result<Self::Output, Self::Error> {
         let target = applied.input.target.clone();
         post_inspect(applied, target)
@@ -603,16 +661,14 @@ impl<I, E> Inspect<Applied<Forget<I, LocalTarget>, E>> for LocalPostInspect {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalReconcile;
 
-impl<E> Reconcile<Inspected<LocalTarget, LocalObservation, E>, LocalExpectation>
-    for LocalReconcile
-{
+impl<E> Reconcile<Inspected<PathBuf, LocalObservation, E>, LocalExpectation> for LocalReconcile {
     type Error = std::convert::Infallible;
     type Output =
-        Reconciled<LocalTarget, LocalReconciliation, EvidenceChain<E, LocalReconcileEvidence>>;
+        Reconciled<PathBuf, LocalReconciliation, EvidenceChain<E, LocalReconcileEvidence>>;
 
     fn reconcile(
         &self,
-        node: Inspected<LocalTarget, LocalObservation, E>,
+        node: Inspected<PathBuf, LocalObservation, E>,
         expected: LocalExpectation,
     ) -> Result<Self::Output, Self::Error> {
         let Inspected {
@@ -664,7 +720,7 @@ mod tests {
     use std::os::windows::fs::symlink_file;
 
     use super::*;
-    use crate::{Inspect, Reconcile};
+    use crate::Reconcile;
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -717,15 +773,15 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let missing = LocalInspect.inspect(LocalTarget::new(&missing)).unwrap();
-        let file = LocalInspect.inspect(LocalTarget::new(&file)).unwrap();
-        let directory = LocalInspect.inspect(LocalTarget::new(&directory)).unwrap();
+        let missing = LocalInspect.inspect((&missing).into()).unwrap();
+        let file = LocalInspect.inspect((&file).into()).unwrap();
+        let directory = LocalInspect.inspect((&directory).into()).unwrap();
 
         assert_eq!(missing.observation, LocalObservation::Missing);
         assert_eq!(file.observation, LocalObservation::File { bytes: 6 });
         assert_eq!(directory.observation, LocalObservation::Directory);
         assert_eq!(file.evidence, LocalInspectEvidence);
-        assert_eq!(fs::read_to_string(&file.input.path).unwrap(), "pulith");
+        assert_eq!(fs::read_to_string(&file.input).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -737,9 +793,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         symlink_file(root.join("missing-source"), &target).unwrap();
 
-        let inspected = LocalInspect.inspect(LocalTarget::new(&target)).unwrap();
+        let inspected = LocalInspect.inspect(target.clone()).unwrap();
 
-        assert_eq!(inspected.observation, LocalObservation::Symlink);
+        assert_eq!(inspected.observation, LocalObservation::SymlinkToFile);
         assert!(
             fs::symlink_metadata(&target)
                 .unwrap()
@@ -801,15 +857,12 @@ mod tests {
         path: &std::path::Path,
         expected: LocalExpectation,
     ) -> crate::Reconciled<
-        LocalTarget,
+        PathBuf,
         LocalReconciliation,
         crate::EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>,
     > {
         LocalReconcile
-            .reconcile(
-                LocalInspect.inspect(LocalTarget::new(path)).unwrap(),
-                expected,
-            )
+            .reconcile(LocalInspect.inspect((path).into()).unwrap(), expected)
             .unwrap()
     }
 }

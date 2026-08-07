@@ -8,9 +8,9 @@
 //!                         -> Prepared -> Applied
 //!                         -> Verified -> Prepared -> Applied
 //! Forget -----------------------------> Applied
-//! Applied<..., LocalTarget> + PathBuf -> Activated
-//! Applied<..., LocalTarget> ----------> Inspected -> Reconciled
-//! LocalTarget -> Inspected -> Reconciled
+//! Applied<..., PathBuf> + PathBuf -> Activated
+//! Applied<..., PathBuf> ----------> Inspected -> Reconciled
+//! PathBuf -> Inspected -> Reconciled
 //! RemoteUrl  --> Inspected
 //! ```
 //!

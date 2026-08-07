@@ -5,6 +5,8 @@
 //! for the deactivation, and read-only post-observation of the exposed view. It never copies the
 //! tree, publishes a target, retains a prior generation, or persists active state.
 //! Platform-specific link mechanics are cfg-split here. Feature-gated on `local`.
+#![allow(clippy::result_large_err)] // receipt-preserving errors are the family law
+#![allow(clippy::type_complexity)] // the node methods echo the family's full typestate
 use std::fmt;
 use std::fs;
 #[cfg(windows)]
@@ -12,9 +14,10 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{Activate, Activated, Applied, EvidenceChain, Inspect, Materialize};
+use crate::{Activate, Activated, Applied, EvidenceChain, Materialize};
 
-use super::{LocalError, LocalInspect, LocalObservation, LocalTarget};
+use super::materialize::{MaterializeEvidence, Materialized};
+use super::{LocalError, LocalInspect, LocalObservation};
 /// Link strategy used by a local active-view activation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalActivationStrategy {
@@ -190,24 +193,38 @@ impl<N: fmt::Debug, E: fmt::Debug> std::error::Error for LocalActivateError<N, E
         }
     }
 }
-impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for LocalActivate {
-    type Error = LocalActivateError<Materialize<I, S, LocalTarget>, E>;
+impl LocalActivate {
+    /// Inherent mirror of [`Activate::activate`] — callable without importing the trait.
+    pub fn activate<N, V>(
+        &self,
+        applied: N,
+        view: V,
+    ) -> Result<<Self as Activate<N, V>>::Output, <Self as Activate<N, V>>::Error>
+    where
+        Self: Activate<N, V>,
+    {
+        Activate::activate(self, applied, view)
+    }
+}
+
+impl<I, S, E> Activate<crate::local::LocalApplied<I, S, E>, PathBuf> for LocalActivate {
+    type Error = LocalActivateError<Materialize<I, S, PathBuf>, E>;
     type Output = LocalActivated<E>;
 
     fn activate(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: crate::local::LocalApplied<I, S, E>,
         view: PathBuf,
     ) -> Result<Self::Output, Self::Error> {
-        let source = applied.input.target.path.clone();
+        let source = applied.input.target.clone();
         perform_activation(applied, view, source)
     }
 }
 
 /// The activate-family error over a materialization request (receipt-preserving by law).
-type ActivationError<I, S, E> = LocalActivateError<Materialize<I, S, LocalTarget>, E>;
+type ActivationError<I, S, E> = LocalActivateError<Materialize<I, S, PathBuf>, E>;
 /// The switch-family error over a materialization request (receipt-preserving by law).
-type SwitchError<I, S, E> = LocalSwitchError<Materialize<I, S, LocalTarget>, E>;
+type SwitchError<I, S, E> = LocalSwitchError<Materialize<I, S, PathBuf>, E>;
 
 /// Expose-aware activation: link a caller-selected subpath of the published tree.
 ///
@@ -216,21 +233,19 @@ type SwitchError<I, S, E> = LocalSwitchError<Materialize<I, S, LocalTarget>, E>;
 /// evidence records the exposed source path. This is the vertical's justified gap admission
 /// (S3.3-A1); the trait input stays `PathBuf`.
 impl LocalActivate {
-    #[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
     pub fn activate_at<I, S, E>(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: crate::local::LocalApplied<I, S, E>,
         view: PathBuf,
         expose: &Path,
     ) -> Result<LocalActivated<E>, ActivationError<I, S, E>> {
-        let source = applied.input.target.path.join(expose);
+        let source = applied.input.target.join(expose);
         perform_activation(applied, view, source)
     }
 }
 
-#[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
 fn perform_activation<I, S, E>(
-    applied: Applied<Materialize<I, S, LocalTarget>, E>,
+    applied: crate::local::LocalApplied<I, S, E>,
     view: PathBuf,
     source: PathBuf,
 ) -> Result<LocalActivated<E>, ActivationError<I, S, E>> {
@@ -331,7 +346,7 @@ fn perform_activation<I, S, E>(
         Ok(observed) => {
             let activated =
                 activation_receipt(view, applied.evidence, source, Some(observed.clone()));
-            if observed == LocalObservation::Symlink {
+            if observed == LocalObservation::SymlinkToDirectory {
                 Ok(activated)
             } else {
                 Err(LocalActivateError::AfterActivation {
@@ -351,16 +366,30 @@ fn perform_activation<I, S, E>(
     }
 }
 
-impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for LocalSwitch {
-    type Error = LocalSwitchError<Materialize<I, S, LocalTarget>, E>;
+impl LocalSwitch {
+    /// Inherent mirror of [`Activate::activate`] — callable without importing the trait.
+    pub fn activate<N, V>(
+        &self,
+        applied: N,
+        view: V,
+    ) -> Result<<Self as Activate<N, V>>::Output, <Self as Activate<N, V>>::Error>
+    where
+        Self: Activate<N, V>,
+    {
+        Activate::activate(self, applied, view)
+    }
+}
+
+impl<I, S, E> Activate<crate::local::LocalApplied<I, S, E>, PathBuf> for LocalSwitch {
+    type Error = LocalSwitchError<Materialize<I, S, PathBuf>, E>;
     type Output = LocalSwitched<E>;
 
     fn activate(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: crate::local::LocalApplied<I, S, E>,
         view: PathBuf,
     ) -> Result<Self::Output, Self::Error> {
-        let source = applied.input.target.path.clone();
+        let source = applied.input.target.clone();
         perform_switch(applied, view, source)
     }
 }
@@ -370,21 +399,19 @@ impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for 
 /// Same law as the `Activate` trait entry, with `source = target.join(expose)`. This is the
 /// switch twin of `LocalActivate::activate_at` (S3.3-A1).
 impl LocalSwitch {
-    #[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
     pub fn activate_at<I, S, E>(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: crate::local::LocalApplied<I, S, E>,
         view: PathBuf,
         expose: &Path,
     ) -> Result<LocalSwitched<E>, SwitchError<I, S, E>> {
-        let source = applied.input.target.path.join(expose);
+        let source = applied.input.target.join(expose);
         perform_switch(applied, view, source)
     }
 }
 
-#[allow(clippy::result_large_err)] // receipt-preserving errors are the family law
 fn perform_switch<I, S, E>(
-    applied: Applied<Materialize<I, S, LocalTarget>, E>,
+    applied: crate::local::LocalApplied<I, S, E>,
     view: PathBuf,
     source: PathBuf,
 ) -> Result<LocalSwitched<E>, SwitchError<I, S, E>> {
@@ -458,7 +485,7 @@ fn perform_switch<I, S, E>(
             });
         }
     };
-    if observed != LocalObservation::Symlink {
+    if observed != LocalObservation::SymlinkToDirectory {
         return Err(LocalSwitchError::ViewNotSymlink {
             applied,
             view,
@@ -529,13 +556,13 @@ fn perform_switch<I, S, E>(
     };
 
     match observe_activation_path(&view) {
-        Ok(LocalObservation::Symlink) => Ok(switch_receipt(
+        Ok(LocalObservation::SymlinkToDirectory) => Ok(switch_receipt(
             view,
             applied.evidence,
             previous_source,
             source,
             backend,
-            Some(LocalObservation::Symlink),
+            Some(LocalObservation::SymlinkToDirectory),
         )),
         Ok(observed) => {
             let activated = switch_receipt(
@@ -568,6 +595,231 @@ fn perform_switch<I, S, E>(
         }),
     }
 }
+/// The link law's policy: what to do when the view path is already occupied.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OccupiedViewPolicy {
+    /// An existing directory-symlink view is natively replaced (the vertical's law).
+    #[default]
+    AutoSwitch,
+    /// An occupied view is refused; nothing is replaced.
+    Refuse,
+}
+
+/// Outcome of the expose-aware link law (D6/D7): a view is always linked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkOutcome {
+    /// A new directory-symlink view was created.
+    Activated,
+    /// An existing directory-symlink view was natively replaced.
+    Switched,
+}
+
+/// The link law error; receipt-preserving like the activation family.
+#[derive(Debug)]
+pub enum LinkError<N, E> {
+    /// A pre-dispatch observation or the view-parent creation failed.
+    BeforeLink {
+        applied: Applied<N, E>,
+        view: PathBuf,
+        cause: LocalError,
+    },
+    /// The expose subpath is not a relative, non-escaping path (D7 shape law).
+    InvalidExpose {
+        applied: Applied<N, E>,
+        expose: PathBuf,
+    },
+    /// The exposed path is not a directory in the materialized tree (D7).
+    ExposeNotDirectory {
+        applied: Applied<N, E>,
+        path: PathBuf,
+        observed: LocalObservation,
+    },
+    /// The view path holds an entry that is not a directory-symlink view (D6).
+    ViewConflict {
+        applied: Applied<N, E>,
+        view: PathBuf,
+        observed: LocalObservation,
+    },
+    /// The view was created but the activation failed.
+    Activation { cause: LocalActivateError<N, E> },
+    /// The existing view was replaced but the switch failed.
+    Switch { cause: LocalSwitchError<N, E> },
+}
+
+impl<N, E> fmt::Display for LinkError<N, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeLink { cause, .. } => write!(f, "link failed: {cause}"),
+            Self::InvalidExpose { expose, .. } => write!(
+                f,
+                "expose path {} must be a relative, non-escaping subpath",
+                expose.display()
+            ),
+            Self::ExposeNotDirectory { path, .. } => {
+                write!(f, "expose path {} is not a directory", path.display())
+            }
+            Self::ViewConflict { view, observed, .. } => write!(
+                f,
+                "view {} holds {observed:?}, which is not a directory-symlink view; nothing replaced",
+                view.display()
+            ),
+            Self::Activation { cause } => write!(f, "view activation failed: {cause}"),
+            Self::Switch { cause } => write!(f, "view switch failed: {cause}"),
+        }
+    }
+}
+
+impl<N: fmt::Debug + 'static, E: fmt::Debug + 'static> std::error::Error for LinkError<N, E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeLink { cause, .. } => Some(cause),
+            Self::Activation { cause } => Some(cause),
+            Self::Switch { cause } => Some(cause),
+            Self::InvalidExpose { .. }
+            | Self::ExposeNotDirectory { .. }
+            | Self::ViewConflict { .. } => None,
+        }
+    }
+}
+
+/// D7 shape law: an expose subpath is relative, non-empty, and cannot escape the tree.
+fn is_safe_expose(expose: &Path) -> bool {
+    if expose.as_os_str().is_empty() || expose.is_absolute() {
+        return false;
+    }
+    expose
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+impl LocalActivate {
+    /// The expose-aware link law (D6/D7): link a view to the `expose` subpath of the
+    /// materialized tree, creating the view parent and switching an occupied view per `policy`.
+    pub fn link<I, S, E>(
+        &self,
+        applied: crate::local::LocalApplied<I, S, E>,
+        view: &Path,
+        expose: &Path,
+        policy: OccupiedViewPolicy,
+    ) -> Result<LinkOutcome, LinkError<Materialize<I, S, PathBuf>, E>> {
+        if !is_safe_expose(expose) {
+            return Err(LinkError::InvalidExpose {
+                applied,
+                expose: expose.to_path_buf(),
+            });
+        }
+        let source = applied.input.target.join(expose);
+        link_view(applied, view, source, policy)
+    }
+
+    /// The expose-aware link law (D6/D7): link a view to the materialized tree root.
+    pub fn link_root<I, S, E>(
+        &self,
+        applied: crate::local::LocalApplied<I, S, E>,
+        view: &Path,
+        policy: OccupiedViewPolicy,
+    ) -> Result<LinkOutcome, LinkError<Materialize<I, S, PathBuf>, E>> {
+        let source = applied.input.target.clone();
+        link_view(applied, view, source, policy)
+    }
+}
+
+impl<I, S, E> Materialized<I, S, E> {
+    /// The link law as a node method: link a view to the `expose` subpath of this materialized
+    /// tree, creating the view parent and switching an occupied view per `policy`.
+    pub fn link(
+        self,
+        view: &Path,
+        expose: &Path,
+        policy: OccupiedViewPolicy,
+    ) -> Result<
+        LinkOutcome,
+        LinkError<Materialize<I, S, PathBuf>, EvidenceChain<E, MaterializeEvidence>>,
+    > {
+        LocalActivate.link(self, view, expose, policy)
+    }
+
+    /// The link law as a node method: link a view to this materialized tree root.
+    pub fn link_root(
+        self,
+        view: &Path,
+        policy: OccupiedViewPolicy,
+    ) -> Result<
+        LinkOutcome,
+        LinkError<Materialize<I, S, PathBuf>, EvidenceChain<E, MaterializeEvidence>>,
+    > {
+        LocalActivate.link_root(self, view, policy)
+    }
+}
+
+/// The shared link dispatch: D7 source observation, view-parent creation, then D6
+/// (create when missing, switch an occupied view per policy, refuse any other entry).
+fn link_view<I, S, E>(
+    applied: crate::local::LocalApplied<I, S, E>,
+    view: &Path,
+    source: PathBuf,
+    policy: OccupiedViewPolicy,
+) -> Result<LinkOutcome, LinkError<Materialize<I, S, PathBuf>, E>> {
+    // D7: the exposed path must be a directory in the materialized tree.
+    let source_observed = match LocalInspect.observe(&source) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LinkError::BeforeLink {
+                applied,
+                view: view.to_path_buf(),
+                cause,
+            });
+        }
+    };
+    if source_observed != LocalObservation::Directory {
+        return Err(LinkError::ExposeNotDirectory {
+            applied,
+            path: source,
+            observed: source_observed,
+        });
+    }
+    // The link law owns the view structure: create the parent before any dispatch.
+    if let Some(parent) = view.parent()
+        && let Err(cause) = std::fs::create_dir_all(parent)
+    {
+        return Err(LinkError::BeforeLink {
+            applied,
+            view: view.to_path_buf(),
+            cause: LocalError::io("create view parent", parent, cause),
+        });
+    }
+    let observed = match LocalInspect.observe(view) {
+        Ok(observation) => observation,
+        Err(cause) => {
+            return Err(LinkError::BeforeLink {
+                applied,
+                view: view.to_path_buf(),
+                cause,
+            });
+        }
+    };
+    match observed {
+        LocalObservation::Missing => perform_activation(applied, view.to_path_buf(), source)
+            .map(|_| LinkOutcome::Activated)
+            .map_err(|cause| LinkError::Activation { cause }),
+        LocalObservation::SymlinkToDirectory => match policy {
+            OccupiedViewPolicy::AutoSwitch => perform_switch(applied, view.to_path_buf(), source)
+                .map(|_| LinkOutcome::Switched)
+                .map_err(|cause| LinkError::Switch { cause }),
+            OccupiedViewPolicy::Refuse => Err(LinkError::ViewConflict {
+                applied,
+                view: view.to_path_buf(),
+                observed,
+            }),
+        },
+        observed => Err(LinkError::ViewConflict {
+            applied,
+            view: view.to_path_buf(),
+            observed,
+        }),
+    }
+}
+
 /// Prior view state recorded by a deactivation: what was actually removed or absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalDeactivatePrior {
@@ -642,13 +894,27 @@ impl<N: fmt::Debug, E: fmt::Debug> std::error::Error for LocalDeactivateError<N,
     }
 }
 
-impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for LocalDeactivate {
-    type Error = LocalDeactivateError<Materialize<I, S, LocalTarget>, E>;
+impl LocalDeactivate {
+    /// Inherent mirror of [`Activate::activate`] — callable without importing the trait.
+    pub fn activate<N, V>(
+        &self,
+        applied: N,
+        view: V,
+    ) -> Result<<Self as Activate<N, V>>::Output, <Self as Activate<N, V>>::Error>
+    where
+        Self: Activate<N, V>,
+    {
+        Activate::activate(self, applied, view)
+    }
+}
+
+impl<I, S, E> Activate<crate::local::LocalApplied<I, S, E>, PathBuf> for LocalDeactivate {
+    type Error = LocalDeactivateError<Materialize<I, S, PathBuf>, E>;
     type Output = LocalDeactivated<E>;
 
     fn activate(
         &self,
-        applied: Applied<Materialize<I, S, LocalTarget>, E>,
+        applied: crate::local::LocalApplied<I, S, E>,
         view: PathBuf,
     ) -> Result<Self::Output, Self::Error> {
         let observed = match observe_activation_path(&view) {
@@ -670,37 +936,10 @@ impl<I, S, E> Activate<Applied<Materialize<I, S, LocalTarget>, E>, PathBuf> for 
                     LocalDeactivatePrior::Missing,
                 ));
             }
-            // Directory gate: only a symlink whose resolved target is a directory is a view.
-            LocalObservation::Symlink => {
-                let target = match fs::read_link(&view) {
-                    Ok(target) => target,
-                    Err(error) => {
-                        return Err(LocalDeactivateError::BeforeDeactivate {
-                            applied,
-                            view: view.clone(),
-                            cause: LocalError::io("read active directory symlink", &view, error),
-                        });
-                    }
-                };
-                match observe_activation_path(&target) {
-                    Ok(LocalObservation::Directory) => {}
-                    Ok(other) => {
-                        return Err(LocalDeactivateError::NotActiveView {
-                            applied,
-                            view,
-                            observed: other,
-                        });
-                    }
-                    Err(cause) => {
-                        return Err(LocalDeactivateError::BeforeDeactivate {
-                            applied,
-                            view,
-                            cause,
-                        });
-                    }
-                }
-            }
-            // Any other entry (file, directory, other) is refused without removal.
+            // Directory gate: only a directory-symlink is a view. The classification is the
+            // single-home `LocalInspect` observation — no link read here.
+            LocalObservation::SymlinkToDirectory => {}
+            // Any other entry (file, directory, file-symlink, other) is refused without removal.
             other => {
                 return Err(LocalDeactivateError::NotActiveView {
                     applied,
@@ -926,9 +1165,7 @@ fn activation_receipt<E>(
 }
 
 fn observe_activation_path(path: &Path) -> Result<LocalObservation, LocalError> {
-    LocalInspect
-        .inspect(LocalTarget::new(path))
-        .map(|inspected| inspected.observation)
+    LocalInspect.observe(path)
 }
 
 #[cfg(unix)]
