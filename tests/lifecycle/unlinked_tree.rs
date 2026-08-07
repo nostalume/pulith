@@ -2,13 +2,14 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 
-use pulith::archive::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip};
+use pulith::archive::{ArchiveKind, ArchivePolicy, prepare};
 use pulith::local::{
-    LocalAcquire, LocalApply, LocalError, LocalExpectation, LocalObservation, LocalPath,
-    LocalPlacement, LocalPostInspect, LocalReconcile, LocalReconciliation, LocalTarget,
+    LocalAcquire, LocalApply, LocalError, LocalExpectation, LocalObservation, LocalPlacement,
+    LocalPostInspect, LocalReconcile, LocalReconciliation,
 };
-use pulith::{Acquire, Apply, Inspect, Materialize, MaterializeMode, Prepare, Reconcile};
+use pulith::{Inspect, Materialize, MaterializeMode, Reconcile};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ArtifactId {
@@ -28,14 +29,14 @@ fn write_archive(path: &std::path::Path) {
 fn request(
     archive: &std::path::Path,
     target: &std::path::Path,
-) -> Materialize<ArtifactId, LocalPath, LocalTarget> {
+) -> Materialize<ArtifactId, PathBuf, PathBuf> {
     Materialize::new(
         ArtifactId {
             name: "demo-tool",
             version: "1.0.0",
         },
-        LocalPath::new(archive),
-        LocalTarget::new(target),
+        archive.to_path_buf(),
+        target.to_path_buf(),
         MaterializeMode::CreateNew,
     )
 }
@@ -51,9 +52,13 @@ fn unlinked_artifact_tree_composes_existing_behaviors() {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
     let acquired = LocalAcquire.acquire(request(&archive, &target)).unwrap();
-    let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&scratch))
-        .prepare(acquired, ArchivePolicy::default())
-        .unwrap();
+    let prepared = prepare(
+        acquired,
+        &scratch,
+        ArchivePolicy::default(),
+        ArchiveKind::Zip,
+    )
+    .unwrap();
     assert!(!target.exists());
     assert_eq!(prepared.evidence.previous.path, archive);
     assert_eq!(prepared.evidence.current.entries, 1);
@@ -71,7 +76,7 @@ fn unlinked_artifact_tree_composes_existing_behaviors() {
     assert!(!active_view.exists());
 
     let inspected = LocalPostInspect.inspect(applied).unwrap();
-    assert_eq!(inspected.input.path, target);
+    assert_eq!(inspected.input, target);
     assert_eq!(inspected.observation, LocalObservation::Directory);
     assert_eq!(inspected.evidence.previous, apply_evidence);
 
@@ -93,9 +98,13 @@ fn unlinked_artifact_tree_rejects_quiescent_existing_target() {
     fs::write(&sentinel, b"retain me").unwrap();
 
     let acquired = LocalAcquire.acquire(request(&archive, &target)).unwrap();
-    let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&scratch))
-        .prepare(acquired, ArchivePolicy::default())
-        .unwrap();
+    let prepared = prepare(
+        acquired,
+        &scratch,
+        ArchivePolicy::default(),
+        ArchiveKind::Zip,
+    )
+    .unwrap();
     let error = LocalApply.apply(prepared).unwrap_err();
 
     assert!(matches!(

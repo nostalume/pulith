@@ -1,7 +1,7 @@
 //! ZIP/TAR preparation into an exclusive guarded scratch tree.
 //!
 //! Owns archive-extraction semantics: entry paths, entry types, decoded and materialized limits,
-//! and path-escape guards. Preparation returns a crate-constructed `ArchiveTree` whose root is
+//! and path-escape guards. Preparation returns a crate-constructed `PreparedTree` whose root is
 //! readable by reference; the final destination is never touched. Feature-gated on `zip`/`tar`
 //! (with gzip/xz/zstd codecs composing tar).
 use std::collections::BTreeMap;
@@ -13,8 +13,8 @@ use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
 use crate::local::ApplyEvidence;
-use crate::local::{LocalApply, LocalError, LocalMaterial, LocalTarget};
-use crate::{Acquired, Applied, Apply, EvidenceChain, Materialize, Prepare, Prepared, Verified};
+use crate::local::{LocalApply, LocalError, LocalMaterial};
+use crate::{Applied, Apply, EvidenceChain, Materialize, Prepared};
 
 /// Errors produced by archive preparation and extraction.
 #[non_exhaustive]
@@ -110,8 +110,6 @@ impl std::error::Error for ArchiveError {
         }
     }
 }
-
-type ArchivePrepared<I, E, A> = Prepared<I, ArchiveTree<A>, EvidenceChain<E, ArchiveEvidence<A>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArchiveEntryKind {
@@ -210,6 +208,16 @@ pub struct Tar<C = Plain> {
     _codec: PhantomData<C>,
 }
 
+#[cfg(feature = "tar")]
+impl<C> Tar<C> {
+    /// Constructs the tar codec marker.
+    pub const fn new() -> Self {
+        Self {
+            _codec: PhantomData,
+        }
+    }
+}
+
 /// Resource and path policy for archive preparation.
 ///
 /// Construct this evolving policy with [`ArchivePolicy::new`] and its builder methods rather than
@@ -282,36 +290,58 @@ impl Default for ArchivePolicy {
 /// A prepared archive tree whose root is established by Pulith.
 ///
 /// External code may inspect the root but cannot construct this type from an arbitrary path or
-/// assign its root field directly. `ArchiveTree` remains an ordinary cloneable value: an open
-/// canonical state may replace it with another tree produced by Pulith. This boundary does not bind
-/// a tree permanently to one input or evidence record, make workspace contents immutable, or
-/// protect them from hostile concurrent filesystem mutation.
+/// The concrete archive format of a prepared tree, as data.
+///
+/// `ArchiveKind` is the canonical data representation of an archive format: `sniff_format`
+/// detects it from magic bytes, `prepare` dispatches on it, and `PreparedTree`/`ArchiveEvidence`
+/// attest it. The format is data, not a type — callers never name a codec type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    TarXz,
+    TarZstd,
+}
+
+/// A prepared extraction tree: the materialized root plus the format it was prepared as.
+///
+/// `PreparedTree` is the data-carrying result of `PrepareArchive`/`prepare`; `LocalApply`
+/// publishes its root. The `root` field is private — an open canonical state may be replaced
+/// only by another Pulith-produced tree, and `PreparedTree` remains an ordinary cloneable value.
+/// This boundary does not bind a tree permanently to one input or evidence record, make
+/// workspace contents immutable, or protect them from hostile concurrent filesystem mutation.
 ///
 /// ```compile_fail
 /// use std::path::PathBuf;
-/// use pulith::archive::ArchiveTree;
+/// use pulith::archive::PreparedTree;
 ///
-/// fn assign_root_directly(tree: &mut ArchiveTree<()>, other: PathBuf) {
+/// fn assign_root_directly(tree: &mut PreparedTree, other: PathBuf) {
 ///     tree.root = other;
 /// }
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveTree<A> {
+pub struct PreparedTree {
     root: PathBuf,
-    _archive: PhantomData<A>,
+    format: ArchiveKind,
 }
 
-impl<A> ArchiveTree<A> {
-    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
+impl PreparedTree {
+    pub(crate) fn new(root: impl Into<PathBuf>, format: ArchiveKind) -> Self {
         Self {
             root: root.into(),
-            _archive: PhantomData,
+            format,
         }
     }
 
     /// Returns the prepared tree root by shared reference.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The format this tree was prepared as.
+    pub fn format(&self) -> ArchiveKind {
+        self.format
     }
 }
 
@@ -320,10 +350,11 @@ impl<A> ArchiveTree<A> {
 /// `total_bytes` counts materialized regular-file bytes. For TAR families, `decoded_bytes` counts
 /// the decoded container stream, including headers, padding, extensions, and stripped entries.
 /// For ZIP, `decoded_bytes` counts decoded entry material; ZIP container metadata is seek-parsed
-/// rather than emitted through an equivalent decoded stream.
+/// rather than emitted through an equivalent decoded stream. `format` attests the archive kind
+/// the tree was prepared as (data, not a type).
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveEvidence<A> {
+pub struct ArchiveEvidence {
     pub root: PathBuf,
     pub entries: u64,
     pub total_bytes: u64,
@@ -331,11 +362,11 @@ pub struct ArchiveEvidence<A> {
     pub files: u64,
     pub directories: u64,
     pub symlinks: u64,
-    _archive: PhantomData<A>,
+    pub format: ArchiveKind,
 }
 
-impl<A> ArchiveEvidence<A> {
-    fn empty(root: impl Into<PathBuf>) -> Self {
+impl ArchiveEvidence {
+    fn empty(root: impl Into<PathBuf>, format: ArchiveKind) -> Self {
         Self {
             root: root.into(),
             entries: 0,
@@ -344,48 +375,213 @@ impl<A> ArchiveEvidence<A> {
             files: 0,
             directories: 0,
             symlinks: 0,
-            _archive: PhantomData,
+            format,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// An extraction root exclusively owned by the caller for Pulith preparation.
+/// A node carrying a local material ready for archive preparation (sealed to the typestates).
 ///
-/// Preparing an archive clears this path recursively before extraction. The path must not point
-/// at shared or independently managed content.
-pub struct ExtractWorkspace {
-    pub root: PathBuf,
+/// Both `Acquired` and `Verified` nodes expose identical `input`/`material`/`evidence` parts, so
+/// one `PrepareArchive` impl serves both. The trait is sealed: only the two typestates implement
+/// it, so the archive adapter cannot be driven from an arbitrary value.
+pub trait ArchiveNode: private::Sealed {
+    type Input;
+    type Evidence;
+    fn into_parts(self) -> (Self::Input, LocalMaterial, Self::Evidence);
 }
 
-impl ExtractWorkspace {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+mod private {
+    pub trait Sealed {}
+}
+
+impl<I, E> private::Sealed for crate::Acquired<I, LocalMaterial, E> {}
+impl<I, E> private::Sealed for crate::Verified<I, LocalMaterial, E> {}
+
+impl<I, E> ArchiveNode for crate::Acquired<I, LocalMaterial, E> {
+    type Input = I;
+    type Evidence = E;
+
+    fn into_parts(self) -> (I, LocalMaterial, E) {
+        (self.input, self.material, self.evidence)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivePrepare<A> {
-    workspace: ExtractWorkspace,
-    _archive: PhantomData<A>,
+impl<I, E> ArchiveNode for crate::Verified<I, LocalMaterial, E> {
+    type Input = I;
+    type Evidence = E;
+
+    fn into_parts(self) -> (I, LocalMaterial, E) {
+        (self.input, self.material, self.evidence)
+    }
 }
 
-impl<A> ArchivePrepare<A> {
-    pub fn new(workspace: ExtractWorkspace) -> Self {
-        Self {
+/// The archive-preparation behavior, implemented per format.
+///
+/// The ZST-to-behavior mapping lives in these impls (one per codec — no macro); every impl
+/// produces the same data-carrying `PreparedTree`, so callers never match on a codec type. Use
+/// the data-driven [`prepare`] entry unless you hold a statically known format.
+pub trait PrepareArchive {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>;
+}
+
+/// Prepare a verified or acquired material as the detected `kind`.
+///
+/// The data-driven entry: one closed dispatch from [`ArchiveKind`] to the per-format
+/// [`PrepareArchive`] impls. Returns the same data-carrying `PreparedTree` for every format.
+pub fn prepare<I, E, N>(
+    node: N,
+    workspace: &Path,
+    policy: ArchivePolicy,
+    kind: ArchiveKind,
+) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+where
+    N: ArchiveNode<Input = I, Evidence = E>,
+{
+    match kind {
+        ArchiveKind::Zip => Zip.prepare(node, workspace, policy),
+        ArchiveKind::Tar => Tar::<Plain>::new().prepare(node, workspace, policy),
+        ArchiveKind::TarGz => Tar::<Gzip>::new().prepare(node, workspace, policy),
+        ArchiveKind::TarXz => Tar::<Xz>::new().prepare(node, workspace, policy),
+        ArchiveKind::TarZstd => Tar::<Zstd>::new().prepare(node, workspace, policy),
+    }
+}
+
+#[cfg(feature = "zip")]
+impl PrepareArchive for Zip {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>,
+    {
+        prepare_archive(node, workspace, policy, ArchiveKind::Zip, extract_zip)
+    }
+}
+
+#[cfg(feature = "tar")]
+impl PrepareArchive for Tar<Plain> {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>,
+    {
+        prepare_archive(node, workspace, policy, ArchiveKind::Tar, extract_tar_plain)
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl PrepareArchive for Tar<Gzip> {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>,
+    {
+        prepare_archive(
+            node,
             workspace,
-            _archive: PhantomData,
+            policy,
+            ArchiveKind::TarGz,
+            extract_tar_gzip,
+        )
+    }
+}
+
+#[cfg(feature = "xz")]
+impl PrepareArchive for Tar<Xz> {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>,
+    {
+        prepare_archive(node, workspace, policy, ArchiveKind::TarXz, extract_tar_xz)
+    }
+}
+
+#[cfg(feature = "zstd")]
+impl PrepareArchive for Tar<Zstd> {
+    fn prepare<I, E, N>(
+        self,
+        node: N,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+    where
+        N: ArchiveNode<Input = I, Evidence = E>,
+    {
+        prepare_archive(
+            node,
+            workspace,
+            policy,
+            ArchiveKind::TarZstd,
+            extract_tar_zstd,
+        )
+    }
+}
+
+/// Detect an archive format from its magic bytes, reading the head once.
+///
+/// Returns `Ok(None)` when the material is not a recognized archive (the caller copies it
+/// as-is). Detection is read-only; it never extracts or opens a handle.
+pub fn sniff_format(path: &Path) -> io::Result<Option<ArchiveKind>> {
+    let mut head = [0u8; 512];
+    let mut file = File::open(path)?;
+    let read = read_head(&mut file, &mut head)?;
+    let head = &head[..read];
+    if head.len() >= 4 && head[..4] == [0x50, 0x4b, 0x03, 0x04] {
+        return Ok(Some(ArchiveKind::Zip));
+    }
+    if head.len() >= 2 && head[..2] == [0x1f, 0x8b] {
+        return Ok(Some(ArchiveKind::TarGz));
+    }
+    if head.len() >= 262 && &head[257..262] == b"ustar" {
+        return Ok(Some(ArchiveKind::Tar));
+    }
+    Ok(None)
+}
+
+fn read_head(file: &mut File, head: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(bytes) => filled += bytes,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
+    Ok(filled)
 }
 
-impl<I, S, E, A> Apply<Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, E>> for LocalApply {
+impl<I, S, E> Apply<Prepared<Materialize<I, S, PathBuf>, PreparedTree, E>> for LocalApply {
     type Error = LocalError;
-    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+    type Output = Applied<Materialize<I, S, PathBuf>, EvidenceChain<E, ApplyEvidence>>;
 
     fn apply(
         &self,
-        node: Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, E>,
+        node: Prepared<Materialize<I, S, PathBuf>, PreparedTree, E>,
     ) -> Result<Self::Output, Self::Error> {
         crate::local::apply_material(
             node.input,
@@ -397,73 +593,17 @@ impl<I, S, E, A> Apply<Prepared<Materialize<I, S, LocalTarget>, ArchiveTree<A>, 
     }
 }
 
-macro_rules! impl_archive_prepare {
-    ($archive:ty, $extract:path) => {
-        impl<I, E> Prepare<Acquired<I, LocalMaterial, E>, ArchivePolicy>
-            for ArchivePrepare<$archive>
-        {
-            type Error = ArchiveError;
-            type Output = ArchivePrepared<I, E, $archive>;
-
-            fn prepare(
-                &self,
-                node: Acquired<I, LocalMaterial, E>,
-                policy: ArchivePolicy,
-            ) -> Result<Self::Output, Self::Error> {
-                prepare_archive(
-                    node.input,
-                    node.material,
-                    node.evidence,
-                    &self.workspace.root,
-                    policy,
-                    $extract,
-                )
-            }
-        }
-
-        impl<I, E> Prepare<Verified<I, LocalMaterial, E>, ArchivePolicy>
-            for ArchivePrepare<$archive>
-        {
-            type Error = ArchiveError;
-            type Output = ArchivePrepared<I, E, $archive>;
-
-            fn prepare(
-                &self,
-                node: Verified<I, LocalMaterial, E>,
-                policy: ArchivePolicy,
-            ) -> Result<Self::Output, Self::Error> {
-                prepare_archive(
-                    node.input,
-                    node.material,
-                    node.evidence,
-                    &self.workspace.root,
-                    policy,
-                    $extract,
-                )
-            }
-        }
-    };
-}
-
-#[cfg(feature = "zip")]
-impl_archive_prepare!(Zip, extract_zip);
-#[cfg(feature = "tar")]
-impl_archive_prepare!(Tar<Plain>, extract_tar_plain);
-#[cfg(feature = "gzip")]
-impl_archive_prepare!(Tar<Gzip>, extract_tar_gzip);
-#[cfg(feature = "xz")]
-impl_archive_prepare!(Tar<Xz>, extract_tar_xz);
-#[cfg(feature = "zstd")]
-impl_archive_prepare!(Tar<Zstd>, extract_tar_zstd);
-
-fn prepare_archive<I, E, A>(
-    input: I,
-    material: LocalMaterial,
-    previous_evidence: E,
+fn prepare_archive<I, E, N>(
+    node: N,
     root: &Path,
     policy: ArchivePolicy,
-    extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence<A>, ArchiveError>,
-) -> Result<ArchivePrepared<I, E, A>, ArchiveError> {
+    format: ArchiveKind,
+    extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence, ArchiveError>,
+) -> Result<Prepared<I, PreparedTree, EvidenceChain<E, ArchiveEvidence>>, ArchiveError>
+where
+    N: ArchiveNode<Input = I, Evidence = E>,
+{
+    let (input, material, previous_evidence) = node.into_parts();
     if let LocalMaterial::Directory { path } = &material {
         return Err(ArchiveError::ArchiveRequiresFile(path.clone()));
     }
@@ -480,7 +620,7 @@ fn prepare_archive<I, E, A>(
 
     Ok(Prepared {
         input,
-        prepared: ArchiveTree::new(root),
+        prepared: PreparedTree::new(root, format),
         evidence: EvidenceChain {
             previous: previous_evidence,
             current: evidence,
@@ -508,12 +648,12 @@ fn extract_zip(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Zip>, ArchiveError> {
+) -> Result<ArchiveEvidence, ArchiveError> {
     let file = File::open(archive_path)
         .map_err(|err| ArchiveError::io("open zip archive", archive_path, err))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
-    let mut evidence = ArchiveEvidence::empty(root);
+    let mut evidence = ArchiveEvidence::empty(root, ArchiveKind::Zip);
     let mut paths = BTreeMap::new();
 
     for index in 0..archive.len() {
@@ -598,10 +738,10 @@ fn extract_tar_plain(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Plain>>, ArchiveError> {
+) -> Result<ArchiveEvidence, ArchiveError> {
     let file = File::open(archive_path)
         .map_err(|err| ArchiveError::io("open tar archive", archive_path, err))?;
-    extract_tar_reader(file, root, policy)
+    extract_tar_reader(file, root, policy, ArchiveKind::Tar)
 }
 
 #[cfg(feature = "gzip")]
@@ -609,10 +749,15 @@ fn extract_tar_gzip(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Gzip>>, ArchiveError> {
+) -> Result<ArchiveEvidence, ArchiveError> {
     let file = File::open(archive_path)
         .map_err(|err| ArchiveError::io("open gzip tar archive", archive_path, err))?;
-    extract_tar_reader(flate2::read::GzDecoder::new(file), root, policy)
+    extract_tar_reader(
+        flate2::read::GzDecoder::new(file),
+        root,
+        policy,
+        ArchiveKind::TarGz,
+    )
 }
 
 #[cfg(feature = "xz")]
@@ -620,10 +765,15 @@ fn extract_tar_xz(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Xz>>, ArchiveError> {
+) -> Result<ArchiveEvidence, ArchiveError> {
     let file = File::open(archive_path)
         .map_err(|err| ArchiveError::io("open xz tar archive", archive_path, err))?;
-    extract_tar_reader(xz2::read::XzDecoder::new(file), root, policy)
+    extract_tar_reader(
+        xz2::read::XzDecoder::new(file),
+        root,
+        policy,
+        ArchiveKind::TarXz,
+    )
 }
 
 #[cfg(feature = "zstd")]
@@ -631,23 +781,24 @@ fn extract_tar_zstd(
     archive_path: &Path,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<Tar<Zstd>>, ArchiveError> {
+) -> Result<ArchiveEvidence, ArchiveError> {
     let file = File::open(archive_path)
         .map_err(|err| ArchiveError::io("open zstd tar archive", archive_path, err))?;
     let decoder = zstd::stream::Decoder::new(file)
         .map_err(|err| ArchiveError::io("open zstd tar decoder", archive_path, err))?;
-    extract_tar_reader(decoder, root, policy)
+    extract_tar_reader(decoder, root, policy, ArchiveKind::TarZstd)
 }
 
 #[cfg(feature = "tar")]
-fn extract_tar_reader<A, R: Read>(
+fn extract_tar_reader<R: Read>(
     reader: R,
     root: &Path,
     policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence<A>, ArchiveError> {
+    format: ArchiveKind,
+) -> Result<ArchiveEvidence, ArchiveError> {
     let reader = DecodedLimitReader::new(reader, policy.max_decoded_bytes);
     let mut archive = tar::Archive::new(reader);
-    let mut evidence = ArchiveEvidence::empty(root);
+    let mut evidence = ArchiveEvidence::empty(root, format);
     let mut paths = BTreeMap::new();
     let entries = archive
         .entries()
@@ -1031,12 +1182,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ArchiveError, ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip, combine_archive_failure,
+        ArchiveError, ArchiveKind, ArchivePolicy, combine_archive_failure, prepare, sniff_format,
     };
-    use crate::local::{
-        LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
-    };
-    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare};
+    use crate::local::{LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial};
+    use crate::{Acquired, Materialize, MaterializeMode};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1161,16 +1310,13 @@ mod tests {
         root: &Path,
         zip_path: &Path,
         target: &Path,
-    ) -> Acquired<
-        Materialize<&'static str, LocalPath, LocalTarget>,
-        LocalMaterial,
-        LocalAcquireEvidence,
-    > {
+    ) -> Acquired<Materialize<&'static str, PathBuf, PathBuf>, LocalMaterial, LocalAcquireEvidence>
+    {
         let acquired = LocalAcquire
             .acquire(Materialize::new(
                 "archive",
-                LocalPath::new(zip_path),
-                LocalTarget::new(target),
+                zip_path.to_path_buf(),
+                target.to_path_buf(),
                 MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
@@ -1188,9 +1334,13 @@ mod tests {
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
         let verified = acquired_archive(&root, &zip_path, &target);
-        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
 
         assert_eq!(prepared.prepared.root(), extract_root.as_path());
         assert_eq!(prepared.evidence.current.entries, 1);
@@ -1219,9 +1369,13 @@ mod tests {
             evidence: (),
         };
 
-        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(node, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            node,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
 
         assert!(!staged_path.exists());
         assert_eq!(
@@ -1248,9 +1402,13 @@ mod tests {
         };
 
         assert!(
-            ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-                .prepare(node, ArchivePolicy::default())
-                .is_err()
+            prepare(
+                node,
+                &extract_root,
+                ArchivePolicy::default(),
+                ArchiveKind::Zip
+            )
+            .is_err()
         );
 
         assert!(!staged_path.exists());
@@ -1268,9 +1426,13 @@ mod tests {
         write_zip(&zip_path, &[("fresh.txt", b"fresh")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(extract_root.join("fresh.txt")).unwrap(),
@@ -1290,9 +1452,13 @@ mod tests {
         write_zip_with_directory(&zip_path);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().strip_components(1))
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().strip_components(1),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 2);
         assert_eq!(prepared.evidence.current.directories, 1);
@@ -1313,9 +1479,13 @@ mod tests {
         write_zip(&zip_path, &[("a.txt", b"a"), ("b.txt", b"b")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::new().max_entries(1))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::new().max_entries(1),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1335,9 +1505,13 @@ mod tests {
         write_zip(&zip_path, &[("../escape.txt", b"nope")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
@@ -1352,9 +1526,13 @@ mod tests {
         write_zip_with_symlink(&zip_path);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ArchiveError::UnsupportedArchiveEntry(_)));
         fs::remove_dir_all(root).unwrap();
@@ -1368,9 +1546,13 @@ mod tests {
         write_zip(&zip_path, &[("a.txt", b"abcd")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::new().max_total_bytes(3),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1391,9 +1573,13 @@ mod tests {
         write_zip_with_understated_size(&zip_path);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().max_total_bytes(4))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().max_total_bytes(4),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1416,9 +1602,13 @@ mod tests {
         write_zip(&zip_path, &[("foo", b"file"), ("foo/child.txt", b"child")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1437,9 +1627,13 @@ mod tests {
         write_zip(&zip_path, &[("Foo", b"file"), ("foo/child.txt", b"child")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1468,9 +1662,13 @@ mod tests {
             write_zip(&zip_path, &[(name, b"unsafe")]);
 
             let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-            let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-                .prepare(verified, ArchivePolicy::default())
-                .unwrap_err();
+            let err = prepare(
+                verified,
+                &extract_root,
+                ArchivePolicy::default(),
+                ArchiveKind::Zip,
+            )
+            .unwrap_err();
 
             assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)), "{name}");
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
@@ -1487,9 +1685,13 @@ mod tests {
         write_zip(&zip_path, &[("payload.txt", b"1234")]);
 
         let verified = acquired_archive(&root, &zip_path, &root.join("target"));
-        let err = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().max_entry_bytes(3))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().max_entry_bytes(3),
+            ArchiveKind::Zip,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1513,9 +1715,13 @@ mod tests {
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
         let verified = acquired_archive(&root, &zip_path, &target);
-        let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
         LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
@@ -1524,25 +1730,52 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn sniff_format_detects_zip_from_magic() {
+        let root = temp_root("sniff-zip");
+        fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("tool.zip");
+        write_zip(&zip_path, &[("bin/tool", b"payload")]);
+        assert_eq!(sniff_format(&zip_path).unwrap(), Some(ArchiveKind::Zip));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepared_tree_attests_its_format_as_data() {
+        let root = temp_root("prepared-format");
+        fs::create_dir_all(&root).unwrap();
+        let zip_path = root.join("tool.zip");
+        write_zip(&zip_path, &[("bin/tool", b"payload")]);
+        let target = root.join("target");
+        let verified = acquired_archive(&root, &zip_path, &target);
+        let extract_root = root.join("extract");
+
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.prepared.format(), ArchiveKind::Zip);
+        assert_eq!(prepared.evidence.current.format, ArchiveKind::Zip);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(all(test, feature = "tar", feature = "local"))]
 mod tar_tests {
     use std::fs::{self, File};
-    use std::io::{Cursor, Write};
+    use std::io::{self, Cursor, Write};
     use std::path::{Path, PathBuf};
 
     #[cfg(feature = "gzip")]
-    use super::Gzip;
     #[cfg(feature = "xz")]
-    use super::Xz;
     #[cfg(feature = "zstd")]
-    use super::Zstd;
-    use super::{ArchiveError, ArchivePolicy, ArchivePrepare, ExtractWorkspace, Tar};
-    use crate::local::{
-        LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial, LocalPath, LocalTarget,
-    };
-    use crate::{Acquire, Acquired, Apply, Materialize, MaterializeMode, Prepare};
+    use super::{ArchiveError, ArchiveKind, ArchivePolicy, prepare, sniff_format};
+    use crate::local::{LocalAcquire, LocalAcquireEvidence, LocalApply, LocalMaterial};
+    use crate::{Acquired, Materialize, MaterializeMode};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1661,16 +1894,13 @@ mod tar_tests {
         root: &Path,
         tar_path: &Path,
         target: &Path,
-    ) -> Acquired<
-        Materialize<&'static str, LocalPath, LocalTarget>,
-        LocalMaterial,
-        LocalAcquireEvidence,
-    > {
+    ) -> Acquired<Materialize<&'static str, PathBuf, PathBuf>, LocalMaterial, LocalAcquireEvidence>
+    {
         let acquired = LocalAcquire
             .acquire(Materialize::new(
                 "archive",
-                LocalPath::new(tar_path),
-                LocalTarget::new(target),
+                tar_path.to_path_buf(),
+                target.to_path_buf(),
                 MaterializeMode::ReplaceOrCreate,
             ))
             .unwrap();
@@ -1689,9 +1919,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
         assert_eq!(prepared.evidence.current.files, 1);
@@ -1714,9 +1948,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().strip_components(1))
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().strip_components(1),
+            ArchiveKind::Tar,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 2);
         assert_eq!(prepared.evidence.current.directories, 1);
@@ -1740,9 +1978,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(0))
-            .unwrap_err();
+        let error = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().max_decoded_bytes(0),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1765,30 +2007,33 @@ mod tar_tests {
             append_file(builder, "payload.txt", b"pulith")
         });
 
-        let measured = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("measure")))
-            .prepare(
-                acquired_archive(&root, &tar_path, &root.join("target")),
-                ArchivePolicy::default(),
-            )
-            .unwrap()
-            .evidence
-            .current
-            .decoded_bytes;
+        let measured = prepare(
+            acquired_archive(&root, &tar_path, &root.join("target")),
+            &root.join("measure"),
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap()
+        .evidence
+        .current
+        .decoded_bytes;
 
-        ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("exact")))
-            .prepare(
-                acquired_archive(&root, &tar_path, &root.join("target")),
-                ArchivePolicy::new().max_decoded_bytes(measured),
-            )
-            .unwrap();
+        prepare(
+            acquired_archive(&root, &tar_path, &root.join("target")),
+            &root.join("exact"),
+            ArchivePolicy::new().max_decoded_bytes(measured),
+            ArchiveKind::Tar,
+        )
+        .unwrap();
 
         let below_root = root.join("below");
-        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&below_root))
-            .prepare(
-                acquired_archive(&root, &tar_path, &root.join("target")),
-                ArchivePolicy::new().max_decoded_bytes(measured - 1),
-            )
-            .unwrap_err();
+        let error = prepare(
+            acquired_archive(&root, &tar_path, &root.join("target")),
+            &below_root,
+            ArchivePolicy::new().max_decoded_bytes(measured - 1),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ArchiveError::ArchiveLimitExceeded {
@@ -1812,9 +2057,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(512))
-            .unwrap_err();
+        let error = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().max_decoded_bytes(512),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1839,9 +2088,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::new().max_entries(1))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::new().max_entries(1),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1864,9 +2117,13 @@ mod tar_tests {
         patch_first_tar_path(&tar_path, b"../escape.txt");
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
@@ -1887,12 +2144,13 @@ mod tar_tests {
                 append_file(builder, "safe.txt", b"nope");
             });
 
-            let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-                .prepare(
-                    acquired_archive(&root, &tar_path, &root.join("target")),
-                    ArchivePolicy::default(),
-                )
-                .unwrap_err();
+            let error = prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                &extract_root,
+                ArchivePolicy::default(),
+                ArchiveKind::Tar,
+            )
+            .unwrap_err();
 
             assert!(matches!(error, ArchiveError::ArchiveInvalidPath(_)));
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
@@ -1915,12 +2173,13 @@ mod tar_tests {
                 append_file(builder, "safe.txt", b"nope");
             });
 
-            let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-                .prepare(
-                    acquired_archive(&root, &tar_path, &root.join("target")),
-                    ArchivePolicy::default(),
-                )
-                .unwrap_err();
+            let error = prepare(
+                acquired_archive(&root, &tar_path, &root.join("target")),
+                &extract_root,
+                ArchivePolicy::default(),
+                ArchiveKind::Tar,
+            )
+            .unwrap_err();
 
             assert!(matches!(error, ArchiveError::ArchiveInvalidPath(_)));
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
@@ -1938,9 +2197,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ArchiveError::UnsupportedArchiveEntry(_)));
         fs::remove_dir_all(root).unwrap();
@@ -1954,9 +2217,13 @@ mod tar_tests {
         write_tar(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::new().max_total_bytes(3),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1980,9 +2247,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2001,9 +2272,13 @@ mod tar_tests {
         write_truncated_tar(&tar_path);
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2025,12 +2300,13 @@ mod tar_tests {
         fs::create_dir_all(&root).unwrap();
         write_truncated_tar(&tar_path);
 
-        let error = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(
-                acquired_archive(&root, &tar_path, &root.join("target")),
-                ArchivePolicy::new().strip_components(1),
-            )
-            .unwrap_err();
+        let error = prepare(
+            acquired_archive(&root, &tar_path, &root.join("target")),
+            &extract_root,
+            ArchivePolicy::new().strip_components(1),
+            ArchiveKind::Tar,
+        )
+        .unwrap_err();
 
         assert!(matches!(error, ArchiveError::Io { .. }), "{error:?}");
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
@@ -2049,9 +2325,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &target);
-        let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::Tar,
+        )
+        .unwrap();
         LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
@@ -2073,9 +2353,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::TarGz,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
         assert_eq!(prepared.evidence.current.files, 1);
@@ -2097,9 +2381,13 @@ mod tar_tests {
         write_gzip_bytes(&tar_path, &bytes);
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::default(),
+            ArchiveKind::TarGz,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
@@ -2115,9 +2403,13 @@ mod tar_tests {
         write_tar_gzip(&tar_path, |builder| append_file(builder, "a.txt", b"abcd"));
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(root.join("extract")))
-            .prepare(verified, ArchivePolicy::new().max_total_bytes(3))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &root.join("extract"),
+            ArchivePolicy::new().max_total_bytes(3),
+            ArchiveKind::TarGz,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2142,14 +2434,15 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(
-                verified,
-                ArchivePolicy::new()
-                    .strip_components(2)
-                    .max_decoded_bytes(1024),
-            )
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new()
+                .strip_components(2)
+                .max_decoded_bytes(1024),
+            ArchiveKind::TarGz,
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -2182,9 +2475,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let err = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::new().max_decoded_bytes(1024))
-            .unwrap_err();
+        let err = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::new().max_decoded_bytes(1024),
+            ArchiveKind::TarGz,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2211,9 +2508,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &target);
-        let prepared = ArchivePrepare::<Tar<Gzip>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::TarGz,
+        )
+        .unwrap();
         LocalApply.apply(prepared).unwrap();
 
         assert_eq!(
@@ -2235,9 +2536,13 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Xz>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::TarXz,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
         assert_eq!(
@@ -2259,14 +2564,57 @@ mod tar_tests {
         });
 
         let verified = acquired_archive(&root, &tar_path, &root.join("target"));
-        let prepared = ArchivePrepare::<Tar<Zstd>>::new(ExtractWorkspace::new(&extract_root))
-            .prepare(verified, ArchivePolicy::default())
-            .unwrap();
+        let prepared = prepare(
+            verified,
+            &extract_root,
+            ArchivePolicy::default(),
+            ArchiveKind::TarZstd,
+        )
+        .unwrap();
 
         assert_eq!(prepared.evidence.current.entries, 1);
         assert_eq!(
             fs::read_to_string(extract_root.join("bin/tool.txt")).unwrap(),
             "pulith"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn sniff_format_detects_archives_from_magic_and_plain_bytes() {
+        let root = temp_root("sniff-format");
+        fs::create_dir_all(&root).unwrap();
+
+        let tar_path = root.join("tool.tar");
+        write_tar(&tar_path, |builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "tool", b"bin".as_slice())
+                .unwrap();
+        });
+        assert_eq!(sniff_format(&tar_path).unwrap(), Some(ArchiveKind::Tar));
+
+        let gz_path = root.join("tool.tar.gz");
+        write_tar_gzip(&gz_path, |builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "tool", b"bin".as_slice())
+                .unwrap();
+        });
+        assert_eq!(sniff_format(&gz_path).unwrap(), Some(ArchiveKind::TarGz));
+
+        let plain_path = root.join("plain.bin");
+        fs::write(&plain_path, b"not an archive at all").unwrap();
+        assert_eq!(sniff_format(&plain_path).unwrap(), None);
+
+        assert_eq!(
+            sniff_format(&root.join("missing.bin")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
         );
         fs::remove_dir_all(root).unwrap();
     }

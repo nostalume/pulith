@@ -3,37 +3,35 @@
 use pulith::Inspected;
 use pulith::hash::{
     ArtifactDescriptor, ArtifactInspectEvidence, ArtifactReconcile, ArtifactReconciliation,
-    HashInspect, HashMaterializeInspect,
+    DigestAlgorithmKind, HashInspect, HashMaterializeInspect,
 };
 use pulith::local::LocalArtifactObservation;
 #[cfg(feature = "blake3")]
 use pulith::local::LocalEntryKind;
-use pulith::local::LocalTarget;
 use pulith::{Inspect, Reconcile};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExternalEvidence;
 
-struct NonTraitAlgorithm;
-
 #[test]
 fn exact_evidence_and_reconcile_do_not_require_marker_traits() {
     fn require_open_evidence<T: Clone + Copy + Default + std::fmt::Debug + Eq>() {}
-    fn require_open_adapter<T: Clone + Copy + Default + std::fmt::Debug>() {}
-    require_open_evidence::<ArtifactInspectEvidence<NonTraitAlgorithm>>();
-    require_open_adapter::<HashInspect<NonTraitAlgorithm>>();
+    fn require_open_adapter<T: Clone + Copy + std::fmt::Debug>() {}
+    require_open_evidence::<ArtifactInspectEvidence>();
+    require_open_adapter::<HashInspect>();
 
     let inspected = Inspected {
-        input: LocalTarget::new("external-target"),
+        input: PathBuf::from("external-target"),
         observation: LocalArtifactObservation::File {
-            attestation: ArtifactDescriptor::<NonTraitAlgorithm>::new("observed", 1),
+            attestation: ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, "00".repeat(32), 1),
         },
         evidence: ExternalEvidence,
     };
     let reconciled = ArtifactReconcile
         .reconcile(
             inspected,
-            ArtifactDescriptor::<NonTraitAlgorithm>::new("expected", 1),
+            ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, "11".repeat(32), 1),
         )
         .unwrap();
     assert!(matches!(
@@ -43,8 +41,12 @@ fn exact_evidence_and_reconcile_do_not_require_marker_traits() {
 }
 
 #[cfg(feature = "blake3")]
-fn blake3_descriptor(bytes: &[u8]) -> ArtifactDescriptor<pulith::hash::Blake3> {
-    ArtifactDescriptor::new(blake3::hash(bytes).to_hex().to_string(), bytes.len() as u64)
+fn blake3_descriptor(bytes: &[u8]) -> ArtifactDescriptor {
+    ArtifactDescriptor::new(
+        DigestAlgorithmKind::Blake3,
+        blake3::hash(bytes).to_hex().to_string(),
+        bytes.len() as u64,
+    )
 }
 
 #[cfg(feature = "blake3")]
@@ -55,8 +57,8 @@ fn blake3_inspect_and_reconcile_exact_regular_file() {
     std::fs::write(&path, b"pulith").unwrap();
     let expected = blake3_descriptor(b"pulith");
 
-    let inspected = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(&path))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(path.clone())
         .unwrap();
     assert_eq!(
         inspected.observation,
@@ -75,8 +77,8 @@ fn same_size_content_drift_is_digest_mismatch() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"PULITH").unwrap();
-    let inspected = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(&path))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(path.clone())
         .unwrap();
 
     let reconciled = ArtifactReconcile
@@ -94,8 +96,8 @@ fn unequal_observed_bytes_is_size_mismatch() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"longer").unwrap();
-    let inspected = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(&path))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(path.clone())
         .unwrap();
 
     let reconciled = ArtifactReconcile
@@ -114,8 +116,8 @@ fn unequal_observed_bytes_is_size_mismatch() {
 #[test]
 fn missing_and_directory_are_observations() {
     let root = tempfile::tempdir().unwrap();
-    let missing = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(root.path().join("missing")))
+    let missing = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(root.path().join("missing"))
         .unwrap();
     assert_eq!(missing.observation, LocalArtifactObservation::Missing);
     let reconciled = ArtifactReconcile
@@ -123,8 +125,8 @@ fn missing_and_directory_are_observations() {
         .unwrap();
     assert_eq!(reconciled.reconciliation, ArtifactReconciliation::Missing);
 
-    let directory = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(root.path()))
+    let directory = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(root.path().to_path_buf())
         .unwrap();
     let reconciled = ArtifactReconcile
         .reconcile(directory, blake3_descriptor(b"expected"))
@@ -145,7 +147,7 @@ fn reconcile_preserves_external_inspection_evidence() {
     };
     let expected_observation = observation.clone();
     let inspected = Inspected {
-        input: LocalTarget::new("external-target"),
+        input: PathBuf::from("external-target"),
         observation,
         evidence: ExternalEvidence,
     };
@@ -172,8 +174,8 @@ fn final_symlink_and_dangling_symlink_are_wrong_kind() {
     crate::common::file_symlink(&target, &link).unwrap();
     crate::common::file_symlink(root.path().join("absent"), &dangling).unwrap();
     for path in [link, dangling] {
-        let inspected = HashInspect::<pulith::hash::Blake3>::new()
-            .inspect(LocalTarget::new(path))
+        let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+            .inspect(path)
             .unwrap();
         let reconciled = ArtifactReconcile
             .reconcile(inspected, blake3_descriptor(b"secret"))
@@ -196,8 +198,8 @@ fn parent_symlink_is_followed_within_trusted_parent_boundary() {
     std::fs::create_dir(&real).unwrap();
     std::fs::write(real.join("artifact"), b"pulith").unwrap();
     crate::common::dir_symlink(&real, &linked).unwrap();
-    let inspected = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(linked.join("artifact")))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(linked.join("artifact"))
         .unwrap();
     assert!(matches!(
         inspected.observation,
@@ -222,8 +224,8 @@ fn unix_fifo_and_socket_are_other_without_blocking() {
     assert!(status.success());
     let _listener = UnixListener::bind(&socket).unwrap();
     for path in [fifo, socket] {
-        let inspected = HashInspect::<pulith::hash::Blake3>::new()
-            .inspect(LocalTarget::new(path))
+        let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+            .inspect(path)
             .unwrap();
         assert_eq!(inspected.observation, LocalArtifactObservation::Other);
     }
@@ -246,8 +248,8 @@ fn windows_junction_is_reparse() {
         .status()
         .unwrap();
     assert!(status.success());
-    let inspected = HashInspect::<pulith::hash::Blake3>::new()
-        .inspect(LocalTarget::new(junction))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
+        .inspect(junction)
         .unwrap();
     assert_eq!(inspected.observation, LocalArtifactObservation::Reparse);
 }
@@ -260,11 +262,14 @@ fn sha256_inspect_and_reconcile_exact_regular_file() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"pulith").unwrap();
-    let expected =
-        ArtifactDescriptor::<pulith::hash::Sha256>::new(hex::encode(Sha256::digest(b"pulith")), 6);
+    let expected = ArtifactDescriptor::new(
+        DigestAlgorithmKind::Sha256,
+        hex::encode(Sha256::digest(b"pulith")),
+        6,
+    );
 
-    let inspected = HashInspect::<pulith::hash::Sha256>::new()
-        .inspect(LocalTarget::new(&path))
+    let inspected = HashInspect::new(pulith::hash::DigestAlgorithmKind::Sha256)
+        .inspect(path.clone())
         .unwrap();
     let reconciled = ArtifactReconcile.reconcile(inspected, expected).unwrap();
     assert_eq!(reconciled.reconciliation, ArtifactReconciliation::Matches);
@@ -273,8 +278,8 @@ fn sha256_inspect_and_reconcile_exact_regular_file() {
 #[cfg(feature = "blake3")]
 #[test]
 fn materialize_inspection_preserves_receipt_and_observes_later_drift() {
-    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
-    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+    use pulith::local::{LocalAcquire, LocalApply};
+    use pulith::{Materialize, MaterializeMode};
 
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
@@ -285,8 +290,8 @@ fn materialize_inspection_preserves_receipt_and_observes_later_drift() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "hash-materialize-inspect",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
@@ -295,7 +300,7 @@ fn materialize_inspection_preserves_receipt_and_observes_later_drift() {
     let apply_evidence = applied.evidence.clone();
     std::fs::write(&target, b"PULITH").unwrap();
 
-    let inspected = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+    let inspected = HashMaterializeInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
         .inspect(applied)
         .unwrap();
     assert_eq!(inspected.evidence.previous, apply_evidence);
@@ -317,8 +322,8 @@ fn materialize_inspection_preserves_receipt_and_observes_later_drift() {
 #[cfg(feature = "blake3")]
 #[test]
 fn materialize_inspection_error_retains_completed_receipt() {
-    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
-    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+    use pulith::local::{LocalAcquire, LocalApply};
+    use pulith::{Materialize, MaterializeMode};
 
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
@@ -329,20 +334,20 @@ fn materialize_inspection_error_retains_completed_receipt() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "hash-materialize-inspect-error",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
         )
         .unwrap();
-    applied.input.target.path.push("\0");
-    let invalid_target = applied.input.target.path.clone();
+    applied.input.target.push("\0");
+    let invalid_target = applied.input.target.clone();
 
-    let error = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+    let error = HashMaterializeInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
         .inspect(applied)
         .unwrap_err();
-    assert_eq!(error.applied.input.target.path, invalid_target);
+    assert_eq!(error.applied.input.target, invalid_target);
     assert!(matches!(
         error.cause,
         pulith::hash::HashError::LocalArtifact { path, .. } if path == invalid_target
@@ -351,8 +356,8 @@ fn materialize_inspection_error_retains_completed_receipt() {
 #[cfg(feature = "blake3")]
 #[test]
 fn materialize_inspection_classifies_later_symlink_without_hashing_it() {
-    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
-    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+    use pulith::local::{LocalAcquire, LocalApply};
+    use pulith::{Materialize, MaterializeMode};
 
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
@@ -363,8 +368,8 @@ fn materialize_inspection_classifies_later_symlink_without_hashing_it() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "hash-materialize-inspect-symlink",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
@@ -373,7 +378,7 @@ fn materialize_inspection_classifies_later_symlink_without_hashing_it() {
     std::fs::remove_file(&target).unwrap();
     crate::common::file_symlink(&source, &target).unwrap();
 
-    let inspected = HashMaterializeInspect::<pulith::hash::Blake3>::new()
+    let inspected = HashMaterializeInspect::new(pulith::hash::DigestAlgorithmKind::Blake3)
         .inspect(applied)
         .unwrap();
     assert_eq!(inspected.observation, LocalArtifactObservation::Symlink);
@@ -382,8 +387,8 @@ fn materialize_inspection_classifies_later_symlink_without_hashing_it() {
 #[cfg(feature = "sha2")]
 #[test]
 fn sha256_materialize_inspection_attests_final_file() {
-    use pulith::local::{LocalAcquire, LocalApply, LocalPath};
-    use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+    use pulith::local::{LocalAcquire, LocalApply};
+    use pulith::{Materialize, MaterializeMode};
     use sha2::{Digest, Sha256};
 
     let root = tempfile::tempdir().unwrap();
@@ -395,21 +400,25 @@ fn sha256_materialize_inspection_attests_final_file() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "sha256-hash-materialize-inspect",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
         )
         .unwrap();
 
-    let inspected = HashMaterializeInspect::<pulith::hash::Sha256>::new()
+    let inspected = HashMaterializeInspect::new(pulith::hash::DigestAlgorithmKind::Sha256)
         .inspect(applied)
         .unwrap();
     assert_eq!(
         inspected.observation,
         LocalArtifactObservation::File {
-            attestation: ArtifactDescriptor::new(hex::encode(Sha256::digest(b"pulith")), 6),
+            attestation: ArtifactDescriptor::new(
+                DigestAlgorithmKind::Sha256,
+                hex::encode(Sha256::digest(b"pulith")),
+                6
+            ),
         }
     );
 }

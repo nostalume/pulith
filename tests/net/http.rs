@@ -1,5 +1,7 @@
 #![cfg(feature = "net")]
 
+use std::path::PathBuf;
+
 use pulith::net::{RemoteUrl, RemoteUrlError};
 
 #[test]
@@ -39,11 +41,10 @@ fn async_http_inspect_implements_inspection_contract() {
 #[cfg(all(feature = "http-sync", feature = "local"))]
 #[test]
 fn sync_http_acquire_implements_destination_free_contract() {
-    use pulith::local::LocalTarget;
     use pulith::net::{RemoteSource, SyncHttpAcquire};
     use pulith::{Acquire, Materialize};
 
-    fn assert_acquire<T: Acquire<Materialize<(), RemoteSource, LocalTarget>>>(_: &T) {}
+    fn assert_acquire<T: Acquire<Materialize<(), RemoteSource, PathBuf>>>(_: &T) {}
 
     assert_acquire(&SyncHttpAcquire::default());
 }
@@ -51,11 +52,10 @@ fn sync_http_acquire_implements_destination_free_contract() {
 #[cfg(all(feature = "http-async", feature = "local"))]
 #[test]
 fn async_http_acquire_implements_destination_free_contract() {
-    use pulith::local::LocalTarget;
     use pulith::net::{AsyncHttpAcquire, RemoteSource};
     use pulith::{AsyncAcquire, Materialize};
 
-    fn assert_async_acquire<T: AsyncAcquire<Materialize<(), RemoteSource, LocalTarget>>>(_: &T) {}
+    fn assert_async_acquire<T: AsyncAcquire<Materialize<(), RemoteSource, PathBuf>>>(_: &T) {}
 
     assert_async_acquire(&AsyncHttpAcquire::default());
 }

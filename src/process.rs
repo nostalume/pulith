@@ -52,8 +52,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(feature = "process-async")]
 use crate::AsyncAcquire;
-use crate::local::{LocalInspect, LocalObservation, LocalTarget, StagedTree};
-use crate::{Acquire, Acquired, EvidenceChain, Inspect, Materialize};
+use crate::local::{LocalInspect, LocalObservation, StagedTree};
+use crate::{Acquire, Acquired, EvidenceChain, Materialize};
 
 const OUTPUT_ENV: &str = "PULITH_OUTPUT_ROOT";
 const INPUT_ENV: &str = "PULITH_INPUT_ROOT";
@@ -541,7 +541,7 @@ impl std::error::Error for ProcessError {
 }
 
 type ProcessAcquired<I> = Acquired<
-    Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+    Materialize<I, ProcessAction<Cooperative>, PathBuf>,
     StagedTree,
     EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
 >;
@@ -559,19 +559,19 @@ impl ProcessAcquire<Cooperative> {
     }
 }
 
-impl<I> Acquire<Materialize<I, ProcessAction<Cooperative>, LocalTarget>>
+impl<I> Acquire<Materialize<I, ProcessAction<Cooperative>, PathBuf>>
     for ProcessAcquire<Cooperative>
 {
     type Error = ProcessError;
     type Output = Acquired<
-        Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        Materialize<I, ProcessAction<Cooperative>, PathBuf>,
         StagedTree,
         EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
     >;
 
     fn acquire(
         &self,
-        input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
     ) -> Result<Self::Output, Self::Error> {
         acquire_process(input, None)
     }
@@ -587,7 +587,7 @@ impl ProcessAcquire<Cooperative> {
     /// [`ProcessError::TimedOut`].
     pub fn acquire_with_cancel<I>(
         &self,
-        input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<ProcessAcquired<I>, ProcessError> {
         acquire_process(input, Some(cancel))
@@ -595,7 +595,7 @@ impl ProcessAcquire<Cooperative> {
 }
 
 fn acquire_process<I>(
-    input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+    input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
     cancel: Option<&CancellationToken>,
 ) -> Result<ProcessAcquired<I>, ProcessError> {
     if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -770,7 +770,7 @@ fn acquire_process<I>(
         );
     }
     let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-    let observation = match LocalInspect.inspect(LocalTarget::new(&selected_output)) {
+    let observation = match LocalInspect.inspect((&selected_output).into()) {
         Ok(inspected) => inspected.observation,
         Err(source) => {
             return fail_cleanup(
@@ -857,12 +857,12 @@ fn stage_inputs(workspace: &Path, inputs: &[InputSpec]) -> Result<(), ProcessErr
 }
 
 #[cfg(feature = "process-async")]
-impl<I> AsyncAcquire<Materialize<I, ProcessAction<Cooperative>, LocalTarget>>
+impl<I> AsyncAcquire<Materialize<I, ProcessAction<Cooperative>, PathBuf>>
     for ProcessAcquire<Cooperative>
 {
     type Error = ProcessError;
     type Output = Acquired<
-        Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        Materialize<I, ProcessAction<Cooperative>, PathBuf>,
         StagedTree,
         EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
     >;
@@ -873,10 +873,10 @@ impl<I> AsyncAcquire<Materialize<I, ProcessAction<Cooperative>, LocalTarget>>
     )]
     fn acquire<'a>(
         &'a self,
-        input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + 'a
     where
-        Materialize<I, ProcessAction<Cooperative>, LocalTarget>: 'a,
+        Materialize<I, ProcessAction<Cooperative>, PathBuf>: 'a,
     {
         async move { acquire_process_async(input, None).await }
     }
@@ -889,7 +889,7 @@ impl ProcessAcquire<Cooperative> {
     /// the future alive to await the outcome. Dropping the future still stops the tree.
     pub async fn acquire_with_token<I>(
         &self,
-        input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
         cancel: &CancellationToken,
     ) -> Result<ProcessAcquired<I>, ProcessError> {
         acquire_process_async(input, Some(cancel)).await
@@ -898,7 +898,7 @@ impl ProcessAcquire<Cooperative> {
 
 #[cfg(feature = "process-async")]
 async fn acquire_process_async<I>(
-    input: Materialize<I, ProcessAction<Cooperative>, LocalTarget>,
+    input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
     cancel: Option<&CancellationToken>,
 ) -> Result<ProcessAcquired<I>, ProcessError> {
     if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -1079,7 +1079,7 @@ async fn acquire_process_async<I>(
     }
     guard.disarm();
     let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-    let observation = match LocalInspect.inspect(LocalTarget::new(&selected_output)) {
+    let observation = match LocalInspect.inspect((&selected_output).into()) {
         Ok(inspected) => inspected.observation,
         Err(source) => {
             return fail_cleanup(

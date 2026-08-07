@@ -1,28 +1,27 @@
 #![cfg(feature = "local")]
 
+use std::path::PathBuf;
+
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
 use crate::common::HttpFixture;
 #[cfg(any(feature = "http-sync", feature = "http-async", feature = "zip"))]
 use std::io::Write;
 
-#[cfg(any(feature = "http-sync", feature = "zip", feature = "tar"))]
-use pulith::Acquire;
+use pulith::Forget;
+#[cfg(any(feature = "http-sync", feature = "http-async"))]
+use pulith::Reconcile;
 #[cfg(any(feature = "zip", feature = "tar"))]
-use pulith::Prepare;
 #[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
 use pulith::Verify;
 #[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
-use pulith::hash::{ArtifactDescriptor, Blake3, HashVerify};
+use pulith::hash::{ArtifactDescriptor, DigestAlgorithmKind, HashVerify};
 #[cfg(any(feature = "zip", feature = "tar"))]
-use pulith::local::{LocalAcquire, LocalPath};
-use pulith::local::{LocalApply, LocalTarget};
+use pulith::local::LocalAcquire;
+use pulith::local::LocalApply;
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
 use pulith::local::{LocalExpectation, LocalInspect, LocalReconcile, LocalReconciliation};
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
 use pulith::net::{RemoteSource, RemoteUrl};
-use pulith::{Apply, Forget};
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
-use pulith::{Inspect, Reconcile};
 #[cfg(any(
     feature = "http-sync",
     feature = "http-async",
@@ -33,20 +32,24 @@ use pulith::{Materialize, MaterializeMode};
 
 #[cfg(any(feature = "http-sync", feature = "http-async"))]
 #[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
-fn descriptor(body: &[u8]) -> ArtifactDescriptor<Blake3> {
-    ArtifactDescriptor::new(blake3::hash(body).to_hex().to_string(), body.len() as u64)
+fn descriptor(body: &[u8]) -> ArtifactDescriptor {
+    ArtifactDescriptor::new(
+        DigestAlgorithmKind::Blake3,
+        blake3::hash(body).to_hex().to_string(),
+        body.len() as u64,
+    )
 }
 
 #[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
 fn assert_applied_then_reconciled(target: &std::path::Path, body: &[u8]) {
     assert_eq!(std::fs::read(target).unwrap(), body);
 
-    let inspected = LocalInspect.inspect(LocalTarget::new(target)).unwrap();
+    let inspected = LocalInspect.inspect(target.to_path_buf()).unwrap();
     let reconciled = LocalReconcile
         .reconcile(inspected, LocalExpectation::FileSize(body.len() as u64))
         .unwrap();
     assert_eq!(reconciled.reconciliation, LocalReconciliation::Matches);
-    assert_eq!(reconciled.input.path, target);
+    assert_eq!(reconciled.input, target);
 }
 
 #[cfg(any(feature = "zip", feature = "tar"))]
@@ -54,15 +57,15 @@ fn acquire_local_archive(
     archive: &std::path::Path,
     target: &std::path::Path,
 ) -> pulith::Acquired<
-    Materialize<&'static str, LocalPath, LocalTarget>,
+    Materialize<&'static str, PathBuf, PathBuf>,
     pulith::local::LocalMaterial,
     pulith::local::LocalAcquireEvidence,
 > {
     LocalAcquire
         .acquire(Materialize::new(
             "archive-flow",
-            LocalPath::new(archive),
-            LocalTarget::new(target),
+            archive.to_path_buf(),
+            target.to_path_buf(),
             MaterializeMode::ReplaceOrCreate,
         ))
         .unwrap()
@@ -80,7 +83,7 @@ fn sync_http_materialization_verification_and_reconciliation() {
     let request = Materialize::new(
         "sync-flow",
         RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()),
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
 
@@ -90,7 +93,7 @@ fn sync_http_materialization_verification_and_reconciliation() {
     assert_eq!(acquired.evidence.status, 200);
     assert_eq!(acquired.evidence.bytes, body.len() as u64);
 
-    let verified = HashVerify::<Blake3>::new()
+    let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
         .verify(acquired, descriptor(body))
         .unwrap();
     assert_eq!(verified.evidence.previous.bytes, body.len() as u64);
@@ -114,7 +117,7 @@ fn async_http_materialization_verification_and_reconciliation() {
     let request = Materialize::new(
         "async-flow",
         RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()),
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
 
@@ -129,7 +132,7 @@ fn async_http_materialization_verification_and_reconciliation() {
     assert_eq!(acquired.evidence.status, 200);
     assert_eq!(acquired.evidence.bytes, body.len() as u64);
 
-    let verified = HashVerify::<Blake3>::new()
+    let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
         .verify(acquired, descriptor(body))
         .unwrap();
     assert_eq!(verified.evidence.previous.bytes, body.len() as u64);
@@ -152,14 +155,18 @@ fn failed_http_verification_never_publishes_the_adapter_owned_stage() {
     let request = Materialize::new(
         "verify-failure",
         RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()),
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
 
     let acquired = SyncHttpAcquire::default().acquire(request).unwrap();
     server.join();
     let wrong = descriptor(b"different artifact");
-    assert!(HashVerify::<Blake3>::new().verify(acquired, wrong).is_err());
+    assert!(
+        HashVerify::new(DigestAlgorithmKind::Blake3)
+            .verify(acquired, wrong)
+            .is_err()
+    );
 
     assert!(!target.exists());
 }
@@ -167,7 +174,7 @@ fn failed_http_verification_never_publishes_the_adapter_owned_stage() {
 #[cfg(feature = "zip")]
 #[test]
 fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
-    use pulith::archive::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip};
+    use pulith::archive::{ArchiveKind, ArchivePolicy, prepare};
 
     let root = tempfile::tempdir().unwrap();
     let archive = root.path().join("artifact.zip");
@@ -180,12 +187,13 @@ fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
     writer.write_all(b"zip payload").unwrap();
     writer.finish().unwrap();
 
-    let prepared = ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&scratch))
-        .prepare(
-            acquire_local_archive(&archive, &target),
-            ArchivePolicy::default(),
-        )
-        .unwrap();
+    let prepared = prepare(
+        acquire_local_archive(&archive, &target),
+        &scratch,
+        ArchivePolicy::default(),
+        ArchiveKind::Zip,
+    )
+    .unwrap();
     assert!(!target.exists());
     assert_eq!(prepared.evidence.current.entries, 1);
     assert_eq!(prepared.evidence.current.files, 1);
@@ -204,7 +212,7 @@ fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
 #[cfg(feature = "tar")]
 #[test]
 fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
-    use pulith::archive::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Tar};
+    use pulith::archive::{ArchiveKind, ArchivePolicy, prepare};
 
     let root = tempfile::tempdir().unwrap();
     let archive = root.path().join("artifact.tar");
@@ -225,12 +233,13 @@ fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
         .unwrap();
     builder.finish().unwrap();
 
-    let prepared = ArchivePrepare::<Tar>::new(ExtractWorkspace::new(&scratch))
-        .prepare(
-            acquire_local_archive(&archive, &target),
-            ArchivePolicy::default(),
-        )
-        .unwrap();
+    let prepared = prepare(
+        acquire_local_archive(&archive, &target),
+        &scratch,
+        ArchivePolicy::default(),
+        ArchiveKind::Tar,
+    )
+    .unwrap();
     assert!(!target.exists());
     assert_eq!(prepared.evidence.current.entries, 1);
     assert_eq!(prepared.evidence.current.files, 1);
@@ -249,7 +258,7 @@ fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
 #[cfg(feature = "zip")]
 #[test]
 fn unsafe_archive_preparation_leaves_no_final_target_or_contaminated_workspace() {
-    use pulith::archive::{ArchivePolicy, ArchivePrepare, ExtractWorkspace, Zip};
+    use pulith::archive::{ArchiveKind, ArchivePolicy, prepare};
 
     let root = tempfile::tempdir().unwrap();
     let archive = root.path().join("unsafe.zip");
@@ -263,12 +272,13 @@ fn unsafe_archive_preparation_leaves_no_final_target_or_contaminated_workspace()
     writer.finish().unwrap();
 
     assert!(
-        ArchivePrepare::<Zip>::new(ExtractWorkspace::new(&scratch))
-            .prepare(
-                acquire_local_archive(&archive, &target),
-                ArchivePolicy::default(),
-            )
-            .is_err()
+        prepare(
+            acquire_local_archive(&archive, &target),
+            &scratch,
+            ArchivePolicy::default(),
+            ArchiveKind::Zip
+        )
+        .is_err()
     );
 
     assert!(!target.exists());
@@ -283,7 +293,7 @@ fn forget_applies_directly_without_a_synthetic_predecessor() {
     std::fs::write(&target, b"obsolete").unwrap();
 
     let applied = LocalApply
-        .apply(Forget::new("forget-flow", LocalTarget::new(&target)))
+        .apply(Forget::new("forget-flow", target.clone()))
         .unwrap();
 
     assert!(!target.exists());

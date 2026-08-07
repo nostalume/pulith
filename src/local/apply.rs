@@ -14,7 +14,7 @@ use crate::{
     Acquired, Applied, Apply, EvidenceChain, Forget, Materialize, MaterializeMode, Verified,
 };
 
-use super::{LocalError, LocalMaterial, LocalTarget, StagedTree};
+use super::{LocalError, LocalMaterial, StagedTree};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyEvidence {
@@ -86,43 +86,56 @@ impl LocalApplyStats {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalApply;
 
-type LocalApplied<I, S, E> =
-    Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+type LocalApplied<I, S, E> = Applied<Materialize<I, S, PathBuf>, EvidenceChain<E, ApplyEvidence>>;
 
-impl<I, S, E> Apply<Acquired<Materialize<I, S, LocalTarget>, LocalMaterial, E>> for LocalApply {
+impl LocalApply {
+    /// Inherent mirror of [`Apply::apply`] — callable without importing the trait.
+    ///
+    /// The generic bound resolves the concrete input (acquired, verified, prepared, forget);
+    /// inherent methods cannot be overloaded by signature, so the single generic mirror covers
+    /// every input the family implements.
+    pub fn apply<N>(&self, node: N) -> Result<<Self as Apply<N>>::Output, <Self as Apply<N>>::Error>
+    where
+        Self: Apply<N>,
+    {
+        Apply::apply(self, node)
+    }
+}
+
+impl<I, S, E> Apply<crate::local::LocalAcquired<I, S, E>> for LocalApply {
     type Error = LocalError;
-    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+    type Output = Applied<Materialize<I, S, PathBuf>, EvidenceChain<E, ApplyEvidence>>;
 
     fn apply(
         &self,
-        node: Acquired<Materialize<I, S, LocalTarget>, LocalMaterial, E>,
+        node: crate::local::LocalAcquired<I, S, E>,
     ) -> Result<Self::Output, Self::Error> {
         apply_material(node.input, node.material, node.evidence)
     }
 }
 
-impl<I, S, E> Apply<Verified<Materialize<I, S, LocalTarget>, LocalMaterial, E>> for LocalApply {
+impl<I, S, E> Apply<Verified<Materialize<I, S, PathBuf>, LocalMaterial, E>> for LocalApply {
     type Error = LocalError;
-    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+    type Output = Applied<Materialize<I, S, PathBuf>, EvidenceChain<E, ApplyEvidence>>;
 
     fn apply(
         &self,
-        node: Verified<Materialize<I, S, LocalTarget>, LocalMaterial, E>,
+        node: Verified<Materialize<I, S, PathBuf>, LocalMaterial, E>,
     ) -> Result<Self::Output, Self::Error> {
         apply_material(node.input, node.material, node.evidence)
     }
 }
 
-impl<I, S, E> Apply<Acquired<Materialize<I, S, LocalTarget>, StagedTree, E>> for LocalApply {
+impl<I, S, E> Apply<Acquired<Materialize<I, S, PathBuf>, StagedTree, E>> for LocalApply {
     type Error = LocalError;
-    type Output = Applied<Materialize<I, S, LocalTarget>, EvidenceChain<E, ApplyEvidence>>;
+    type Output = Applied<Materialize<I, S, PathBuf>, EvidenceChain<E, ApplyEvidence>>;
 
     fn apply(
         &self,
-        node: Acquired<Materialize<I, S, LocalTarget>, StagedTree, E>,
+        node: Acquired<Materialize<I, S, PathBuf>, StagedTree, E>,
     ) -> Result<Self::Output, Self::Error> {
         let input = node.input;
-        let target = input.target.path.clone();
+        let target = input.target.clone();
         let mode = match input.mode {
             MaterializeMode::CreateNew => {
                 if target_entry_exists(&target)? {
@@ -146,12 +159,12 @@ impl<I, S, E> Apply<Acquired<Materialize<I, S, LocalTarget>, StagedTree, E>> for
     }
 }
 /// Removes the exact caller-authorized local target without acquiring a source.
-impl<I> Apply<Forget<I, LocalTarget>> for LocalApply {
+impl<I> Apply<Forget<I, PathBuf>> for LocalApply {
     type Error = LocalError;
-    type Output = Applied<Forget<I, LocalTarget>, ApplyEvidence>;
+    type Output = Applied<Forget<I, PathBuf>, ApplyEvidence>;
 
-    fn apply(&self, node: Forget<I, LocalTarget>) -> Result<Self::Output, Self::Error> {
-        match remove_existing(&node.target.path) {
+    fn apply(&self, node: Forget<I, PathBuf>) -> Result<Self::Output, Self::Error> {
+        match remove_existing(&node.target) {
             Ok(()) => {}
             Err(LocalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -170,11 +183,11 @@ enum PublishMode {
 }
 
 pub(crate) fn apply_material<I, S, E>(
-    input: Materialize<I, S, LocalTarget>,
+    input: Materialize<I, S, PathBuf>,
     material: LocalMaterial,
     evidence: E,
 ) -> Result<LocalApplied<I, S, E>, LocalError> {
-    let target = input.target.path.clone();
+    let target = input.target.clone();
     let mode = match input.mode {
         MaterializeMode::CreateNew => {
             if target_entry_exists(&target)? {
@@ -461,10 +474,8 @@ mod tests {
     use std::os::windows::fs::symlink_file;
 
     use super::*;
-    use crate::local::{
-        LocalAcquire, LocalAcquireEvidence, LocalError, LocalMaterial, LocalPath, LocalTarget,
-    };
-    use crate::{Acquire, Apply, Forget, Materialize, MaterializeMode};
+    use crate::local::{LocalAcquire, LocalAcquireEvidence, LocalError, LocalMaterial, PathBuf};
+    use crate::{Forget, Materialize, MaterializeMode};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -505,8 +516,8 @@ mod tests {
         let node = crate::Acquired {
             input: Materialize::new(
                 "demo",
-                LocalPath::new(&staged_path),
-                LocalTarget::new(&target),
+                staged_path.clone(),
+                target.clone(),
                 MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
@@ -534,8 +545,8 @@ mod tests {
         let node = crate::Acquired {
             input: Materialize::new(
                 "demo",
-                LocalPath::new(&staged_path),
-                LocalTarget::new(&target),
+                staged_path.clone(),
+                target.clone(),
                 MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
@@ -568,8 +579,8 @@ mod tests {
         let node = crate::Acquired {
             input: Materialize::new(
                 "demo",
-                LocalPath::new(&staged_path),
-                LocalTarget::new(&target),
+                staged_path.clone(),
+                target.clone(),
                 MaterializeMode::CreateNew,
             ),
             material: LocalMaterial::StagedFile {
@@ -692,12 +703,12 @@ mod tests {
         fs::write(&target, "obsolete").unwrap();
 
         let applied = LocalApply
-            .apply(Forget::new("demo", LocalTarget::new(&target)))
+            .apply(Forget::new("demo", target.clone()))
             .unwrap();
 
         assert!(!target.exists());
         assert_eq!(applied.input.item, "demo");
-        assert_eq!(applied.input.target.path, target);
+        assert_eq!(applied.input.target, target);
         assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
         fs::remove_dir_all(root).unwrap();
@@ -710,11 +721,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let applied = LocalApply
-            .apply(Forget::new("demo", LocalTarget::new(&target)))
+            .apply(Forget::new("demo", target.clone()))
             .unwrap();
 
         assert!(!target.exists());
-        assert_eq!(applied.input.target.path, target);
+        assert_eq!(applied.input.target, target);
         assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
         fs::remove_dir_all(root).unwrap();
@@ -735,7 +746,7 @@ mod tests {
         );
 
         LocalApply
-            .apply(Forget::new("demo", LocalTarget::new(&target)))
+            .apply(Forget::new("demo", target.clone()))
             .unwrap();
 
         assert_eq!(
@@ -753,7 +764,7 @@ mod tests {
         fs::write(target.join("nested/file.txt"), "obsolete").unwrap();
 
         LocalApply
-            .apply(Forget::new("demo", LocalTarget::new(&target)))
+            .apply(Forget::new("demo", target.clone()))
             .unwrap();
 
         assert!(!target.exists());
@@ -785,8 +796,8 @@ mod tests {
         let node = crate::Acquired {
             input: Materialize::new(
                 "demo",
-                LocalPath::new(&source),
-                LocalTarget::new(&target),
+                source.clone(),
+                target.clone(),
                 MaterializeMode::ReplaceOrCreate,
             ),
             material: LocalMaterial::File { path: source },
@@ -905,15 +916,15 @@ mod tests {
         source: &std::path::Path,
         target: &std::path::Path,
     ) -> crate::Acquired<
-        Materialize<&'static str, LocalPath, LocalTarget>,
+        Materialize<&'static str, PathBuf, PathBuf>,
         LocalMaterial,
         LocalAcquireEvidence,
     > {
         LocalAcquire
             .acquire(Materialize::new(
                 "demo",
-                LocalPath::new(source),
-                LocalTarget::new(target),
+                source.to_path_buf(),
+                target.to_path_buf(),
                 mode,
             ))
             .unwrap()

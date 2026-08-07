@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pulith::local::{
-    LocalAcquire, LocalApply, LocalExpectation, LocalInspect, LocalObservation, LocalPath,
-    LocalPlacement, LocalPostInspect, LocalReconcile, LocalReconciliation, LocalTarget,
+    LocalAcquire, LocalApply, LocalExpectation, LocalInspect, LocalObservation, LocalPlacement,
+    LocalPostInspect, LocalReconcile, LocalReconciliation,
 };
-use pulith::{Acquire, Apply, Forget, Inspect, Materialize, MaterializeMode, Reconcile};
+use pulith::{Forget, Inspect, Materialize, MaterializeMode, Reconcile};
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -33,8 +33,8 @@ fn materialize_local_file_without_synthetic_transitions() {
 
     let request = Materialize::new(
         AppId("demo"),
-        LocalPath::new(&source),
-        LocalTarget::new(&target),
+        source.clone(),
+        target.clone(),
         MaterializeMode::ReplaceOrCreate,
     );
     let acquired = LocalAcquire.acquire(request).unwrap();
@@ -58,8 +58,8 @@ fn create_new_conflict_is_typed_and_non_mutating() {
 
     let request = Materialize::new(
         "demo",
-        LocalPath::new(&source),
-        LocalTarget::new(&target),
+        source.clone(),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
     let error = LocalApply
@@ -79,7 +79,7 @@ fn create_new_conflict_is_typed_and_non_mutating() {
 #[cfg(feature = "blake3")]
 fn verify_then_apply_exact_local_artifact() {
     use pulith::Verify;
-    use pulith::hash::{ArtifactDescriptor, Blake3, HashVerify};
+    use pulith::hash::{ArtifactDescriptor, DigestAlgorithmKind, HashVerify};
 
     let root = temp_root("descriptor");
     let source = root.join("source.txt");
@@ -90,13 +90,13 @@ fn verify_then_apply_exact_local_artifact() {
 
     let request = Materialize::new(
         "demo",
-        LocalPath::new(&source),
-        LocalTarget::new(&target),
+        source.clone(),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
     let acquired = LocalAcquire.acquire(request).unwrap();
-    let expected = ArtifactDescriptor::<Blake3>::new(digest, 6);
-    let verified = HashVerify::<Blake3>::new()
+    let expected = ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, digest, 6);
+    let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
         .verify(acquired, expected.clone())
         .unwrap();
     assert_eq!(verified.evidence.current.expected, expected);
@@ -116,11 +116,11 @@ fn forget_local_target_directly() {
     fs::write(&target, "obsolete").unwrap();
 
     let applied = LocalApply
-        .apply(Forget::new("demo", LocalTarget::new(&target)))
+        .apply(Forget::new("demo", target.clone()))
         .unwrap();
 
     assert!(!target.exists());
-    assert_eq!(applied.input.target.path, target);
+    assert_eq!(applied.input.target, target);
     assert_eq!(applied.evidence.strategy, LocalPlacement::Removed);
 
     fs::remove_dir_all(root).unwrap();
@@ -133,7 +133,7 @@ fn inspect_and_reconcile_without_mutating_local_target() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&target, "pulith").unwrap();
 
-    let inspected = LocalInspect.inspect(LocalTarget::new(&target)).unwrap();
+    let inspected = LocalInspect.inspect(target.clone()).unwrap();
     assert_eq!(inspected.observation, LocalObservation::File { bytes: 6 });
     assert_eq!(inspected.evidence, pulith::local::LocalInspectEvidence);
 
@@ -145,7 +145,7 @@ fn inspect_and_reconcile_without_mutating_local_target() {
         reconciled.evidence.current.expected,
         LocalExpectation::FileSize(6)
     );
-    assert_eq!(reconciled.input.path, target);
+    assert_eq!(reconciled.input, target);
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
     fs::remove_dir_all(root).unwrap();
@@ -164,8 +164,8 @@ fn post_inspect_preserves_materialize_apply_evidence_and_reconciles() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "post-inspect",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
@@ -174,7 +174,7 @@ fn post_inspect_preserves_materialize_apply_evidence_and_reconciles() {
     let apply_evidence = applied.evidence.clone();
 
     let inspected = LocalPostInspect.inspect(applied).unwrap();
-    assert_eq!(inspected.input.path, target);
+    assert_eq!(inspected.input, target);
     assert_eq!(inspected.observation, LocalObservation::File { bytes: 6 });
     assert_eq!(inspected.evidence.previous, apply_evidence);
     assert_eq!(
@@ -203,8 +203,8 @@ fn post_inspect_reports_later_mutation_without_reapplying() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "post-inspect-mutation",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
@@ -236,15 +236,12 @@ fn post_inspect_forget_observes_missing_without_acquisition() {
     fs::write(&target, "obsolete").unwrap();
 
     let applied = LocalApply
-        .apply(Forget::new(
-            "post-inspect-forget",
-            LocalTarget::new(&target),
-        ))
+        .apply(Forget::new("post-inspect-forget", target.clone()))
         .unwrap();
     let apply_evidence = applied.evidence.clone();
 
     let inspected = LocalPostInspect.inspect(applied).unwrap();
-    assert_eq!(inspected.input.path, target);
+    assert_eq!(inspected.input, target);
     assert_eq!(inspected.observation, LocalObservation::Missing);
     assert_eq!(inspected.evidence.previous, apply_evidence);
 
@@ -264,19 +261,19 @@ fn post_inspect_error_retains_completed_apply_receipt() {
             LocalAcquire
                 .acquire(Materialize::new(
                     "post-inspect-error",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
         )
         .unwrap();
     let original_target = target.clone();
-    applied.input.target.path.push("\0");
-    let invalid_target = applied.input.target.path.clone();
+    applied.input.target.push("\0");
+    let invalid_target = applied.input.target.clone();
 
     let error = LocalPostInspect.inspect(applied).unwrap_err();
-    assert_eq!(error.applied.input.target.path, invalid_target);
+    assert_eq!(error.applied.input.target, invalid_target);
     assert!(matches!(
         error.cause,
         pulith::local::LocalError::Io { action: "inspect local target", path, .. } if path == invalid_target

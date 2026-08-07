@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 
-use pulith::hash::{Blake3, DigestValue, HashVerify};
+use pulith::hash::{DigestAlgorithmKind, DigestValue, HashVerify};
 use pulith::local::{
     LocalApply, LocalExpectation, LocalMaterial, LocalObservation, LocalReconcile,
-    LocalReconciliation, LocalTarget,
+    LocalReconciliation,
 };
 use pulith::{
-    Acquire, Acquired, Apply, EvidenceChain, Inspect, Inspected, Materialize, MaterializeMode,
-    Reconcile, Verified, Verify,
+    Acquire, Acquired, EvidenceChain, Inspect, Inspected, Materialize, MaterializeMode, Reconcile,
+    Verified, Verify,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,11 +27,11 @@ struct ExternalInspect;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExternalInspectEvidence;
 
-impl Inspect<LocalTarget> for ExternalInspect {
+impl Inspect<PathBuf> for ExternalInspect {
     type Error = std::convert::Infallible;
-    type Output = Inspected<LocalTarget, LocalObservation, ExternalInspectEvidence>;
+    type Output = Inspected<PathBuf, LocalObservation, ExternalInspectEvidence>;
 
-    fn inspect(&self, input: LocalTarget) -> Result<Self::Output, Self::Error> {
+    fn inspect(&self, input: PathBuf) -> Result<Self::Output, Self::Error> {
         Ok(Inspected {
             input,
             observation: LocalObservation::File { bytes: 6 },
@@ -71,17 +71,17 @@ impl<I, E> Verify<Acquired<I, LocalMaterial, E>, ()> for ExternalVerify {
     }
 }
 
-impl Acquire<Materialize<&'static str, ExternalSource, LocalTarget>> for ExternalAcquire {
+impl Acquire<Materialize<&'static str, ExternalSource, PathBuf>> for ExternalAcquire {
     type Error = std::io::Error;
     type Output = Acquired<
-        Materialize<&'static str, ExternalSource, LocalTarget>,
+        Materialize<&'static str, ExternalSource, PathBuf>,
         LocalMaterial,
         ExternalEvidence,
     >;
 
     fn acquire(
         &self,
-        input: Materialize<&'static str, ExternalSource, LocalTarget>,
+        input: Materialize<&'static str, ExternalSource, PathBuf>,
     ) -> Result<Self::Output, Self::Error> {
         let staged = tempfile::NamedTempFile::new()?;
         std::fs::copy(&input.source.0, staged.path())?;
@@ -105,7 +105,7 @@ fn external_acquire_composes_with_builtin_verify_and_apply() {
     let request = Materialize::new(
         "external",
         ExternalSource(source.clone()),
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     );
     let acquired = ExternalAcquire.acquire(request).unwrap();
@@ -113,8 +113,12 @@ fn external_acquire_composes_with_builtin_verify_and_apply() {
         LocalMaterial::StagedFile { path } => path.to_path_buf(),
         _ => panic!("external acquire must return staged custody"),
     };
-    let expected = DigestValue::<Blake3>::new(blake3::hash(b"pulith").to_hex().to_string());
-    let verified = HashVerify::<Blake3>::new()
+    let expected = DigestValue::new(
+        DigestAlgorithmKind::Blake3,
+        blake3::hash(b"pulith").to_hex().to_string(),
+    )
+    .unwrap();
+    let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
         .verify(acquired, expected)
         .unwrap();
     let applied = LocalApply.apply(verified).unwrap();
@@ -128,7 +132,7 @@ fn external_acquire_composes_with_builtin_verify_and_apply() {
 #[test]
 fn external_inspect_composes_with_builtin_reconcile() {
     let inspected = ExternalInspect
-        .inspect(LocalTarget::new("external-target"))
+        .inspect(PathBuf::from("external-target"))
         .unwrap();
     let reconciled = LocalReconcile
         .reconcile(inspected, LocalExpectation::FileSize(6))
@@ -148,7 +152,7 @@ fn external_middle_transition_consumes_and_rebuilds_canonical_state() {
         .acquire(Materialize::new(
             "external",
             ExternalSource(source),
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ))
         .unwrap();

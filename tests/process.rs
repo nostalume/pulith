@@ -1,9 +1,10 @@
 #![cfg(feature = "process")]
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use pulith::local::{LocalApply, LocalTarget};
+use pulith::local::LocalApply;
 mod common;
 use common::{
     Fixture, assert_failure_keeps_target_missing, captured_contains, fixture_action,
@@ -13,9 +14,9 @@ use pulith::process::{
     CancellationToken, Cooperative, ExplicitEnvironment, InputSpec, ProcessAcquire, ProcessAction,
     ProcessConfigError, ProcessDiagnostics, ProcessError,
 };
-use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+use pulith::{Acquire, Materialize, MaterializeMode};
 
-type ProcessMaterialize = Materialize<&'static str, ProcessAction<Cooperative>, LocalTarget>;
+type ProcessMaterialize = Materialize<&'static str, ProcessAction<Cooperative>, PathBuf>;
 type ProcessOutput = pulith::Acquired<
     ProcessMaterialize,
     pulith::local::StagedTree,
@@ -29,7 +30,7 @@ fn acquire(
     ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
         "process-fixture",
         action,
-        LocalTarget::new(root.join("published")),
+        root.join("published"),
         MaterializeMode::CreateNew,
     ))
 }
@@ -184,7 +185,7 @@ fn timeout_stops_descendant_and_carries_captured_diagnostics() {
     let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
         "process-fixture",
         action,
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     ));
 
@@ -249,7 +250,7 @@ fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
         Materialize::new(
             "process-fixture",
             action,
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
         &token,
@@ -297,7 +298,7 @@ fn pre_cancelled_token_fails_fast_without_spawning() {
             "process-fixture",
             fixture_action(Fixture::Success, "tree", Duration::from_secs(30))
                 .with_capture_cap(4096),
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
         &token,
@@ -362,7 +363,7 @@ fn missing_declared_input_fails_pre_spawn_and_keeps_target_missing() {
     let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
         "process-fixture",
         action,
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     ));
 
@@ -390,7 +391,7 @@ fn colliding_staged_names_fail_pre_spawn() {
     let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
         "process-fixture",
         action,
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     ));
 
@@ -415,7 +416,7 @@ fn invalid_staged_name_fails_pre_spawn() {
         let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
             "process-fixture",
             action,
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ));
 

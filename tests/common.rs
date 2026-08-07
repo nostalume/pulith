@@ -19,8 +19,8 @@ use pulith::process::{
     WorkspaceRelativePath,
 };
 
-use pulith::local::{LocalAcquire, LocalApply, LocalPath, LocalTarget};
-use pulith::{Acquire, Apply, Materialize, MaterializeMode};
+use pulith::local::{LocalAcquire, LocalApply};
+use pulith::{Acquire, Materialize, MaterializeMode};
 
 /// Runs one real process fixture: a hand-rolled local server or child process script.
 #[derive(Clone, Copy)]
@@ -45,7 +45,7 @@ pub fn temp_dir() -> tempfile::TempDir {
 // ---------------------------------------------------------------------------
 
 pub type PublishedTree = pulith::Applied<
-    Materialize<&'static str, LocalPath, LocalTarget>,
+    Materialize<&'static str, PathBuf, PathBuf>,
     pulith::EvidenceChain<pulith::local::LocalAcquireEvidence, pulith::local::ApplyEvidence>,
 >;
 
@@ -66,8 +66,8 @@ pub fn publish_tree(
             LocalAcquire
                 .acquire(Materialize::new(
                     "demo-tool",
-                    LocalPath::new(&source),
-                    LocalTarget::new(&target),
+                    source.clone(),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 ))
                 .unwrap(),
@@ -80,12 +80,12 @@ pub fn publish_tree(
 /// A synthetic apply receipt for a target, for activation tests that need only the target shape.
 pub fn receipt_for(
     target: &Path,
-) -> pulith::Applied<Materialize<&'static str, LocalPath, LocalTarget>, ()> {
+) -> pulith::Applied<Materialize<&'static str, PathBuf, PathBuf>, ()> {
     pulith::Applied {
         input: Materialize::new(
             "demo-tool",
-            LocalPath::new("unused"),
-            LocalTarget::new(target),
+            PathBuf::from("unused"),
+            target.to_path_buf(),
             MaterializeMode::CreateNew,
         ),
         evidence: (),
@@ -293,7 +293,7 @@ pub fn assert_failure_keeps_target_missing(
     let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
         "process-fixture",
         fixture_action(fixture, "tree", timeout),
-        LocalTarget::new(&target),
+        target.clone(),
         MaterializeMode::CreateNew,
     ));
 

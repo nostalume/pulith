@@ -229,6 +229,34 @@ impl RemoteUrl {
     }
 }
 
+impl std::str::FromStr for RemoteUrl {
+    type Err = RemoteUrlError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        RemoteUrl::parse(input)
+    }
+}
+
+impl TryFrom<String> for RemoteUrl {
+    type Error = RemoteUrlError;
+
+    fn try_from(input: String) -> Result<Self, Self::Error> {
+        input.parse()
+    }
+}
+
+/// Optional serde deserialization (feature `serde`): the http(s) scheme gate stays here.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RemoteUrl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+        RemoteUrl::parse(&input).map_err(serde::de::Error::custom)
+    }
+}
+
 impl From<RemoteUrlError> for AcquireError {
     fn from(error: RemoteUrlError) -> Self {
         Self::RemoteUrl(error)
@@ -722,6 +750,11 @@ impl RemoteSource {
         }
     }
 
+    /// Parse a URL string into a remote source in one step.
+    pub fn from_url_str(url: &str) -> Result<Self, RemoteUrlError> {
+        Ok(Self::new(RemoteUrl::parse(url)?))
+    }
+
     pub fn policy(mut self, policy: AcquirePolicy) -> Self {
         self.policy = policy;
         self
@@ -1062,6 +1095,19 @@ impl SyncHttpAcquire {
 }
 
 #[cfg(feature = "http-sync")]
+impl SyncHttpAcquire {
+    /// Inherent mirror of [`Acquire::acquire`] — callable without importing the trait.
+    pub fn acquire<N>(
+        &self,
+        node: N,
+    ) -> Result<<Self as Acquire<N>>::Output, <Self as Acquire<N>>::Error>
+    where
+        Self: Acquire<N>,
+    {
+        Acquire::acquire(self, node)
+    }
+}
+
 impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
     type Error = AcquireError;
     type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
@@ -2346,28 +2392,26 @@ impl StagedDownload<Closed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "http-sync")]
+    use crate::Inspect;
     #[cfg(all(
         any(feature = "http-async", feature = "http-sync"),
         feature = "hash",
         feature = "blake3"
     ))]
-    use crate::hash::{ArtifactDescriptor, Blake3, DigestValue, HashVerify};
+    use crate::Verify;
+    #[cfg(all(
+        any(feature = "http-async", feature = "http-sync"),
+        feature = "hash",
+        feature = "blake3"
+    ))]
+    use crate::hash::{ArtifactDescriptor, DigestAlgorithmKind, DigestValue, HashVerify};
     #[cfg(all(
         any(feature = "http-async", feature = "http-sync"),
         feature = "hash",
         feature = "blake3"
     ))]
     use crate::local::LocalApply;
-    #[cfg(any(feature = "http-async", feature = "http-sync"))]
-    use crate::local::LocalTarget;
-    #[cfg(feature = "http-sync")]
-    use crate::{Acquire, Inspect};
-    #[cfg(all(
-        any(feature = "http-async", feature = "http-sync"),
-        feature = "hash",
-        feature = "blake3"
-    ))]
-    use crate::{Apply, Verify};
     #[cfg(feature = "http-async")]
     use crate::{AsyncAcquire, AsyncInspect};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
@@ -2378,6 +2422,8 @@ mod tests {
     use std::io::{BufRead, BufReader};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::net::{TcpListener, TcpStream};
+    #[cfg(any(feature = "http-async", feature = "http-sync"))]
+    use std::path::PathBuf;
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::sync::{Arc as TestArc, Mutex, mpsc};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
@@ -2390,14 +2436,9 @@ mod tests {
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     fn materialize(
         source: RemoteSource,
-        target: impl Into<PathBuf>,
-    ) -> Materialize<&'static str, RemoteSource, LocalTarget> {
-        Materialize::new(
-            "artifact",
-            source,
-            LocalTarget::new(target),
-            MaterializeMode::ReplaceOrCreate,
-        )
+        target: PathBuf,
+    ) -> Materialize<&'static str, RemoteSource, PathBuf> {
+        Materialize::new("artifact", source, target, MaterializeMode::ReplaceOrCreate)
     }
 
     #[test]
@@ -2894,7 +2935,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
         let acquired = SyncHttpAcquire::default()
-            .acquire(materialize(source, &target))
+            .acquire(materialize(source, target.clone()))
             .unwrap();
         server.join();
 
@@ -2911,7 +2952,7 @@ mod tests {
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
         let acquired = SyncHttpAcquire::default()
-            .acquire(materialize(source, &target))
+            .acquire(materialize(source, target.clone()))
             .unwrap();
         server.join();
 
@@ -2945,7 +2986,7 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         std::fs::write(&destination, b"old").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, &destination);
+        let chosen = materialize(source, destination.clone());
 
         let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
@@ -2969,7 +3010,7 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         let policy = AcquirePolicy::default().max_bytes(3);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, &destination);
+        let chosen = materialize(source, destination.clone());
 
         let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
         server.join();
@@ -3366,7 +3407,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
             let acquired = AsyncHttpAcquire::default()
-                .acquire(materialize(source, &target))
+                .acquire(materialize(source, target.clone()))
                 .await
                 .unwrap();
             server.join();
@@ -3386,7 +3427,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
             let acquired = AsyncHttpAcquire::default()
-                .acquire(materialize(source, &target))
+                .acquire(materialize(source, target.clone()))
                 .await
                 .unwrap();
             server.join();
@@ -3426,7 +3467,7 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             std::fs::write(&destination, b"old").unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, &destination);
+            let chosen = materialize(source, destination.clone());
 
             let error = AsyncHttpAcquire::default()
                 .acquire(chosen)
@@ -3455,7 +3496,7 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             let policy = AcquirePolicy::default().max_bytes(3);
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, &destination);
+            let chosen = materialize(source, destination.clone());
 
             let error = AsyncHttpAcquire::default()
                 .acquire(chosen)
@@ -3655,7 +3696,7 @@ mod tests {
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
             let error = AsyncHttpAcquire::default()
-                .acquire(materialize(source, &target))
+                .acquire(materialize(source, target.clone()))
                 .await
                 .unwrap_err();
             server.join();
@@ -3882,10 +3923,14 @@ mod tests {
 
             let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
             server.join();
-            let verified = HashVerify::<Blake3>::new()
+            let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
                 .verify(
                     acquired,
-                    ArtifactDescriptor::new(expected, body.len() as u64),
+                    ArtifactDescriptor::new(
+                        DigestAlgorithmKind::Blake3,
+                        expected,
+                        body.len() as u64,
+                    ),
                 )
                 .unwrap();
 
@@ -3906,12 +3951,15 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let final_path = temp.path().join("final.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, &final_path);
+            let chosen = materialize(source, final_path.clone());
 
             let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
             server.join();
-            let verified = HashVerify::<Blake3>::new()
-                .verify(acquired, DigestValue::new(expected))
+            let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
+                .verify(
+                    acquired,
+                    DigestValue::new(DigestAlgorithmKind::Blake3, expected).unwrap(),
+                )
                 .unwrap();
             let applied = LocalApply.apply(verified).unwrap();
 
@@ -3932,10 +3980,10 @@ mod tests {
 
         let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
-        let verified = HashVerify::<Blake3>::new()
+        let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
             .verify(
                 acquired,
-                ArtifactDescriptor::new(expected, body.len() as u64),
+                ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, expected, body.len() as u64),
             )
             .unwrap();
 
@@ -3954,12 +4002,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let final_path = temp.path().join("final.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, &final_path);
+        let chosen = materialize(source, final_path.clone());
 
         let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
         server.join();
-        let verified = HashVerify::<Blake3>::new()
-            .verify(acquired, DigestValue::new(expected))
+        let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
+            .verify(
+                acquired,
+                DigestValue::new(DigestAlgorithmKind::Blake3, expected).unwrap(),
+            )
             .unwrap();
         let applied = LocalApply.apply(verified).unwrap();
 

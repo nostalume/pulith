@@ -4,9 +4,9 @@ use std::time::Duration;
 
 mod common;
 use common::{Fixture, captured_contains, fixture_action, marker_environment};
-use pulith::local::{LocalApply, LocalTarget};
+use pulith::local::LocalApply;
 use pulith::process::{CancellationToken, Cooperative, InputSpec, ProcessAcquire, ProcessError};
-use pulith::{Apply, AsyncAcquire, Materialize, MaterializeMode};
+use pulith::{AsyncAcquire, Materialize, MaterializeMode};
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -25,7 +25,7 @@ fn async_success_stages_tree_before_local_apply_and_preserves_evidence_order() {
         Materialize::new(
             "process-fixture",
             fixture_action(Fixture::Success, "tree", Duration::from_secs(2)),
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ))
@@ -73,7 +73,7 @@ fn async_staged_input_is_reachable_with_exact_bytes_via_input_root() {
             "process-fixture",
             fixture_action(Fixture::CopiesInputEnv, "tree", Duration::from_secs(30))
                 .with_inputs([InputSpec::new(&source, "input.txt")]),
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ))
@@ -102,7 +102,7 @@ fn async_timeout_stops_descendant_and_carries_captured_diagnostics() {
         Materialize::new(
             "process-fixture",
             action,
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ));
@@ -144,7 +144,7 @@ fn async_capture_truncates_streams_at_the_cap() {
         Materialize::new(
             "process-fixture",
             action,
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ))
@@ -168,7 +168,7 @@ fn async_capture_cap_zero_disables_capture() {
         Materialize::new(
             "process-fixture",
             action,
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ))
@@ -210,7 +210,7 @@ fn assert_failure(fixture: Fixture, timeout: Duration, check: impl Fn(&ProcessEr
         Materialize::new(
             "process-fixture",
             fixture_action(fixture, "tree", timeout),
-            LocalTarget::new(&target),
+            target.clone(),
             MaterializeMode::CreateNew,
         ),
     ));
@@ -244,7 +244,7 @@ fn async_drop_cancellation_stops_the_admitted_tree() {
                 Materialize::new(
                     "process-fixture",
                     action,
-                    LocalTarget::new(&target),
+                    target.clone(),
                     MaterializeMode::CreateNew,
                 )
             ));
@@ -295,7 +295,7 @@ fn async_token_cancel_stops_tree_while_future_stays_alive() {
             Materialize::new(
                 "process-fixture",
                 action,
-                LocalTarget::new(&target),
+                target.clone(),
                 MaterializeMode::CreateNew,
             ),
             &token,
