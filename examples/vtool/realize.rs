@@ -1,31 +1,54 @@
-//! Realization wiring for the vtool vertical: install a manifest over landed behaviors.
+//! Realization wiring for the vtool vertical: install / deactivate / repair a manifest over
+//! landed behaviors (zero core admission — everything here is caller-owned composition).
 //!
-//! Owns the install flow by composing node methods — acquire (HTTP sync or local), then
-//! `.materialize()` (verify blake3/sha2 over byte streams, magic-detect zip/tar/tar.gz else
-//! copy, publish), then `.link()`/`.link_root()` (the core link law D6/D7: expose is a
-//! directory in the tree, an occupied view is auto-switched, the view parent is created by the
-//! law). A local directory source is copied without byte verification (digests attest byte
-//! streams; a tree has none). No typestate is ever named by the caller. All error paths are
-//! named and actionable; private workspaces are RAII-cleaned.
+//! One private `realize(mode)` chain is shared by install (create-new) and repair (replace):
+//! acquire by source kind, `.materialize()` (verify blake3/sha2 over byte streams, magic-detect
+//! zip/tar/tar.gz else copy, publish), then `.link()`/`.link_root()` (the core link law D6/D7).
+//! Each arm is one linear chain — the two acquire evidence types differ, no type is ever named.
+//! Deactivate re-runs the same materialize (`ReplaceOrCreate`) to obtain the real `Applied`
+//! node, then `LocalDeactivate` removes the view (s3-1 law), then commits `Deactivated`.
+//! Repair (s2-13 law) folds the journal — the caller's own committed intent, never derived from
+//! observation — reconciles the address against the manifest it was given, and on mismatch runs
+//! a bounded fresh cycle with a fixed backoff, reported per attempt, report-and-stop. All error
+//! paths are named and actionable; private workspaces are RAII-cleaned.
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pulith::archive::ArchivePolicy;
-use pulith::local::{LinkOutcome, LocalAcquire, OccupiedViewPolicy};
+use pulith::local::{
+    LinkOutcome, LocalAcquire, LocalDeactivate, LocalInspect, LocalObservation, OccupiedViewPolicy,
+};
 use pulith::net::{RemoteSource, SyncHttpAcquire};
 use pulith::{Materialize, MaterializeMode};
 
-use crate::manifest::Resolved;
-use crate::manifest::Source;
+use crate::manifest::{Journal, Phase, Record, Resolved, Source, StateError};
+
+/// Link the declared view of a freshly materialized tree (per-format arm of the heterogeneous
+/// acquire chain; a macro keeps one linear chain per arm without naming the type).
+macro_rules! link_view {
+    ($materialized:expr, $view:expr, $expose:expr) => {{
+        let materialized = $materialized;
+        match $view.as_deref() {
+            None => None,
+            Some(view) => Some(match $expose.as_deref() {
+                Some(expose) => materialized.link(view, expose, OccupiedViewPolicy::AutoSwitch)?,
+                None => materialized.link_root(view, OccupiedViewPolicy::AutoSwitch)?,
+            }),
+        }
+    }};
+}
 
 impl Resolved {
-    /// Acquire, materialize, and link this resolved manifest under `root`; `None` means the
-    /// manifest declares no view.
-    pub fn install(self, root: &Path) -> Result<Option<LinkOutcome>, Box<dyn Error + Send + Sync>> {
-        let digest = &self.hash;
-
-        // The publication law (create-new) never creates the target parent; the vertical owns
-        // the artifacts/<name> structure. The private RAII workspace is cleaned on every exit.
+    /// The shared realization chain: acquire (create-new or replace), materialize, and link the
+    /// declared view (`None` when the manifest declares no view). The private RAII workspace is
+    /// cleaned on every exit; the publication law never creates the target parent, so the
+    /// vertical creates it (it owns the `artifacts/<name>` structure).
+    fn realize(
+        &self,
+        mode: MaterializeMode,
+        root: &Path,
+    ) -> Result<Option<LinkOutcome>, Box<dyn Error + Send + Sync>> {
         ensure_parent(&self.target)?;
         let workspace_root = root.join(".pulith-work").join(format!(
             "{}-{}",
@@ -33,34 +56,19 @@ impl Resolved {
             self.manifest.version.as_str()
         ));
         let _work = WorkDir::create(&workspace_root)?;
-        let workspace = &workspace_root;
+        let digest = &self.hash;
 
-        // Acquire by source kind, then compose the landed behaviors as node methods: materialize
-        // always runs (the tree is published), then the core link law applies when a view is
-        // declared. The two acquire evidence types differ, so each arm is one linear chain — no
-        // type is named.
-        // Acquire by source kind, then compose the landed behaviors as node methods: materialize
-        // always runs (the tree is published); the core link law applies when a view is declared
-        // (an inert `expose` is not checked). Each arm is one linear chain — no type is named.
-        match &self.source {
+        let outcome = match &self.source {
             Source::Local { path } => {
                 let materialized = LocalAcquire
                     .acquire(Materialize::new(
                         self.manifest.name.clone().into_string(),
                         (path).into(),
                         self.target.clone(),
-                        MaterializeMode::CreateNew,
+                        mode,
                     ))?
-                    .materialize(digest.clone(), workspace, ArchivePolicy::new())?;
-                let Some(view) = self.view.as_deref() else {
-                    return Ok(None);
-                };
-                Ok(Some(match self.manifest.expose.as_deref() {
-                    Some(expose) => {
-                        materialized.link(view, expose, OccupiedViewPolicy::AutoSwitch)?
-                    }
-                    None => materialized.link_root(view, OccupiedViewPolicy::AutoSwitch)?,
-                }))
+                    .materialize(digest.clone(), &workspace_root, ArchivePolicy::new())?;
+                link_view!(materialized, &self.view, &self.manifest.expose)
             }
             Source::Url { url } => {
                 let materialized = SyncHttpAcquire::default()
@@ -68,21 +76,209 @@ impl Resolved {
                         self.manifest.name.clone().into_string(),
                         RemoteSource::new(url.clone()),
                         self.target.clone(),
-                        MaterializeMode::CreateNew,
+                        mode,
                     ))?
-                    .materialize(digest.clone(), workspace, ArchivePolicy::new())?;
-                let Some(view) = self.view.as_deref() else {
-                    return Ok(None);
-                };
-                Ok(Some(match self.manifest.expose.as_deref() {
-                    Some(expose) => {
-                        materialized.link(view, expose, OccupiedViewPolicy::AutoSwitch)?
-                    }
-                    None => materialized.link_root(view, OccupiedViewPolicy::AutoSwitch)?,
-                }))
+                    .materialize(digest.clone(), &workspace_root, ArchivePolicy::new())?;
+                link_view!(materialized, &self.view, &self.manifest.expose)
+            }
+        };
+        Ok(outcome)
+    }
+
+    /// Acquire, materialize, and link this resolved manifest under `root`; journal-before-
+    /// acknowledge: the effect ran, the `Installed` intent is committed (next generation,
+    /// fsync'd) before the caller sees success.
+    pub fn install(self, root: &Path) -> Result<Option<LinkOutcome>, Box<dyn Error + Send + Sync>> {
+        let outcome = self.realize(MaterializeMode::CreateNew, root)?;
+        commit(
+            root,
+            self.manifest.name.as_str(),
+            self.manifest.version.as_str(),
+            Phase::Installed,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Remove the active view without touching foreign objects (the s3-1 `LocalDeactivate`
+    /// law). The cross-process caller has no stored receipt, so this is a fresh authorized
+    /// cycle (s2-13 D3): re-materialize `ReplaceOrCreate` to obtain the real `Applied` node,
+    /// then deactivate, then commit the `Deactivated` intent.
+    pub fn deactivate(self, root: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let Some(view) = self.view else {
+            return Ok(());
+        };
+        // Move the per-cycle inputs out once (the arms are mutually exclusive, so each is
+        // consumed exactly once); only the journal-facing name is cloned (two consumers).
+        let name = self.manifest.name.into_string();
+        let version = self.manifest.version.into_string();
+        let target = self.target;
+        let digest = self.hash;
+        let source = self.source;
+
+        ensure_parent(&target)?;
+        let workspace_root = root.join(".pulith-work").join(format!("{name}-{version}"));
+        let _work = WorkDir::create(&workspace_root)?;
+
+        match source {
+            Source::Local { path } => {
+                let materialized = LocalAcquire
+                    .acquire(Materialize::new(
+                        name.clone(),
+                        path,
+                        target,
+                        MaterializeMode::ReplaceOrCreate,
+                    ))?
+                    .materialize(digest, &workspace_root, ArchivePolicy::new())?;
+                LocalDeactivate.activate(materialized, view)?;
+            }
+            Source::Url { url } => {
+                let materialized = SyncHttpAcquire::default()
+                    .acquire(Materialize::new(
+                        name.clone(),
+                        RemoteSource::new(url),
+                        target,
+                        MaterializeMode::ReplaceOrCreate,
+                    ))?
+                    .materialize(digest, &workspace_root, ArchivePolicy::new())?;
+                LocalDeactivate.activate(materialized, view)?;
+            }
+        }
+
+        commit(root, &name, &version, Phase::Deactivated)?;
+        Ok(())
+    }
+}
+
+/// Per-address outcome of a repair pass: satisfied, repaired (fresh cycle committed), or failed
+/// (budget exhausted — report-and-stop, no convergence claim).
+#[derive(Debug, Default)]
+pub struct RepairReport {
+    pub satisfied: Vec<String>,
+    pub repaired: Vec<String>,
+    pub failed: Vec<String>,
+    pub attempts: Vec<String>,
+}
+
+impl std::fmt::Display for RepairReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(formatter, "satisfied: {}", self.satisfied.join(", "))?;
+        writeln!(formatter, "repaired: {}", self.repaired.join(", "))?;
+        writeln!(formatter, "failed: {}", self.failed.join(", "))?;
+        for attempt in &self.attempts {
+            writeln!(formatter, "  attempt: {attempt}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Run one repair pass for the given manifest address: the expectation is the caller's own
+/// committed intent — the journal's latest phase for `name@version` (never derived from
+/// observation) — plus the manifest's content. A never-installed or explicitly deactivated
+/// address is left alone (repair does not resurrect). On a mismatch with observation, run a
+/// fresh authorized cycle, bounded by `attempts` with a fixed `backoff`, report-and-stop.
+/// Ctrl-C stops the process by the OS default (the loop is not caught).
+pub fn repair(
+    resolved: &Resolved,
+    root: &Path,
+    attempts: usize,
+    backoff: Duration,
+) -> Result<RepairReport, StateError> {
+    let journal = Journal::open(root)?;
+    let mut report = RepairReport::default();
+    let address = || {
+        format!(
+            "{}@{}",
+            resolved.manifest.name.as_str(),
+            resolved.manifest.version.as_str()
+        )
+    };
+
+    let records = journal.read()?;
+    let Some(latest) = records
+        .iter()
+        .filter(|record| {
+            record.name == resolved.manifest.name.as_str()
+                && record.version == resolved.manifest.version.as_str()
+        })
+        .max_by_key(|record| record.generation)
+    else {
+        return Ok(report); // never installed: nothing to repair
+    };
+    if latest.phase != Phase::Installed {
+        return Ok(report); // explicitly deactivated: repair does not resurrect
+    }
+    if is_satisfied(resolved) {
+        report.satisfied.push(address());
+        return Ok(report);
+    }
+
+    let mut success = false;
+    for attempt in 1..=attempts {
+        match resolved.realize(MaterializeMode::ReplaceOrCreate, root) {
+            Ok(_) => {
+                commit(
+                    root,
+                    resolved.manifest.name.as_str(),
+                    resolved.manifest.version.as_str(),
+                    Phase::Installed,
+                )?;
+                report.repaired.push(address());
+                success = true;
+                break;
+            }
+            Err(error) => {
+                report
+                    .attempts
+                    .push(format!("{} attempt {attempt}: {error}", address()));
+                std::thread::sleep(backoff);
             }
         }
     }
+    if !success {
+        report.failed.push(address());
+    }
+    Ok(report)
+}
+
+/// The committed intent is satisfied when the published tree is a directory and, if a view was
+/// declared, the view is a directory symlink (the observation is read-only).
+fn is_satisfied(resolved: &Resolved) -> bool {
+    let target_ok = matches!(
+        LocalInspect.observe(&resolved.target),
+        Ok(LocalObservation::Directory)
+    );
+    if !target_ok {
+        return false;
+    }
+    match &resolved.view {
+        None => true,
+        Some(view) => matches!(
+            LocalInspect.observe(view),
+            Ok(LocalObservation::SymlinkToDirectory)
+        ),
+    }
+}
+
+/// Journal the committed intent (journal-before-acknowledge): the next generation for this
+/// address, fsync'd before the caller sees success. The record is the caller's own expectation —
+/// a repair reconciles against it, never against observation.
+fn commit(root: &Path, name: &str, version: &str, phase: Phase) -> Result<(), StateError> {
+    let mut journal = Journal::open(root)?;
+    let generation = journal
+        .read()?
+        .iter()
+        .filter(|record| record.name == name && record.version == version)
+        .map(|record| record.generation)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    journal.append(&Record {
+        name: name.to_string(),
+        version: version.to_string(),
+        phase,
+        generation,
+    })?;
+    Ok(())
 }
 
 /// Create the parent directory of a layout path (the landed laws never create parents).
@@ -93,6 +289,7 @@ fn ensure_parent(path: &Path) -> std::io::Result<()> {
     };
     std::fs::create_dir_all(parent)
 }
+
 /// RAII private workspace: created on demand, removed on drop (D5 staged cleanup).
 struct WorkDir(PathBuf);
 
@@ -113,7 +310,6 @@ impl Drop for WorkDir {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     const WIN_ZIP_HEX: &str = "2edc44c413a0a47ab1977297f524ee8a87aae99d5db2f3e5d7ee668c33c22076";
     const LINUX_TAR_GZ_HEX: &str =
@@ -134,7 +330,6 @@ mod tests {
             .into_owned()
     }
 
-    /// A manifest whose selected platform points at a local fixture.
     /// Escape a path for embedding in a TOML string (backslash and quote).
     fn toml_string(value: &str) -> String {
         value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -181,6 +376,26 @@ mod tests {
         let manifest = crate::manifest::Manifest::parse(text).expect("parse manifest");
         let resolved = manifest.resolve(layout_root).expect("resolve");
         resolved.install(layout_root)
+    }
+
+    fn make_directory_symlink(target: &Path, view: &Path) {
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, view).unwrap();
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(target, view).unwrap();
+    }
+
+    /// A journal seed for a repair address (the committed intent repair reconciles against).
+    fn seed_intent(root: &Path, name: &str, version: &str, phase: Phase) {
+        let mut journal = Journal::open(root).unwrap();
+        journal
+            .append(&Record {
+                name: name.to_string(),
+                version: version.to_string(),
+                phase,
+                generation: 1,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -447,5 +662,116 @@ mod tests {
         );
         let outcome = install_manifest(&inert_recipe, layout_root.path()).unwrap();
         assert_eq!(outcome, None);
+    }
+
+    // --- repair controller tests ---
+
+    fn resolve_manifest(text: &str, layout_root: &Path) -> Resolved {
+        crate::manifest::Manifest::parse(text)
+            .expect("parse manifest")
+            .resolve(layout_root)
+            .expect("resolve")
+    }
+
+    /// A local-source recipe whose source directory exists (real bytes for the fresh cycle).
+    fn local_recipe(name: &str, source: &Path, link_at: Option<&Path>) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(source.join("bin/tool")).unwrap());
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        recipe_text(
+            name,
+            "1.0.0",
+            &source.to_string_lossy(),
+            &hex,
+            Some("bin"),
+            link_at,
+        )
+    }
+
+    #[test]
+    fn repair_reports_satisfied_when_tree_and_view_match_the_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/tool"), b"ok").unwrap();
+        let target = root.path().join("artifacts/demo/1.0.0");
+        fs::create_dir_all(&target).unwrap();
+        let view = root.path().join("views/demo");
+        fs::create_dir_all(view.parent().unwrap()).unwrap();
+        make_directory_symlink(&target, &view);
+
+        let recipe = local_recipe("demo", &source, Some(&view));
+        let resolved = resolve_manifest(&recipe, root.path());
+        seed_intent(root.path(), "demo", "1.0.0", Phase::Installed);
+        let report = repair(&resolved, root.path(), 3, Duration::from_millis(1)).unwrap();
+        assert!(report.satisfied.iter().any(|a| a == "demo@1.0.0"));
+        assert!(report.repaired.is_empty());
+    }
+
+    #[test]
+    fn repair_restores_a_missing_view_and_commits_the_next_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/tool"), b"repair me").unwrap();
+        let target = root.path().join("artifacts/demo/1.0.0");
+        fs::create_dir_all(&target).unwrap();
+        let view = root.path().join("views/demo");
+        fs::create_dir_all(view.parent().unwrap()).unwrap();
+
+        let recipe = local_recipe("demo", &source, Some(&view));
+        let resolved = resolve_manifest(&recipe, root.path());
+        seed_intent(root.path(), "demo", "1.0.0", Phase::Installed);
+        let report = repair(&resolved, root.path(), 3, Duration::from_millis(1)).unwrap();
+        assert!(
+            report.repaired.iter().any(|a| a == "demo@1.0.0"),
+            "attempts: {:?}",
+            report.attempts
+        );
+        assert!(view.is_symlink() || view.join("tool").exists());
+        // The repair committed the next generation (supersede: latest record wins).
+        let records = Journal::open(root.path()).unwrap().read().unwrap();
+        let latest = records.iter().max_by_key(|r| r.generation).unwrap();
+        assert_eq!(latest.generation, 2);
+    }
+
+    #[test]
+    fn repair_does_not_resurrect_a_deactivated_address() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/tool"), b"quiet").unwrap();
+
+        let recipe = local_recipe("demo", &source, None);
+        let resolved = resolve_manifest(&recipe, root.path());
+        seed_intent(root.path(), "demo", "1.0.0", Phase::Deactivated);
+        let report = repair(&resolved, root.path(), 3, Duration::from_millis(1)).unwrap();
+        assert!(report.satisfied.is_empty());
+        assert!(report.repaired.is_empty());
+        assert!(report.failed.is_empty());
+    }
+
+    #[test]
+    fn repair_budget_exhaustion_reports_and_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/tool"), b"budget").unwrap();
+
+        // The resolved source points at a missing path → the fresh cycle must fail every attempt.
+        let recipe = local_recipe("demo", &source, None);
+        let mut resolved = resolve_manifest(&recipe, root.path());
+        resolved.source = Source::Local {
+            path: root.path().join("missing-source"),
+        };
+        seed_intent(root.path(), "demo", "1.0.0", Phase::Installed);
+        let report = repair(&resolved, root.path(), 2, Duration::from_millis(1)).unwrap();
+        assert!(report.failed.iter().any(|a| a == "demo@1.0.0"));
+        assert_eq!(report.attempts.len(), 2, "each attempt is reported");
     }
 }

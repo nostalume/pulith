@@ -202,6 +202,173 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
+// --- Durable intent journal (s2-12, caller-owned) -------------------------------------------
+// Append-only `journal.jsonl` under `.pulith-state/`: one `Record` per line, fsync'd before the
+// caller acknowledges. The record is the caller's own intent (name@version + phase + the
+// superseding generation) — the manifest carries the artifact content, so the journal never
+// duplicates it. A crash before the fsync loses the record; recovery re-observes the paths.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+
+use serde::Serialize;
+
+/// One committed intent for a `name@version` address (the expectation repair reconciles
+/// against — never derived from observation).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    pub name: String,
+    pub version: String,
+    pub phase: Phase,
+    pub generation: u64,
+}
+
+/// The caller's committed lifecycle phase for an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    Installed,
+    Deactivated,
+}
+
+/// Append-only journal with a behavior invariant: every append is one JSON line, fsync'd before
+/// the caller acknowledges (an invariant-holding object, not a path wrapper).
+pub struct Journal {
+    path: PathBuf,
+}
+
+impl Journal {
+    /// Open (creating `.pulith-state/` as needed) the journal for the layout root.
+    pub fn open(root: &Path) -> Result<Self, StateError> {
+        let dir = root.join(".pulith-state");
+        fs::create_dir_all(&dir)
+            .map_err(|source| StateError::io("create state directory", &dir, source))?;
+        Ok(Self {
+            path: dir.join("journal.jsonl"),
+        })
+    }
+
+    /// Append one record: write the JSON line and fsync before returning. Test crash hooks
+    /// abort right before/after the fsync (`PULITH_VT_CRASH_AFTER=journal-append|journal-fsync`).
+    pub fn append(&mut self, record: &Record) -> Result<(), StateError> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| StateError::io("open journal for append", &self.path, source))?;
+        serde_json::to_writer(&mut file, record)
+            .map_err(|error| StateError::encode(&self.path, error))?;
+        file.write_all(b"\n")
+            .map_err(|source| StateError::io("write journal line", &self.path, source))?;
+        // Crash hooks (test-only by convention): abort before/after the fsync.
+        if std::env::var("PULITH_VT_CRASH_AFTER").as_deref() == Ok("journal-append") {
+            std::process::abort();
+        }
+        file.sync_all()
+            .map_err(|source| StateError::io("fsync journal", &self.path, source))?;
+        if std::env::var("PULITH_VT_CRASH_AFTER").as_deref() == Ok("journal-fsync") {
+            std::process::abort();
+        }
+        Ok(())
+    }
+
+    /// Read every record in append order; a missing journal is empty, a corrupt line is an
+    /// error (recovery must not silently drop committed intent).
+    pub fn read(&self) -> Result<Vec<Record>, StateError> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(StateError::io("open journal for read", &self.path, source)),
+        };
+        let mut records = Vec::new();
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line =
+                line.map_err(|source| StateError::io("read journal line", &self.path, source))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(
+                serde_json::from_str(&line).map_err(|error| StateError::Decode {
+                    path: self.path.clone(),
+                    line: index + 1,
+                    message: error.to_string(),
+                })?,
+            );
+        }
+        Ok(records)
+    }
+}
+
+/// Failure of the durable-state machinery (action + path named).
+#[derive(Debug)]
+pub enum StateError {
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Decode {
+        path: PathBuf,
+        line: usize,
+        message: String,
+    },
+    Encode {
+        path: PathBuf,
+        message: String,
+    },
+}
+
+impl StateError {
+    fn io(action: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::Io {
+            action,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    fn encode(path: &Path, error: serde_json::Error) -> Self {
+        Self::Encode {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io {
+                action,
+                path,
+                source,
+            } => write!(f, "{action} `{}`: {source}", path.display()),
+            Self::Decode {
+                path,
+                line,
+                message,
+            } => {
+                write!(
+                    f,
+                    "corrupt journal line {line} in `{}`: {message}",
+                    path.display()
+                )
+            }
+            Self::Encode { path, message } => {
+                write!(f, "encode journal record `{}`: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,7 +734,6 @@ hex = "0000000000000000000000000000000000000000000000000000000000000000"
         let error = Manifest::parse(manifest).unwrap_err();
         assert!(error.to_string().contains("must be an absolute path"));
     }
-    use super::*;
 
     #[cfg(windows)]
     fn absolute_view() -> PathBuf {
@@ -651,5 +817,110 @@ hex = "0000000000000000000000000000000000000000000000000000000000000000"
         }
         let error = bad.resolve(Path::new("/opt/tools")).unwrap_err();
         assert!(matches!(error, ResolveError::NoSourceForPlatform { .. }));
+    }
+
+    // --- journal tests (the state machinery lives with the manifest types) ---
+
+    fn record(name: &str, version: &str, generation: u64) -> Record {
+        Record {
+            name: name.to_string(),
+            version: version.to_string(),
+            phase: Phase::Installed,
+            generation,
+        }
+    }
+
+    use std::collections::HashMap;
+
+    /// Keep the highest generation per `name@version` (supersede), first-appearance order.
+    /// The production paths (`commit`, `repair`) query the address directly; this is the
+    /// fold semantics under test.
+    fn fold(records: &[Record]) -> Vec<Record> {
+        let mut best: HashMap<(&str, &str), usize> = HashMap::new();
+        let mut folded: Vec<Record> = Vec::new();
+        for record in records {
+            let key = (record.name.as_str(), record.version.as_str());
+            match best.get(&key) {
+                Some(&index) if folded[index].generation >= record.generation => {}
+                Some(&index) => folded[index] = record.clone(),
+                None => {
+                    best.insert(key, folded.len());
+                    folded.push(record.clone());
+                }
+            }
+        }
+        folded
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pulith-vtool-manifest-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn append_persists_across_reopen() {
+        let root = temp_root("persist");
+        let mut journal = Journal::open(&root).unwrap();
+        journal.append(&record("demo", "1.0.0", 1)).unwrap();
+        drop(journal);
+
+        let reopened = Journal::open(&root).unwrap();
+        let records = reopened.read().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "demo");
+        assert_eq!(records[0].generation, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_of_missing_journal_is_empty() {
+        let root = temp_root("missing");
+        let journal = Journal::open(&root).unwrap();
+        assert!(journal.read().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fold_keeps_highest_generation_per_address() {
+        let records = vec![
+            record("demo", "1.0.0", 1),
+            record("demo", "1.0.0", 2),
+            record("other", "2.0.0", 1),
+            record("demo", "1.0.0", 3),
+        ];
+        let folded = fold(&records);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].name, "demo");
+        assert_eq!(folded[0].generation, 3);
+        assert_eq!(folded[1].name, "other");
+        assert_eq!(folded[1].generation, 1);
+    }
+
+    #[test]
+    fn older_generation_does_not_replace_newer() {
+        let records = vec![record("demo", "1.0.0", 5), record("demo", "1.0.0", 3)];
+        let folded = fold(&records);
+        assert_eq!(folded[0].generation, 5);
+    }
+
+    #[test]
+    fn a_corrupt_line_is_an_error_not_silent_drop() {
+        let root = temp_root("corrupt");
+        let mut journal = Journal::open(&root).unwrap();
+        journal.append(&record("demo", "1.0.0", 1)).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".pulith-state/journal.jsonl"))
+            .unwrap()
+            .write_all(b"not-json\n")
+            .unwrap();
+        let error = journal.read().unwrap_err();
+        assert!(matches!(error, StateError::Decode { line: 2, .. }));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
