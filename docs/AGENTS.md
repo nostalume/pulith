@@ -67,13 +67,14 @@ block the gate.
 ## Feature graph
 
 ```text
-default = local
+default -> archive
+archive -> zip + gzip + xz + zstd
 process -> local
 net
 http-sync -> net + local
 http-async -> net + local + tokio
-blake3 -> hash
-sha2 -> hash
+blake3 -> hash + local
+sha2 -> hash + local
 zip -> local
 tar -> local
 gzip/xz/zstd -> tar

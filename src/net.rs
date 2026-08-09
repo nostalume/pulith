@@ -29,8 +29,6 @@ use governor::clock::Clock;
 use crate::local::LocalMaterial;
 #[cfg(feature = "http-sync")]
 use crate::{Acquire, Inspect};
-#[cfg(any(feature = "http-async", feature = "http-sync"))]
-use crate::{Acquired, Inspected, Materialize};
 #[cfg(feature = "http-async")]
 use crate::{AsyncAcquire, AsyncInspect};
 
@@ -198,9 +196,14 @@ impl AcquireError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct RemoteUrl {
     url: url::Url,
+    policy: HttpInspectPolicy,
+    #[cfg(feature = "http-sync")]
+    sync_resources: Option<SyncHttpResources>,
+    #[cfg(feature = "http-async")]
+    async_resources: Option<AsyncHttpResources>,
 }
 
 impl RemoteUrl {
@@ -209,11 +212,38 @@ impl RemoteUrl {
             input: input.to_string(),
         })?;
         match url.scheme() {
-            "http" | "https" => Ok(Self { url }),
+            "http" | "https" => Ok(Self {
+                url,
+                policy: HttpInspectPolicy::default(),
+                #[cfg(feature = "http-sync")]
+                sync_resources: None,
+                #[cfg(feature = "http-async")]
+                async_resources: None,
+            }),
             scheme => Err(RemoteUrlError::UnsupportedScheme {
                 scheme: scheme.to_string(),
             }),
         }
+    }
+
+    /// Replace the default synchronous HEAD resources (agent, delay, admission).
+    #[cfg(feature = "http-sync")]
+    pub fn with_sync_resources(mut self, resources: SyncHttpResources) -> Self {
+        self.sync_resources = Some(resources);
+        self
+    }
+
+    /// Replace the default asynchronous HEAD resources (client, delay, admission).
+    #[cfg(feature = "http-async")]
+    pub fn with_async_resources(mut self, resources: AsyncHttpResources) -> Self {
+        self.async_resources = Some(resources);
+        self
+    }
+
+    /// Replace the default HEAD inspection policy (timeout and retry).
+    pub fn with_inspect_policy(mut self, policy: HttpInspectPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub fn as_str(&self) -> &str {
@@ -228,6 +258,14 @@ impl RemoteUrl {
         self.url
     }
 }
+
+impl PartialEq for RemoteUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+
+impl Eq for RemoteUrl {}
 
 impl std::str::FromStr for RemoteUrl {
     type Err = RemoteUrlError;
@@ -576,7 +614,7 @@ impl HttpInspectPolicy {
 
 /// HTTP-specific facts reported by a HEAD response.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HttpObservation {
+pub struct RemoteObservation {
     pub status: u16,
     pub declared_content_length: Option<u64>,
 }
@@ -609,7 +647,7 @@ impl HttpInspectAttemptEvidence {
 
 /// Evidence for a completed HTTP inspection, including redirect authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HttpInspectEvidence {
+pub struct RemoteInspectEvidence {
     pub requested_url: url::Url,
     pub final_url: url::Url,
     pub attempts: Vec<HttpInspectAttemptEvidence>,
@@ -735,18 +773,35 @@ impl Validator {
     }
 }
 
-/// HTTP source identity and acquisition policy; it carries no publication destination.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// HTTP source identity, acquisition policy, and transport resources; it carries no publication
+/// destination.
+#[derive(Clone, Debug)]
 pub struct RemoteSource {
     pub(crate) url: RemoteUrl,
     pub(crate) policy: AcquirePolicy,
+    #[cfg(feature = "http-sync")]
+    pub(crate) sync_resources: Option<SyncHttpResources>,
+    #[cfg(feature = "http-async")]
+    pub(crate) async_resources: Option<AsyncHttpResources>,
 }
+
+impl PartialEq for RemoteSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url && self.policy == other.policy
+    }
+}
+
+impl Eq for RemoteSource {}
 
 impl RemoteSource {
     pub fn new(url: RemoteUrl) -> Self {
         Self {
             url,
             policy: AcquirePolicy::default(),
+            #[cfg(feature = "http-sync")]
+            sync_resources: None,
+            #[cfg(feature = "http-async")]
+            async_resources: None,
         }
     }
 
@@ -760,14 +815,28 @@ impl RemoteSource {
         self
     }
 
+    /// Replace the default synchronous transport resources (agent, delay, admission, pacing).
+    #[cfg(feature = "http-sync")]
+    pub fn with_sync_resources(mut self, resources: SyncHttpResources) -> Self {
+        self.sync_resources = Some(resources);
+        self
+    }
+
+    /// Replace the default asynchronous transport resources (client, delay, admission, pacing).
+    #[cfg(feature = "http-async")]
+    pub fn with_async_resources(mut self, resources: AsyncHttpResources) -> Self {
+        self.async_resources = Some(resources);
+        self
+    }
+
     pub fn url(&self) -> &RemoteUrl {
         &self.url
     }
 }
 
-/// Observed HTTP acquisition facts, excluding the ephemeral stage owned by the output material.
+/// Observed HTTP acquisition facts, excluding the ephemeral stage owned by the output artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HttpAcquireEvidence {
+pub struct RemoteAcquireEvidence {
     pub url: url::Url,
     pub status: u16,
     pub bytes: u64,
@@ -961,48 +1030,25 @@ impl std::fmt::Debug for SyncHttpResources {
 }
 
 #[cfg(feature = "http-sync")]
-/// Synchronous HEAD inspection implemented by `ureq`.
-#[derive(Clone, Debug)]
-pub struct SyncHttpInspect {
-    resources: SyncHttpResources,
-    policy: HttpInspectPolicy,
-}
-
-#[cfg(feature = "http-sync")]
-impl Default for SyncHttpInspect {
-    fn default() -> Self {
-        Self::new(SyncHttpResources::default(), HttpInspectPolicy::default())
-    }
-}
-
-#[cfg(feature = "http-sync")]
-impl SyncHttpInspect {
-    pub fn new(resources: SyncHttpResources, policy: HttpInspectPolicy) -> Self {
-        Self { resources, policy }
-    }
-}
-
-#[cfg(feature = "http-sync")]
-impl Inspect<RemoteUrl> for SyncHttpInspect {
+impl Inspect<()> for RemoteUrl {
     type Error = HttpInspectError;
-    type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
+    type Output = (RemoteObservation, RemoteInspectEvidence);
 
-    fn inspect(&self, node: RemoteUrl) -> Result<Self::Output, Self::Error> {
+    fn inspect(mut self, (): ()) -> Result<Self::Output, Self::Error> {
         use ureq::ResponseExt as _;
 
-        let requested_url = node.as_url().clone();
+        let resources = self.sync_resources.take().unwrap_or_default();
+        let requested_url = self.url.clone();
         let mut attempts = Vec::new();
         for attempt in 0..=self.policy.retry.max_retries {
-            let admission_wait = self
-                .resources
+            let admission_wait = resources
                 .admission
                 .as_ref()
                 .map(|admission| admission.enter_sync());
 
-            let mut request_config = self
-                .resources
+            let mut request_config = resources
                 .agent
-                .head(node.as_str())
+                .head(self.url.as_str())
                 .config()
                 .http_status_as_error(false);
             if let Some(timeout) = self.policy.timeout {
@@ -1018,7 +1064,7 @@ impl Inspect<RemoteUrl> for SyncHttpInspect {
                             .with_planned_delay(planned_delay),
                     );
                     if let Some(delay) = planned_delay {
-                        (self.resources.delay)(delay);
+                        (resources.delay)(delay);
                         continue;
                     }
                     return Err(HttpInspectError::Transport {
@@ -1060,60 +1106,34 @@ impl Inspect<RemoteUrl> for SyncHttpInspect {
                     .with_planned_delay(planned_delay),
             );
             if let Some(delay) = planned_delay {
-                (self.resources.delay)(delay);
+                (resources.delay)(delay);
                 continue;
             }
 
-            return Ok(Inspected {
-                input: node,
-                observation: HttpObservation {
+            return Ok((
+                RemoteObservation {
                     status,
                     declared_content_length,
                 },
-                evidence: HttpInspectEvidence {
+                RemoteInspectEvidence {
                     requested_url,
                     final_url,
                     attempts,
                 },
-            });
+            ));
         }
         unreachable!("HTTP inspection retry loop always returns")
     }
 }
 
 #[cfg(feature = "http-sync")]
-#[derive(Clone, Debug, Default)]
-pub struct SyncHttpAcquire {
-    resources: SyncHttpResources,
-}
-
-#[cfg(feature = "http-sync")]
-impl SyncHttpAcquire {
-    pub fn new(resources: SyncHttpResources) -> Self {
-        Self { resources }
-    }
-}
-
-#[cfg(feature = "http-sync")]
-impl SyncHttpAcquire {
-    /// Inherent mirror of [`Acquire::acquire`] — callable without importing the trait.
-    pub fn acquire<N>(
-        &self,
-        node: N,
-    ) -> Result<<Self as Acquire<N>>::Output, <Self as Acquire<N>>::Error>
-    where
-        Self: Acquire<N>,
-    {
-        Acquire::acquire(self, node)
-    }
-}
-
-impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
+impl Acquire for RemoteSource {
     type Error = AcquireError;
-    type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
+    type Output = (LocalMaterial, RemoteAcquireEvidence);
 
-    fn acquire(&self, node: Materialize<I, RemoteSource, T>) -> Result<Self::Output, Self::Error> {
-        let source = node.source.clone();
+    fn acquire(self) -> Result<Self::Output, Self::Error> {
+        let mut source = self;
+        let resources = source.sync_resources.take().unwrap_or_default();
 
         let mut attempts = Vec::new();
         let mut resume = None;
@@ -1127,12 +1147,11 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
             let resume_context = (!resume_suppressed)
                 .then(|| planned_resume(&source.policy.resume))
                 .flatten();
-            let admission_wait = self
-                .resources
+            let admission_wait = resources
                 .admission
                 .as_ref()
                 .map(|admission| admission.enter_sync());
-            let mut request = self.resources.agent.get(source.url.as_str());
+            let mut request = resources.agent.get(source.url.as_str());
             for (name, value) in &source.policy.headers {
                 request = request.header(name, value);
             }
@@ -1158,7 +1177,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
                             .with_admission_wait(admission_wait),
                     );
                     if let Some(delay) = planned_delay {
-                        (self.resources.delay)(delay);
+                        (resources.delay)(delay);
                         continue;
                     }
                     return Err(AcquireError::transport(
@@ -1228,7 +1247,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
                     .with_planned_delay(planned_delay),
                 );
                 if let Some(delay) = planned_delay {
-                    (self.resources.delay)(delay);
+                    (resources.delay)(delay);
                     continue;
                 }
                 return Err(AcquireError::HttpStatus {
@@ -1342,7 +1361,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
             } else {
                 0
             };
-            let active_pacer = self.resources.byte_pacer.as_ref();
+            let active_pacer = resources.byte_pacer.as_ref();
             let copy = match copy_response_body(
                 response.body_mut().as_reader(),
                 temp.as_file_mut(),
@@ -1367,7 +1386,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
                         .with_planned_delay(planned_delay),
                     );
                     if let Some(delay) = planned_delay {
-                        (self.resources.delay)(delay);
+                        (resources.delay)(delay);
                         continue;
                     }
                     return Err(AcquireError::transport(
@@ -1457,10 +1476,9 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
                 )
                 .with_pacing_wait(copy.pacing_wait),
             );
-            return Ok(Acquired {
-                input: node,
-                material: LocalMaterial::StagedFile { path: staged_path },
-                evidence: HttpAcquireEvidence {
+            return Ok((
+                LocalMaterial::StagedFile { path: staged_path },
+                RemoteAcquireEvidence {
                     url: source.url.into_url(),
                     status,
                     bytes: copy.bytes,
@@ -1469,7 +1487,7 @@ impl<I, T> Acquire<Materialize<I, RemoteSource, T>> for SyncHttpAcquire {
                     resume,
                     validator: response_validator,
                 },
-            });
+            ));
         }
         unreachable!("retry loop always returns")
     }
@@ -1532,46 +1550,14 @@ impl std::fmt::Debug for AsyncHttpResources {
 }
 
 #[cfg(feature = "http-async")]
-/// Tokio-backed asynchronous HEAD inspection implemented by `reqwest`.
-#[derive(Clone, Debug)]
-pub struct AsyncHttpInspect {
-    resources: AsyncHttpResources,
-    policy: HttpInspectPolicy,
-}
-
-#[cfg(feature = "http-async")]
-impl Default for AsyncHttpInspect {
-    fn default() -> Self {
-        Self::new(AsyncHttpResources::default(), HttpInspectPolicy::default())
-    }
-}
-
-#[cfg(feature = "http-async")]
-impl AsyncHttpInspect {
-    pub fn new(resources: AsyncHttpResources, policy: HttpInspectPolicy) -> Self {
-        Self { resources, policy }
-    }
-}
-
-#[cfg(feature = "http-async")]
-impl AsyncInspect<RemoteUrl> for AsyncHttpInspect {
+impl AsyncInspect for RemoteUrl {
     type Error = HttpInspectError;
-    type Output = Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>;
+    type Output = (RemoteObservation, RemoteInspectEvidence);
 
-    fn inspect<'a>(
-        &'a self,
-        node: RemoteUrl,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
-    where
-        RemoteUrl: 'a,
-    {
-        inspect_reqwest(
-            self.resources.client.clone(),
-            self.resources.delay.clone(),
-            self.resources.admission.clone(),
-            self.policy.clone(),
-            node,
-        )
+    fn inspect(self) -> impl Future<Output = Result<Self::Output, Self::Error>> {
+        let mut url = self;
+        let resources = url.async_resources.take().unwrap_or_default();
+        inspect_reqwest(resources.client, resources.delay, resources.admission, url)
     }
 }
 
@@ -1584,26 +1570,25 @@ async fn inspect_reqwest(
     client: reqwest::Client,
     delay: AsyncSleep,
     admission: Option<Arc<RateAdmission>>,
-    policy: HttpInspectPolicy,
-    node: RemoteUrl,
-) -> Result<Inspected<RemoteUrl, HttpObservation, HttpInspectEvidence>, HttpInspectError> {
-    let requested_url = node.as_url().clone();
+    url: RemoteUrl,
+) -> Result<(RemoteObservation, RemoteInspectEvidence), HttpInspectError> {
+    let requested_url = url.as_url().clone();
     let mut attempts = Vec::new();
-    for attempt in 0..=policy.retry.max_retries {
+    for attempt in 0..=url.policy.retry.max_retries {
         let admission_wait = match admission.as_ref() {
             Some(admission) => Some(admission.enter_async().await),
             None => None,
         };
 
-        let mut request = client.head(node.as_str());
-        if let Some(timeout) = policy.timeout {
+        let mut request = client.head(url.as_str());
+        if let Some(timeout) = url.policy.timeout {
             request = request.timeout(timeout);
         }
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                let will_retry = attempt < policy.retry.max_retries;
-                let planned_delay = will_retry.then(|| retry_delay(policy.retry, attempt));
+                let will_retry = attempt < url.policy.retry.max_retries;
+                let planned_delay = will_retry.then(|| retry_delay(url.policy.retry, attempt));
                 attempts.push(
                     HttpInspectAttemptEvidence::new(attempt, None, admission_wait)
                         .with_planned_delay(planned_delay),
@@ -1632,9 +1617,9 @@ async fn inspect_reqwest(
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
-        let will_retry = should_retry_status(status) && attempt < policy.retry.max_retries;
+        let will_retry = should_retry_status(status) && attempt < url.policy.retry.max_retries;
         let planned_delay =
-            will_retry.then(|| planned_retry_delay(policy.retry, attempt, retry_after));
+            will_retry.then(|| planned_retry_delay(url.policy.retry, attempt, retry_after));
         attempts.push(
             HttpInspectAttemptEvidence::new(attempt, Some(status), admission_wait)
                 .with_planned_delay(planned_delay),
@@ -1644,52 +1629,33 @@ async fn inspect_reqwest(
             continue;
         }
 
-        return Ok(Inspected {
-            input: node,
-            observation: HttpObservation {
+        return Ok((
+            RemoteObservation {
                 status,
                 declared_content_length,
             },
-            evidence: HttpInspectEvidence {
+            RemoteInspectEvidence {
                 requested_url,
                 final_url,
                 attempts,
             },
-        });
+        ));
     }
     unreachable!("HTTP inspection retry loop always returns")
 }
 
 #[cfg(feature = "http-async")]
-#[derive(Clone, Debug, Default)]
-pub struct AsyncHttpAcquire {
-    resources: AsyncHttpResources,
-}
-
-#[cfg(feature = "http-async")]
-impl AsyncHttpAcquire {
-    pub fn new(resources: AsyncHttpResources) -> Self {
-        Self { resources }
-    }
-}
-
-#[cfg(feature = "http-async")]
-impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for AsyncHttpAcquire {
+impl AsyncAcquire for RemoteSource {
     type Error = AcquireError;
-    type Output = Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>;
+    type Output = (LocalMaterial, RemoteAcquireEvidence);
 
-    fn acquire<'a>(
-        &'a self,
-        node: Materialize<I, RemoteSource, T>,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + 'a
-    where
-        Materialize<I, RemoteSource, T>: 'a,
-    {
-        let client = self.resources.client.clone();
-        let delay = self.resources.delay.clone();
-        let admission = self.resources.admission.clone();
-        let byte_pacer = self.resources.byte_pacer.clone();
-        async move { acquire_reqwest(client, delay, admission, byte_pacer, node).await }
+    fn acquire(mut self) -> impl Future<Output = Result<Self::Output, Self::Error>> {
+        let resources = self.async_resources.take().unwrap_or_default();
+        let client = resources.client;
+        let delay = resources.delay;
+        let admission = resources.admission;
+        let byte_pacer = resources.byte_pacer;
+        async move { acquire_reqwest(client, delay, admission, byte_pacer, self).await }
     }
 }
 
@@ -1698,18 +1664,13 @@ impl<I, T> AsyncAcquire<Materialize<I, RemoteSource, T>> for AsyncHttpAcquire {
     clippy::result_large_err,
     reason = "AcquireError keeps URL, retry, and resume evidence direct; this async boundary does not establish future-layout pressure"
 )]
-async fn acquire_reqwest<I, T>(
+async fn acquire_reqwest(
     client: reqwest::Client,
     delay: AsyncSleep,
     admission: Option<Arc<RateAdmission>>,
     byte_pacer: Option<Arc<ByteRatePacer>>,
-    node: Materialize<I, RemoteSource, T>,
-) -> Result<
-    Acquired<Materialize<I, RemoteSource, T>, LocalMaterial, HttpAcquireEvidence>,
-    AcquireError,
-> {
-    let source = node.source.clone();
-
+    source: RemoteSource,
+) -> Result<(LocalMaterial, RemoteAcquireEvidence), AcquireError> {
     let mut attempts = Vec::new();
     let mut resume = None;
     let mut resume_suppressed = false;
@@ -2013,10 +1974,9 @@ async fn acquire_reqwest<I, T>(
             )
             .with_pacing_wait(pacing_wait),
         );
-        return Ok(Acquired {
-            input: node,
-            material: LocalMaterial::StagedFile { path: staged_path },
-            evidence: HttpAcquireEvidence {
+        return Ok((
+            LocalMaterial::StagedFile { path: staged_path },
+            RemoteAcquireEvidence {
                 url: source.url.into_url(),
                 status,
                 bytes,
@@ -2025,7 +1985,7 @@ async fn acquire_reqwest<I, T>(
                 resume,
                 validator: response_validator,
             },
-        });
+        ));
     }
     unreachable!("retry loop always returns")
 }
@@ -2394,28 +2354,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "http-sync")]
     use crate::Inspect;
-    #[cfg(all(
-        any(feature = "http-async", feature = "http-sync"),
-        feature = "hash",
-        feature = "blake3"
-    ))]
-    use crate::Verify;
-    #[cfg(all(
-        any(feature = "http-async", feature = "http-sync"),
-        feature = "hash",
-        feature = "blake3"
-    ))]
-    use crate::hash::{ArtifactDescriptor, DigestAlgorithmKind, DigestValue, HashVerify};
-    #[cfg(all(
-        any(feature = "http-async", feature = "http-sync"),
-        feature = "hash",
-        feature = "blake3"
-    ))]
-    use crate::local::LocalApply;
     #[cfg(feature = "http-async")]
     use crate::{AsyncAcquire, AsyncInspect};
-    #[cfg(any(feature = "http-async", feature = "http-sync"))]
-    use crate::{Materialize, MaterializeMode};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::io::Write as TestWrite;
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
@@ -2423,22 +2363,12 @@ mod tests {
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::net::{TcpListener, TcpStream};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
-    use std::path::PathBuf;
-    #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::sync::{Arc as TestArc, Mutex, mpsc};
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
     use std::thread;
 
     fn test_validator() -> Validator {
         Validator::strong_etag("\"abc\"").unwrap()
-    }
-
-    #[cfg(any(feature = "http-async", feature = "http-sync"))]
-    fn materialize(
-        source: RemoteSource,
-        target: PathBuf,
-    ) -> Materialize<&'static str, RemoteSource, PathBuf> {
-        Materialize::new("artifact", source, target, MaterializeMode::ReplaceOrCreate)
     }
 
     #[test]
@@ -2684,38 +2614,33 @@ mod tests {
     #[cfg(feature = "http-sync")]
     fn ureq_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
-        let inspected = SyncHttpInspect::default()
-            .inspect(RemoteUrl::parse(&server.url).unwrap())
-            .unwrap();
+        let (observation, evidence) =
+            Inspect::inspect(RemoteUrl::parse(&server.url).unwrap(), ()).unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
-        assert_eq!(inspected.observation.status, 200);
+        assert_eq!(observation.status, 200);
         assert_eq!(
-            inspected.observation.declared_content_length,
+            observation.declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence.attempts.len(), 1);
-        assert_eq!(
-            inspected.evidence.requested_url,
-            inspected.evidence.final_url
-        );
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_eq!(evidence.requested_url, evidence.final_url);
     }
 
     #[test]
     #[cfg(feature = "http-sync")]
     fn ureq_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
-        let inspected = SyncHttpInspect::default()
-            .inspect(RemoteUrl::parse(&server.url).unwrap())
-            .unwrap();
+        let (observation, evidence) =
+            Inspect::inspect(RemoteUrl::parse(&server.url).unwrap(), ()).unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request.starts_with("HEAD "));
-        assert_eq!(inspected.observation.status, 405);
-        assert_eq!(inspected.evidence.attempts.len(), 1);
+        assert_eq!(observation.status, 405);
+        assert_eq!(evidence.attempts.len(), 1);
     }
 
     #[test]
@@ -2732,25 +2657,24 @@ mod tests {
             max_delay: None,
             respect_retry_after: false,
         });
-        let inspected = SyncHttpInspect::new(resources, policy)
-            .inspect(RemoteUrl::parse(&server.url).unwrap())
-            .unwrap();
+        let (observation, evidence) = Inspect::inspect(
+            RemoteUrl::parse(&server.url)
+                .unwrap()
+                .with_sync_resources(resources)
+                .with_inspect_policy(policy),
+            (),
+        )
+        .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
         assert!(server.next_request().starts_with("HEAD "));
         server.join();
 
-        assert_eq!(inspected.observation.status, 404);
-        assert_eq!(inspected.evidence.attempts.len(), 2);
-        assert_eq!(inspected.evidence.attempts[0].status, Some(503));
-        assert_eq!(inspected.evidence.attempts[1].status, Some(404));
-        assert_eq!(
-            inspected.evidence.attempts[0].admission_wait,
-            Some(Duration::ZERO)
-        );
-        assert_eq!(
-            inspected.evidence.attempts[1].admission_wait,
-            Some(Duration::ZERO)
-        );
+        assert_eq!(observation.status, 404);
+        assert_eq!(evidence.attempts.len(), 2);
+        assert_eq!(evidence.attempts[0].status, Some(503));
+        assert_eq!(evidence.attempts[1].status, Some(404));
+        assert_eq!(evidence.attempts[0].admission_wait, Some(Duration::ZERO));
+        assert_eq!(evidence.attempts[1].admission_wait, Some(Duration::ZERO));
     }
 
     #[test]
@@ -2758,15 +2682,13 @@ mod tests {
     fn ureq_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
-        let inspected = SyncHttpInspect::default()
-            .inspect(requested.clone())
-            .unwrap();
+        let (_, evidence) = Inspect::inspect(requested.clone(), ()).unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
 
-        assert_eq!(inspected.evidence.requested_url, requested.into_url());
-        assert!(inspected.evidence.final_url.as_str().ends_with("/final"));
+        assert_eq!(evidence.requested_url, requested.into_url());
+        assert!(evidence.final_url.as_str().ends_with("/final"));
     }
 
     #[test]
@@ -2776,9 +2698,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let error = SyncHttpInspect::default()
-            .inspect(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap())
-            .unwrap_err();
+        let error = Inspect::inspect(
+            RemoteUrl::parse(&format!("http://{address}/resource")).unwrap(),
+            (),
+        )
+        .unwrap_err();
 
         match error {
             HttpInspectError::Transport { attempts, .. } => {
@@ -2793,40 +2717,37 @@ mod tests {
     #[cfg(feature = "http-async")]
     fn reqwest_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
-        let inspected = block_on_reqwest(
-            AsyncHttpInspect::default().inspect(RemoteUrl::parse(&server.url).unwrap()),
-        )
+        let (observation, evidence) = block_on_reqwest(AsyncInspect::inspect(
+            RemoteUrl::parse(&server.url).unwrap(),
+        ))
         .unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request.starts_with("HEAD /artifact.bin HTTP/1.1\r\n"));
-        assert_eq!(inspected.observation.status, 200);
+        assert_eq!(observation.status, 200);
         assert_eq!(
-            inspected.observation.declared_content_length,
+            observation.declared_content_length,
             Some(b"body-not-materialized".len() as u64)
         );
-        assert_eq!(inspected.evidence.attempts.len(), 1);
-        assert_eq!(
-            inspected.evidence.requested_url,
-            inspected.evidence.final_url
-        );
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_eq!(evidence.requested_url, evidence.final_url);
     }
 
     #[test]
     #[cfg(feature = "http-async")]
     fn reqwest_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
-        let inspected = block_on_reqwest(
-            AsyncHttpInspect::default().inspect(RemoteUrl::parse(&server.url).unwrap()),
-        )
+        let (observation, evidence) = block_on_reqwest(AsyncInspect::inspect(
+            RemoteUrl::parse(&server.url).unwrap(),
+        ))
         .unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request.starts_with("HEAD "));
-        assert_eq!(inspected.observation.status, 405);
-        assert_eq!(inspected.evidence.attempts.len(), 1);
+        assert_eq!(observation.status, 405);
+        assert_eq!(evidence.attempts.len(), 1);
     }
 
     #[test]
@@ -2843,27 +2764,23 @@ mod tests {
             max_delay: None,
             respect_retry_after: false,
         });
-        let inspected = block_on_reqwest(
-            AsyncHttpInspect::new(resources, policy)
-                .inspect(RemoteUrl::parse(&server.url).unwrap()),
-        )
+        let (observation, evidence) = block_on_reqwest(AsyncInspect::inspect(
+            RemoteUrl::parse(&server.url)
+                .unwrap()
+                .with_async_resources(resources)
+                .with_inspect_policy(policy),
+        ))
         .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
         assert!(server.next_request().starts_with("HEAD "));
         server.join();
 
-        assert_eq!(inspected.observation.status, 404);
-        assert_eq!(inspected.evidence.attempts.len(), 2);
-        assert_eq!(inspected.evidence.attempts[0].status, Some(503));
-        assert_eq!(inspected.evidence.attempts[1].status, Some(404));
-        assert_eq!(
-            inspected.evidence.attempts[0].admission_wait,
-            Some(Duration::ZERO)
-        );
-        assert_eq!(
-            inspected.evidence.attempts[1].admission_wait,
-            Some(Duration::ZERO)
-        );
+        assert_eq!(observation.status, 404);
+        assert_eq!(evidence.attempts.len(), 2);
+        assert_eq!(evidence.attempts[0].status, Some(503));
+        assert_eq!(evidence.attempts[1].status, Some(404));
+        assert_eq!(evidence.attempts[0].admission_wait, Some(Duration::ZERO));
+        assert_eq!(evidence.attempts[1].admission_wait, Some(Duration::ZERO));
     }
 
     #[test]
@@ -2871,14 +2788,13 @@ mod tests {
     fn reqwest_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
-        let inspected =
-            block_on_reqwest(AsyncHttpInspect::default().inspect(requested.clone())).unwrap();
+        let (_, evidence) = block_on_reqwest(AsyncInspect::inspect(requested.clone())).unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
 
-        assert_eq!(inspected.evidence.requested_url, requested.into_url());
-        assert!(inspected.evidence.final_url.as_str().ends_with("/final"));
+        assert_eq!(evidence.requested_url, requested.into_url());
+        assert!(evidence.final_url.as_str().ends_with("/final"));
     }
 
     #[test]
@@ -2888,10 +2804,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
 
-        let error = block_on_reqwest(
-            AsyncHttpInspect::default()
-                .inspect(RemoteUrl::parse(&format!("http://{address}/resource")).unwrap()),
-        )
+        let error = block_on_reqwest(AsyncInspect::inspect(
+            RemoteUrl::parse(&format!("http://{address}/resource")).unwrap(),
+        ))
         .unwrap_err();
 
         match error {
@@ -2908,21 +2823,18 @@ mod tests {
     fn ureq_acquire_downloads_file_to_local_material() {
         let body = b"downloaded bytes";
         let server = serve_once(200, body, &[]);
-        let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert!(matches!(
-            &acquired.material,
-            LocalMaterial::StagedFile { .. }
-        ));
-        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), body);
-        assert_eq!(acquired.evidence.status, 200);
-        assert_eq!(acquired.evidence.bytes, body.len() as u64);
-        assert_eq!(acquired.evidence.content_length, Some(body.len() as u64));
+        let LocalMaterial::StagedFile { path } = &artifact else {
+            panic!("remote acquisition must keep staged-file custody")
+        };
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        assert_eq!(evidence.status, 200);
+        assert_eq!(evidence.bytes, body.len() as u64);
+        assert_eq!(evidence.content_length, Some(body.len() as u64));
     }
 
     #[test]
@@ -2934,13 +2846,11 @@ mod tests {
         std::fs::write(&target, b"original").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = SyncHttpAcquire::default()
-            .acquire(materialize(source, target.clone()))
-            .unwrap();
+        let (artifact, _) = Acquire::acquire(source).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
-        drop(acquired);
+        drop(artifact);
     }
 
     #[test]
@@ -2951,29 +2861,24 @@ mod tests {
         let target = temp.path().join("absent/target.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = SyncHttpAcquire::default()
-            .acquire(materialize(source, target.clone()))
-            .unwrap();
+        let (artifact, _) = Acquire::acquire(source).unwrap();
         server.join();
 
         assert!(!target.parent().unwrap().exists());
-        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"staged");
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"staged");
     }
 
     #[test]
     #[cfg(feature = "http-sync")]
     fn ureq_acquired_material_is_removed_when_abandoned() {
         let server = serve_once(200, b"temporary", &[]);
-        let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let acquired = SyncHttpAcquire::default()
-            .acquire(materialize(source, temp.path().join("target.bin")))
-            .unwrap();
+        let (artifact, _) = Acquire::acquire(source).unwrap();
         server.join();
-        let staged_path = acquired.material.path().to_path_buf();
+        let staged_path = artifact.path().to_path_buf();
         assert!(staged_path.exists());
-        drop(acquired);
+        drop(artifact);
 
         assert!(!staged_path.exists());
     }
@@ -2986,9 +2891,8 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         std::fs::write(&destination, b"old").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, destination.clone());
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3010,9 +2914,8 @@ mod tests {
         let destination = temp.path().join("artifact.bin");
         let policy = AcquirePolicy::default().max_bytes(3);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, destination.clone());
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
@@ -3031,9 +2934,7 @@ mod tests {
             .resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = SyncHttpAcquire::default()
-            .acquire(materialize(source, temp.path().join("out")))
-            .unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         let attempts = match error {
@@ -3051,7 +2952,6 @@ mod tests {
             (503, b"busy", &[("Retry-After", "2")]),
             (200, b"ok", &[]),
         ]);
-        let temp = tempfile::tempdir().unwrap();
         let policy =
             AcquirePolicy::default().retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
@@ -3060,30 +2960,26 @@ mod tests {
             let sleeps = TestArc::clone(&sleeps);
             TestArc::new(move |duration| sleeps.lock().unwrap().push(duration))
         });
-        let chosen = materialize(source, temp.path().join("out"));
+        let source = source.with_sync_resources(resources);
 
-        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"ok");
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"ok");
         assert_eq!(*sleeps.lock().unwrap(), vec![Duration::from_secs(2)]);
-        assert_eq!(acquired.evidence.attempts.len(), 2);
-        assert_eq!(acquired.evidence.attempts[0].status, Some(503));
+        assert_eq!(evidence.attempts.len(), 2);
+        assert_eq!(evidence.attempts[0].status, Some(503));
         assert_eq!(
-            acquired.evidence.attempts[0].outcome,
+            evidence.attempts[0].outcome,
             AttemptOutcome::RetryableStatus
         );
-        assert_eq!(
-            acquired.evidence.attempts[1].outcome,
-            AttemptOutcome::Success
-        );
+        assert_eq!(evidence.attempts[1].outcome, AttemptOutcome::Success);
     }
 
     #[test]
     #[cfg(feature = "http-sync")]
     fn ureq_concrete_byte_rate_pacer_downloads() {
         let server = serve_once(200, b"concrete paced", &[]);
-        let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
             .policy(AcquirePolicy::default());
         let pacer = ByteRatePacer::new(ByteRate::new(
@@ -3091,27 +2987,20 @@ mod tests {
             NonZeroU32::new(16_384).unwrap(),
         ));
         let resources = SyncHttpResources::default().with_byte_pacer(TestArc::new(pacer));
-        let chosen = materialize(source, temp.path().join("out"));
+        let source = source.with_sync_resources(resources);
 
-        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert_eq!(
-            std::fs::read(acquired.material.path()).unwrap(),
-            b"concrete paced"
-        );
-        assert_eq!(acquired.evidence.attempts[0].pacing_wait, Duration::ZERO);
-        assert_eq!(
-            acquired.evidence.attempts[0].outcome,
-            AttemptOutcome::Success
-        );
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"concrete paced");
+        assert_eq!(evidence.attempts[0].pacing_wait, Duration::ZERO);
+        assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
     }
 
     #[test]
     #[cfg(feature = "http-sync")]
     fn ureq_concrete_rate_admission_downloads() {
         let server = serve_once(200, b"rate admitted", &[]);
-        let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
             .policy(AcquirePolicy::default());
         let admission = RateAdmission::new(AttemptRate::new(
@@ -3119,23 +3008,14 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
         ));
         let resources = SyncHttpResources::default().with_admission(TestArc::new(admission));
-        let chosen = materialize(source, temp.path().join("out"));
+        let source = source.with_sync_resources(resources);
 
-        let acquired = SyncHttpAcquire::new(resources).acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert_eq!(
-            std::fs::read(acquired.material.path()).unwrap(),
-            b"rate admitted"
-        );
-        assert_eq!(
-            acquired.evidence.attempts[0].admission_wait,
-            Some(Duration::ZERO)
-        );
-        assert_eq!(
-            acquired.evidence.attempts[0].outcome,
-            AttemptOutcome::Success
-        );
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"rate admitted");
+        assert_eq!(evidence.attempts[0].admission_wait, Some(Duration::ZERO));
+        assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
     }
 
     #[test]
@@ -3152,19 +3032,15 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert_eq!(
-            std::fs::read(acquired.material.path()).unwrap(),
-            b"hello world"
-        );
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
         assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
-        assert_eq!(acquired.evidence.bytes, 11);
+        assert_eq!(evidence.bytes, 11);
         assert_eq!(
-            acquired.evidence.resume.unwrap().outcome,
+            evidence.resume.unwrap().outcome,
             ResumeOutcome::PartialAppended
         );
     }
@@ -3179,15 +3055,14 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
         assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
         assert_eq!(
-            acquired.evidence.resume.unwrap().outcome,
+            evidence.resume.unwrap().outcome,
             ResumeOutcome::RangeIgnoredRestarted
         );
     }
@@ -3202,9 +3077,8 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         let first_request = server.next_request();
         let second_request = server.next_request();
         server.join();
@@ -3213,10 +3087,10 @@ mod tests {
         assert!(request_has_header_name(&first_request, "If-Range"));
         assert!(!request_has_header_name(&second_request, "Range"));
         assert!(!request_has_header_name(&second_request, "If-Range"));
-        assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
         assert_eq!(std::fs::read(&partial).unwrap(), b"stale partial");
         assert_eq!(
-            acquired.evidence.resume.unwrap().outcome,
+            evidence.resume.unwrap().outcome,
             ResumeOutcome::RangeUnsatisfiableRestarted
         );
     }
@@ -3232,9 +3106,8 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3259,9 +3132,8 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3292,9 +3164,8 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3323,22 +3194,18 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request_has_header(&request, "range", "bytes=5-"));
         assert!(request_has_header(&request, "if-range", "\"abc\""));
-        assert_eq!(
-            std::fs::read(acquired.material.path()).unwrap(),
-            b"hello world"
-        );
-        let resume = acquired.evidence.resume.unwrap();
+        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
+        let resume = evidence.resume.unwrap();
         assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
         assert_eq!(resume.validator, validator);
-        assert_eq!(acquired.evidence.validator, Some(test_validator()));
+        assert_eq!(evidence.validator, Some(test_validator()));
     }
 
     #[test]
@@ -3356,9 +3223,8 @@ mod tests {
         let policy =
             AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let error = SyncHttpAcquire::default().acquire(chosen).unwrap_err();
+        let error = Acquire::acquire(source).unwrap_err();
         server.join();
 
         assert!(matches!(
@@ -3378,21 +3244,18 @@ mod tests {
         block_on_reqwest(async {
             let body = b"async downloaded bytes";
             let server = serve_once(200, body, &[]);
-            let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
-            assert!(matches!(
-                &acquired.material,
-                LocalMaterial::StagedFile { .. }
-            ));
-            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), body);
-            assert_eq!(acquired.evidence.status, 200);
-            assert_eq!(acquired.evidence.bytes, body.len() as u64);
-            assert_eq!(acquired.evidence.content_length, Some(body.len() as u64));
+            let LocalMaterial::StagedFile { path } = &artifact else {
+                panic!("remote acquisition must keep staged-file custody")
+            };
+            assert_eq!(std::fs::read(path).unwrap(), body);
+            assert_eq!(evidence.status, 200);
+            assert_eq!(evidence.bytes, body.len() as u64);
+            assert_eq!(evidence.content_length, Some(body.len() as u64));
         });
     }
 
@@ -3406,14 +3269,11 @@ mod tests {
             std::fs::write(&target, b"original").unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = AsyncHttpAcquire::default()
-                .acquire(materialize(source, target.clone()))
-                .await
-                .unwrap();
+            let (artifact, _) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
             assert_eq!(std::fs::read(&target).unwrap(), b"original");
-            drop(acquired);
+            drop(artifact);
         });
     }
 
@@ -3426,14 +3286,11 @@ mod tests {
             let target = temp.path().join("absent/target.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = AsyncHttpAcquire::default()
-                .acquire(materialize(source, target.clone()))
-                .await
-                .unwrap();
+            let (artifact, _) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
             assert!(!target.parent().unwrap().exists());
-            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"staged");
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"staged");
         });
     }
 
@@ -3442,17 +3299,13 @@ mod tests {
     fn reqwest_acquired_material_is_removed_when_abandoned() {
         block_on_reqwest(async {
             let server = serve_once(200, b"temporary", &[]);
-            let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-            let acquired = AsyncHttpAcquire::default()
-                .acquire(materialize(source, temp.path().join("target.bin")))
-                .await
-                .unwrap();
+            let (artifact, _) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
-            let staged_path = acquired.material.path().to_path_buf();
+            let staged_path = artifact.path().to_path_buf();
             assert!(staged_path.exists());
-            drop(acquired);
+            drop(artifact);
 
             assert!(!staged_path.exists());
         });
@@ -3467,12 +3320,8 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             std::fs::write(&destination, b"old").unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, destination.clone());
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(chosen)
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(
@@ -3496,12 +3345,8 @@ mod tests {
             let destination = temp.path().join("artifact.bin");
             let policy = AcquirePolicy::default().max_bytes(3);
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, destination.clone());
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(chosen)
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
@@ -3522,10 +3367,7 @@ mod tests {
                 .resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(materialize(source, temp.path().join("out")))
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             let attempts = match error {
@@ -3545,7 +3387,6 @@ mod tests {
                 (503, b"busy", &[("Retry-After", "2")]),
                 (200, b"ok", &[]),
             ]);
-            let temp = tempfile::tempdir().unwrap();
             let policy = AcquirePolicy::default()
                 .retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
@@ -3557,26 +3398,20 @@ mod tests {
                     Box::pin(std::future::ready(()))
                 })
             });
-            let chosen = materialize(source, temp.path().join("out"));
+            let source = source.with_async_resources(resources);
 
-            let acquired = AsyncHttpAcquire::new(resources)
-                .acquire(chosen)
-                .await
-                .unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"ok");
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"ok");
             assert_eq!(*sleeps.lock().unwrap(), vec![Duration::from_secs(2)]);
-            assert_eq!(acquired.evidence.attempts.len(), 2);
-            assert_eq!(acquired.evidence.attempts[0].status, Some(503));
+            assert_eq!(evidence.attempts.len(), 2);
+            assert_eq!(evidence.attempts[0].status, Some(503));
             assert_eq!(
-                acquired.evidence.attempts[0].outcome,
+                evidence.attempts[0].outcome,
                 AttemptOutcome::RetryableStatus
             );
-            assert_eq!(
-                acquired.evidence.attempts[1].outcome,
-                AttemptOutcome::Success
-            );
+            assert_eq!(evidence.attempts[1].outcome, AttemptOutcome::Success);
         });
     }
 
@@ -3585,7 +3420,6 @@ mod tests {
     fn reqwest_concrete_byte_rate_pacer_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async concrete paced", &[]);
-            let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
                 .policy(AcquirePolicy::default());
             let pacer = ByteRatePacer::new(ByteRate::new(
@@ -3593,23 +3427,17 @@ mod tests {
                 NonZeroU32::new(16_384).unwrap(),
             ));
             let resources = AsyncHttpResources::default().with_byte_pacer(TestArc::new(pacer));
-            let chosen = materialize(source, temp.path().join("out"));
+            let source = source.with_async_resources(resources);
 
-            let acquired = AsyncHttpAcquire::new(resources)
-                .acquire(chosen)
-                .await
-                .unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
             assert_eq!(
-                std::fs::read(acquired.material.path()).unwrap(),
+                std::fs::read(artifact.path()).unwrap(),
                 b"async concrete paced"
             );
-            assert_eq!(acquired.evidence.attempts[0].pacing_wait, Duration::ZERO);
-            assert_eq!(
-                acquired.evidence.attempts[0].outcome,
-                AttemptOutcome::Success
-            );
+            assert_eq!(evidence.attempts[0].pacing_wait, Duration::ZERO);
+            assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
         });
     }
 
@@ -3618,7 +3446,6 @@ mod tests {
     fn reqwest_concrete_rate_admission_downloads() {
         block_on_reqwest(async {
             let server = serve_once(200, b"async rate admitted", &[]);
-            let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
                 .policy(AcquirePolicy::default());
             let admission = RateAdmission::new(AttemptRate::new(
@@ -3626,26 +3453,17 @@ mod tests {
                 NonZeroU32::new(1).unwrap(),
             ));
             let resources = AsyncHttpResources::default().with_admission(TestArc::new(admission));
-            let chosen = materialize(source, temp.path().join("out"));
+            let source = source.with_async_resources(resources);
 
-            let acquired = AsyncHttpAcquire::new(resources)
-                .acquire(chosen)
-                .await
-                .unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
             assert_eq!(
-                std::fs::read(acquired.material.path()).unwrap(),
+                std::fs::read(artifact.path()).unwrap(),
                 b"async rate admitted"
             );
-            assert_eq!(
-                acquired.evidence.attempts[0].admission_wait,
-                Some(Duration::ZERO)
-            );
-            assert_eq!(
-                acquired.evidence.attempts[0].outcome,
-                AttemptOutcome::Success
-            );
+            assert_eq!(evidence.attempts[0].admission_wait, Some(Duration::ZERO));
+            assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
         });
     }
 
@@ -3664,19 +3482,15 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
-            assert_eq!(
-                std::fs::read(acquired.material.path()).unwrap(),
-                b"hello world"
-            );
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
             assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
-            assert_eq!(acquired.evidence.bytes, 11);
+            assert_eq!(evidence.bytes, 11);
             assert_eq!(
-                acquired.evidence.resume.unwrap().outcome,
+                evidence.resume.unwrap().outcome,
                 ResumeOutcome::PartialAppended
             );
         });
@@ -3695,10 +3509,7 @@ mod tests {
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(materialize(source, target.clone()))
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(
@@ -3725,12 +3536,8 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(chosen)
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(
@@ -3763,12 +3570,8 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(chosen)
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(
@@ -3799,22 +3602,18 @@ mod tests {
             let policy = AcquirePolicy::default()
                 .resume(ResumePolicy::if_range(&partial, validator.clone()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             let request = server.next_request();
             server.join();
 
             assert!(request_has_header(&request, "range", "bytes=5-"));
             assert!(request_has_header(&request, "if-range", "\"abc\""));
-            assert_eq!(
-                std::fs::read(acquired.material.path()).unwrap(),
-                b"hello world"
-            );
-            let resume = acquired.evidence.resume.unwrap();
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
+            let resume = evidence.resume.unwrap();
             assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
             assert_eq!(resume.validator, validator);
-            assert_eq!(acquired.evidence.validator, Some(test_validator()));
+            assert_eq!(evidence.validator, Some(test_validator()));
         });
     }
 
@@ -3834,12 +3633,8 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let error = AsyncHttpAcquire::default()
-                .acquire(chosen)
-                .await
-                .unwrap_err();
+            let error = AsyncAcquire::acquire(source).await.unwrap_err();
             server.join();
 
             assert!(matches!(
@@ -3865,15 +3660,14 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
 
-            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
             assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
             assert_eq!(
-                acquired.evidence.resume.unwrap().outcome,
+                evidence.resume.unwrap().outcome,
                 ResumeOutcome::RangeIgnoredRestarted
             );
         });
@@ -3890,9 +3684,8 @@ mod tests {
             let policy =
                 AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             let first_request = server.next_request();
             let second_request = server.next_request();
             server.join();
@@ -3901,121 +3694,91 @@ mod tests {
             assert!(request_has_header_name(&first_request, "If-Range"));
             assert!(!request_has_header_name(&second_request, "Range"));
             assert!(!request_has_header_name(&second_request, "If-Range"));
-            assert_eq!(std::fs::read(acquired.material.path()).unwrap(), b"fresh");
+            assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
             assert_eq!(std::fs::read(&partial).unwrap(), b"stale partial");
             assert_eq!(
-                acquired.evidence.resume.unwrap().outcome,
+                evidence.resume.unwrap().outcome,
                 ResumeOutcome::RangeUnsatisfiableRestarted
             );
         });
     }
 
     #[test]
-    #[cfg(all(feature = "http-async", feature = "hash", feature = "blake3"))]
-    fn reqwest_acquire_flows_into_descriptor_verify() {
+    #[cfg(feature = "http-async")]
+    fn reqwest_acquire_outputs_staged_artifact_with_evidence() {
         block_on_reqwest(async {
             let body = b"reqwest verified bytes";
-            let expected = blake3::hash(body).to_hex().to_string();
             let server = serve_once(200, body, &[]);
-            let temp = tempfile::tempdir().unwrap();
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, temp.path().join("out"));
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, evidence) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
-            let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
-                .verify(
-                    acquired,
-                    ArtifactDescriptor::new(
-                        DigestAlgorithmKind::Blake3,
-                        expected,
-                        body.len() as u64,
-                    ),
-                )
-                .unwrap();
 
-            assert!(matches!(
-                verified.material,
-                LocalMaterial::StagedFile { .. }
-            ));
+            let LocalMaterial::StagedFile { path } = &artifact else {
+                panic!("remote acquisition must keep staged-file custody")
+            };
+            assert_eq!(std::fs::read(path).unwrap(), body);
+            assert_eq!(evidence.status, 200);
+            assert_eq!(evidence.bytes, body.len() as u64);
         });
     }
 
     #[test]
-    #[cfg(all(feature = "http-async", feature = "hash", feature = "blake3"))]
-    fn reqwest_acquire_flows_into_local_apply_after_verify() {
+    #[cfg(feature = "http-async")]
+    fn reqwest_acquire_outputs_staged_artifact_without_publishing_destination() {
         block_on_reqwest(async {
             let body = b"reqwest apply bytes";
-            let expected = blake3::hash(body).to_hex().to_string();
             let server = serve_once(200, body, &[]);
             let temp = tempfile::tempdir().unwrap();
             let final_path = temp.path().join("final.bin");
             let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-            let chosen = materialize(source, final_path.clone());
 
-            let acquired = AsyncHttpAcquire::default().acquire(chosen).await.unwrap();
+            let (artifact, _) = AsyncAcquire::acquire(source).await.unwrap();
             server.join();
-            let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
-                .verify(
-                    acquired,
-                    DigestValue::new(DigestAlgorithmKind::Blake3, expected).unwrap(),
-                )
-                .unwrap();
-            let applied = LocalApply.apply(verified).unwrap();
 
-            assert_eq!(std::fs::read(final_path).unwrap(), body);
-            assert_eq!(applied.evidence.current.files, 1);
+            assert!(!final_path.exists());
+            let LocalMaterial::StagedFile { path } = &artifact else {
+                panic!("remote acquisition must keep staged-file custody")
+            };
+            assert_eq!(std::fs::read(path).unwrap(), body);
         });
     }
 
     #[test]
-    #[cfg(all(feature = "http-sync", feature = "hash", feature = "blake3"))]
-    fn ureq_acquire_flows_into_descriptor_verify() {
+    #[cfg(feature = "http-sync")]
+    fn ureq_acquire_outputs_staged_artifact_with_evidence() {
         let body = b"verified bytes";
-        let expected = blake3::hash(body).to_hex().to_string();
         let server = serve_once(200, body, &[]);
-        let temp = tempfile::tempdir().unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, temp.path().join("out"));
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, evidence) = Acquire::acquire(source).unwrap();
         server.join();
-        let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
-            .verify(
-                acquired,
-                ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, expected, body.len() as u64),
-            )
-            .unwrap();
 
-        assert!(matches!(
-            verified.material,
-            LocalMaterial::StagedFile { .. }
-        ));
+        let LocalMaterial::StagedFile { path } = &artifact else {
+            panic!("remote acquisition must keep staged-file custody")
+        };
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        assert_eq!(evidence.status, 200);
+        assert_eq!(evidence.bytes, body.len() as u64);
     }
 
     #[test]
-    #[cfg(all(feature = "http-sync", feature = "hash", feature = "blake3"))]
-    fn ureq_acquire_flows_into_local_apply_after_verify() {
+    #[cfg(feature = "http-sync")]
+    fn ureq_acquire_outputs_staged_artifact_without_publishing_destination() {
         let body = b"apply bytes";
-        let expected = blake3::hash(body).to_hex().to_string();
         let server = serve_once(200, body, &[]);
         let temp = tempfile::tempdir().unwrap();
         let final_path = temp.path().join("final.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-        let chosen = materialize(source, final_path.clone());
 
-        let acquired = SyncHttpAcquire::default().acquire(chosen).unwrap();
+        let (artifact, _) = Acquire::acquire(source).unwrap();
         server.join();
-        let verified = HashVerify::new(DigestAlgorithmKind::Blake3)
-            .verify(
-                acquired,
-                DigestValue::new(DigestAlgorithmKind::Blake3, expected).unwrap(),
-            )
-            .unwrap();
-        let applied = LocalApply.apply(verified).unwrap();
 
-        assert_eq!(std::fs::read(final_path).unwrap(), body);
-        assert_eq!(applied.evidence.current.files, 1);
+        assert!(!final_path.exists());
+        let LocalMaterial::StagedFile { path } = &artifact else {
+            panic!("remote acquisition must keep staged-file custody")
+        };
+        assert_eq!(std::fs::read(path).unwrap(), body);
     }
 
     #[cfg(any(feature = "http-async", feature = "http-sync"))]
