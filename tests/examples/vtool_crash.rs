@@ -9,27 +9,11 @@
     feature = "sha2"
 ))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn vtool() -> Command {
-    // `CARGO_BIN_EXE_*` is only defined for [[bin]] targets. An example binary is not built
-    // by `cargo test --test X`, so build it once (idempotent when already fresh).
-    static BUILD: std::sync::Once = std::sync::Once::new();
-    BUILD.call_once(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "--all-features", "--example", "vtool"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "cargo build --example vtool failed");
-    });
-    let exe = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/examples/vtool");
-    let exe = if cfg!(windows) {
-        exe.with_extension("exe")
-    } else {
-        exe
-    };
-    Command::new(exe)
+    Command::new(super::example("vtool"))
 }
 
 /// A throwaway layout root with a local-source manifest for `demo-tool` 1.2.0.
@@ -111,9 +95,10 @@ fn crash_before_fsync_aborts_before_the_record_is_durable() {
     let status = vtool()
         .args([
             "install",
+            "--root",
+            fixture.root.to_str().unwrap(),
             fixture.root.join("manifest.toml").to_str().unwrap(),
         ])
-        .arg(&fixture.root)
         .env("PULITH_VT_CRASH_AFTER", "journal-append")
         .status()
         .unwrap();
@@ -139,9 +124,10 @@ fn crash_after_fsync_keeps_the_record_as_truth() {
     let status = vtool()
         .args([
             "install",
+            "--root",
+            fixture.root.to_str().unwrap(),
             fixture.root.join("manifest.toml").to_str().unwrap(),
         ])
-        .arg(&fixture.root)
         .env("PULITH_VT_CRASH_AFTER", "journal-fsync")
         .status()
         .unwrap();

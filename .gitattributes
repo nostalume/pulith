@@ -1,0 +1,2 @@
+# Fixtures are byte-exact test inputs: never normalize line endings.
+tests/examples/vtool/fixtures/** binary
