@@ -1,4 +1,4 @@
-//! Cooperative, caller-authorized process realization into local staged-tree custody.
+//! Caller-authorized process realization into local staged-tree custody.
 //!
 //! This module does not sandbox the selected program, resolve dependencies, or publish a final
 //! target. It creates one private workspace, provides an explicit output path, and returns a
@@ -15,23 +15,23 @@
 //! caller-configurable byte cap. The cap bounds the retained memory only: during the run the child
 //! may write unbounded bytes to those files, bounded only by workspace lifetime and disk.
 //! Captured diagnostics are payload, not safe-facts attestation; they are never rendered in
-//! [`fmt::Display`] error text and never copied into [`ProcessEvidence`].
+//! [`fmt::Display`] error text and never copied into [`OutputEvidence`].
 //!
-//! Declared inputs ([`InputSpec`]) are staged as copies under `inputs/<name>` inside the workspace
+//! Declared inputs ([`StagedInput`]) are staged as copies under `inputs/<name>` inside the workspace
 //! before the run, with `PULITH_INPUT_ROOT` pointing at the staged directory and
 //! `PULITH_OUTPUT_ROOT` at the declared output. This is input closure, not isolation: the admitted
 //! program's visible input world is exactly the declared copies, the explicit environment, and the
 //! workspace, but ambient host reads are not guaranteed blocked.
 //!
-//! With the `process-async` feature, [`ProcessAcquire`] also implements [`AsyncAcquire`]: the same
+//! With the `process-async` feature, [`OutputProcess`] also implements [`AsyncAcquire`]: the same
 //! realization law with a tokio-awaited wait loop. Dropping or aborting the acquire future stops
 //! the admitted tree (the same tree-stop path as sync, plus a direct-child kill signal), so an
-//! abandoned build does not leak a running process tree. The async adapter reuses the shared
+//! abandoned build does not leak a running process tree. The async entry reuses the shared
 //! platform helpers; only the orchestration is duplicated.
 //!
-//! Both adapters accept a caller-owned [`CancellationToken`]: once cancelled (sticky, `Send +
+//! Both the sync and async entries accept a caller-owned [`CancelToken`]: once cancelled (sticky, `Send +
 //! Sync`), the wait loop stops the admitted tree via the same path and returns
-//! [`ProcessError::Cancelled`] — a caller stop request, never confused with a timeout. A token
+//! [`RunError::Cancelled`] — a caller stop request, never confused with a timeout. A token
 //! already cancelled at entry fails fast before the program spawns.
 
 use std::ffi::{OsStr, OsString};
@@ -52,8 +52,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(feature = "process-async")]
 use crate::AsyncAcquire;
-use crate::local::{LocalInspect, LocalObservation, StagedTree};
-use crate::{Acquire, Acquired, EvidenceChain, Materialize};
+use crate::local::{LocalObservation, LocalTarget, StagedTree};
+use crate::{Acquire, Inspect};
 
 const OUTPUT_ENV: &str = "PULITH_OUTPUT_ROOT";
 const INPUT_ENV: &str = "PULITH_INPUT_ROOT";
@@ -61,24 +61,303 @@ const DEFAULT_CAPTURE_CAP: usize = 1024 * 1024;
 #[cfg(windows)]
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
-/// Caller-authorized execution without a host-containment or sandbox claim.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Cooperative;
+/// One long-lived child process whose complete admitted tree remains under session custody.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedProcess {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+    working_dir: PathBuf,
+}
+
+/// Exclusive custody of one running managed process tree.
+pub struct ProcessSession {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: JobHandle,
+    program: PathBuf,
+    started: Instant,
+    resolved: bool,
+}
+
+/// One non-consuming observation of a managed process.
+#[derive(Debug)]
+pub enum ProcessObservation {
+    Running,
+    Exited(ExitStatus),
+}
+
+/// The terminal fact produced by waiting for or explicitly stopping a managed process.
+#[derive(Debug)]
+pub enum ProcessEnd {
+    Exited {
+        status: ExitStatus,
+        elapsed: Duration,
+    },
+    Stopped {
+        elapsed: Duration,
+    },
+}
+
+/// A managed process could not be started, observed, or stopped within its caller deadline.
+#[derive(Debug)]
+pub enum SessionError {
+    Spawn {
+        program: PathBuf,
+        source: io::Error,
+    },
+    Wait {
+        program: PathBuf,
+        source: io::Error,
+    },
+    StopTimedOut {
+        program: PathBuf,
+        deadline: Duration,
+    },
+    #[cfg(windows)]
+    CapabilityUnavailable {
+        program: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn { program, source } => {
+                write!(
+                    formatter,
+                    "failed to spawn managed process {}: {source}",
+                    program.display()
+                )
+            }
+            Self::Wait { program, source } => {
+                write!(
+                    formatter,
+                    "failed to observe managed process {}: {source}",
+                    program.display()
+                )
+            }
+            Self::StopTimedOut { program, deadline } => write!(
+                formatter,
+                "managed process {} did not stop within {deadline:?}",
+                program.display()
+            ),
+            #[cfg(windows)]
+            Self::CapabilityUnavailable { program, source } => write!(
+                formatter,
+                "managed process-tree capability unavailable for {}: {source}",
+                program.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn { source, .. } | Self::Wait { source, .. } => Some(source),
+            #[cfg(windows)]
+            Self::CapabilityUnavailable { source, .. } => Some(source),
+            Self::StopTimedOut { .. } => None,
+        }
+    }
+}
+
+impl ManagedProcess {
+    /// Admits an absolute executable and absolute working directory.
+    pub fn new(
+        program: impl Into<PathBuf>,
+        working_dir: impl Into<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        let program = program.into();
+        let working_dir = working_dir.into();
+        admit_program(&program)?;
+        if !working_dir.is_absolute() {
+            return Err(ConfigError::NonAbsoluteWorktree(working_dir));
+        }
+        Ok(Self {
+            program,
+            arguments: Vec::new(),
+            working_dir,
+        })
+    }
+
+    /// Replaces literal arguments without shell interpolation.
+    pub fn with_arguments(mut self, arguments: impl IntoIterator<Item = OsString>) -> Self {
+        self.arguments = arguments.into_iter().collect();
+        self
+    }
+
+    /// Starts with the caller environment inherited unchanged.
+    pub fn start(self) -> Result<ProcessSession, SessionError> {
+        let mut command = self.command();
+        self.spawn(&mut command)
+    }
+
+    /// Starts with only the admitted environment entries.
+    pub fn start_in_environment(
+        self,
+        environment: EnvVars,
+    ) -> Result<ProcessSession, SessionError> {
+        let mut command = self.command();
+        command.env_clear().envs(environment.entries);
+        self.spawn(&mut command)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command
+            .current_dir(&self.working_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .args(&self.arguments);
+        command
+    }
+
+    fn spawn(self, command: &mut Command) -> Result<ProcessSession, SessionError> {
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_SUSPENDED);
+        let started = Instant::now();
+        let child = command.spawn().map_err(|source| SessionError::Spawn {
+            program: self.program.clone(),
+            source,
+        })?;
+        #[cfg(windows)]
+        let (child, job) = managed_job(child, &self.program)?;
+        Ok(ProcessSession {
+            child,
+            #[cfg(windows)]
+            job,
+            program: self.program,
+            started,
+            resolved: false,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn managed_job(
+    mut child: std::process::Child,
+    program: &Path,
+) -> Result<(std::process::Child, JobHandle), SessionError> {
+    let job = assign_to_job(child.id()).map_err(|source| {
+        let _ = child.kill();
+        let _ = child.wait();
+        SessionError::CapabilityUnavailable {
+            program: program.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok((child, job))
+}
+
+impl ProcessSession {
+    /// Observes the child without consuming a running session.
+    pub fn observe(&mut self) -> Result<ProcessObservation, SessionError> {
+        match self
+            .child
+            .try_wait()
+            .map_err(|source| self.wait_error(source))?
+        {
+            Some(status) => {
+                self.resolved = true;
+                Ok(ProcessObservation::Exited(status))
+            }
+            None => Ok(ProcessObservation::Running),
+        }
+    }
+
+    /// Waits for natural child termination; every exit status is factual output.
+    pub fn wait(mut self) -> Result<ProcessEnd, SessionError> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|source| self.wait_error(source))?;
+        self.resolved = true;
+        Ok(ProcessEnd::Exited {
+            status,
+            elapsed: self.started.elapsed(),
+        })
+    }
+
+    /// Stops the admitted tree and waits no longer than the caller's deadline for reaping.
+    pub fn stop_within(mut self, deadline: Duration) -> Result<ProcessEnd, SessionError> {
+        self.stop_tree();
+        let stop_started = Instant::now();
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|source| self.wait_error(source))?
+                .is_some()
+            {
+                self.resolved = true;
+                return Ok(ProcessEnd::Stopped {
+                    elapsed: self.started.elapsed(),
+                });
+            }
+            if stop_started.elapsed() >= deadline {
+                return Err(SessionError::StopTimedOut {
+                    program: self.program.clone(),
+                    deadline,
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_error(&self, source: io::Error) -> SessionError {
+        SessionError::Wait {
+            program: self.program.clone(),
+            source,
+        }
+    }
+
+    fn stop_tree(&mut self) {
+        #[cfg(unix)]
+        stop_tree(self.child.id() as i32);
+        #[cfg(windows)]
+        stop_tree(&self.job);
+    }
+}
+
+impl Drop for ProcessSession {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.stop_tree();
+            let _ = self.child.wait();
+            self.resolved = true;
+        }
+    }
+}
+
+fn admit_program(program: &Path) -> Result<(), ConfigError> {
+    if program.as_os_str().is_empty() {
+        return Err(ConfigError::EmptyProgram);
+    }
+    if !program.is_absolute() {
+        return Err(ConfigError::NonAbsoluteProgram(program.to_path_buf()));
+    }
+    Ok(())
+}
 
 /// A path contained below the process workspace output root.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkspaceRelativePath(PathBuf);
+pub struct OutputPath(PathBuf);
 
-impl WorkspaceRelativePath {
+impl OutputPath {
     /// Admits one nonempty, normal-component-only relative output path.
-    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ProcessConfigError> {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let path = path.into();
         if path.as_os_str().is_empty()
             || path
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
         {
-            return Err(ProcessConfigError::InvalidWorkspaceOutput(path));
+            return Err(ConfigError::InvalidOutputPath(path));
         }
         Ok(Self(path))
     }
@@ -91,39 +370,39 @@ impl WorkspaceRelativePath {
 
 /// One argument passed to the selected program without shell interpolation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ActionArgument {
+pub enum Arg {
     Literal(OsString),
     WorkspaceRoot,
     OutputRoot,
-    OutputPath(WorkspaceRelativePath),
+    OutputPath(OutputPath),
 }
 
 /// Explicit process environment entries.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ExplicitEnvironment {
+pub struct EnvVars {
     entries: Vec<(OsString, OsString)>,
 }
 
-impl ExplicitEnvironment {
-    /// Admits caller entries while reserving Pulith's output-root variable.
+impl EnvVars {
+    /// Admits caller entries while reserving Pulith's input/output-root variables.
     pub fn new(
         entries: impl IntoIterator<Item = (OsString, OsString)>,
-    ) -> Result<Self, ProcessConfigError> {
+    ) -> Result<Self, ConfigError> {
         let entries = entries.into_iter().collect::<Vec<_>>();
         for (index, (key, _)) in entries.iter().enumerate() {
             if key.is_empty() || key.to_string_lossy().contains('=') {
-                return Err(ProcessConfigError::InvalidEnvironmentKey(key.clone()));
+                return Err(ConfigError::InvalidEnvironmentKey(key.clone()));
             }
             if environment_keys_equal(key, OsStr::new(OUTPUT_ENV))
                 || environment_keys_equal(key, OsStr::new(INPUT_ENV))
             {
-                return Err(ProcessConfigError::ReservedEnvironmentKey(key.clone()));
+                return Err(ConfigError::ReservedEnvironmentKey(key.clone()));
             }
             if entries[..index]
                 .iter()
                 .any(|(prior, _)| environment_keys_equal(prior, key))
             {
-                return Err(ProcessConfigError::DuplicateEnvironmentKey(key.clone()));
+                return Err(ConfigError::DuplicateEnvironmentKey(key.clone()));
             }
         }
         Ok(Self { entries })
@@ -145,28 +424,46 @@ fn environment_keys_equal(left: &OsStr, right: &OsStr) -> bool {
 /// Process configuration rejected before workspace creation or spawn.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum ProcessConfigError {
-    InvalidWorkspaceOutput(PathBuf),
+pub enum ConfigError {
+    InvalidOutputPath(PathBuf),
+    InvalidInputName(OsString),
+    NonAbsoluteInput(PathBuf),
     EmptyProgram,
     NonAbsoluteProgram(PathBuf),
+    NonAbsoluteWorktree(PathBuf),
     ZeroTimeout,
     InvalidEnvironmentKey(OsString),
     ReservedEnvironmentKey(OsString),
     DuplicateEnvironmentKey(OsString),
 }
 
-impl fmt::Display for ProcessConfigError {
+impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidWorkspaceOutput(path) => write!(
+            Self::InvalidOutputPath(path) => write!(
                 formatter,
                 "workspace output must be a nonempty contained relative path: {}",
+                path.display()
+            ),
+            Self::InvalidInputName(name) => write!(
+                formatter,
+                "staged input name must be one normal path component: {:?}",
+                name
+            ),
+            Self::NonAbsoluteInput(path) => write!(
+                formatter,
+                "staged input source path must be absolute: {}",
                 path.display()
             ),
             Self::EmptyProgram => formatter.write_str("process program path must not be empty"),
             Self::NonAbsoluteProgram(path) => write!(
                 formatter,
                 "process program path must be absolute: {}",
+                path.display()
+            ),
+            Self::NonAbsoluteWorktree(path) => write!(
+                formatter,
+                "process worktree path must be absolute: {}",
                 path.display()
             ),
             Self::ZeroTimeout => formatter.write_str("process timeout must be nonzero"),
@@ -189,7 +486,75 @@ impl fmt::Display for ProcessConfigError {
     }
 }
 
-impl std::error::Error for ProcessConfigError {}
+/// One bounded process that executes inside an existing caller-owned worktree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeProcess {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+    working_dir: PathBuf,
+    timeout: Duration,
+    capture_cap: usize,
+}
+
+impl WorktreeProcess {
+    /// Admits an absolute program and absolute caller-owned worktree.
+    pub fn new(
+        program: impl Into<PathBuf>,
+        working_dir: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self, ConfigError> {
+        let program = program.into();
+        let working_dir = working_dir.into();
+        if program.as_os_str().is_empty() {
+            return Err(ConfigError::EmptyProgram);
+        }
+        if !program.is_absolute() {
+            return Err(ConfigError::NonAbsoluteProgram(program));
+        }
+        if !working_dir.is_absolute() {
+            return Err(ConfigError::NonAbsoluteWorktree(working_dir));
+        }
+        if timeout.is_zero() {
+            return Err(ConfigError::ZeroTimeout);
+        }
+        Ok(Self {
+            program,
+            arguments: Vec::new(),
+            working_dir,
+            timeout,
+            capture_cap: DEFAULT_CAPTURE_CAP,
+        })
+    }
+
+    /// Replaces literal process arguments without shell interpolation.
+    pub fn with_arguments(mut self, arguments: impl IntoIterator<Item = OsString>) -> Self {
+        self.arguments = arguments.into_iter().collect();
+        self
+    }
+
+    /// Bounds each retained diagnostic stream at read time.
+    pub fn with_capture_cap(mut self, cap: usize) -> Self {
+        self.capture_cap = cap;
+        self
+    }
+}
+
+/// Safe facts from a successful caller-worktree execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeEvidence {
+    pub program: PathBuf,
+    pub working_dir: PathBuf,
+    pub elapsed: Duration,
+}
+
+/// Named result of a successful bounded caller-worktree execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeResult {
+    pub evidence: WorktreeEvidence,
+    pub diagnostics: Diagnostics,
+}
+
+impl std::error::Error for ConfigError {}
 
 /// One declared input file staged into the private workspace before the run.
 ///
@@ -198,83 +563,78 @@ impl std::error::Error for ProcessConfigError {}
 /// argument. The file is copied, never linked, so the program's view is a snapshot: later host
 /// edits do not reach the run, and the run cannot write back through the staged copy.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InputSpec {
+pub struct StagedInput {
     source: PathBuf,
-    name: String,
+    name: OsString,
 }
 
-impl InputSpec {
-    /// Declares a source path staged under an explicit name.
-    ///
-    /// The name is validated at staging time: it must be a non-empty single path component.
-    pub fn new(source: impl Into<PathBuf>, name: impl Into<String>) -> Self {
-        Self {
-            source: source.into(),
-            name: name.into(),
-        }
-    }
-
-    /// Declares a source path staged under its file name.
-    pub fn from_path(source: impl Into<PathBuf>) -> Self {
+impl StagedInput {
+    /// Admits an absolute source path and one normal staged name.
+    pub fn new(source: impl Into<PathBuf>, name: impl Into<OsString>) -> Result<Self, ConfigError> {
         let source = source.into();
-        let name = source
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Self { source, name }
+        if !source.is_absolute() {
+            return Err(ConfigError::NonAbsoluteInput(source));
+        }
+        let name = name.into();
+        let mut components = Path::new(&name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(part)), None) if !part.is_empty()
+        ) {
+            return Err(ConfigError::InvalidInputName(name));
+        }
+        Ok(Self { source, name })
     }
 }
 
-/// One bounded process action that must create a directory below its private output root.
+/// One bounded process that must create a directory below its private output root.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessAction<P> {
+pub struct OutputProcess {
     program: PathBuf,
-    arguments: Vec<ActionArgument>,
-    environment: ExplicitEnvironment,
-    inputs: Vec<InputSpec>,
-    output: WorkspaceRelativePath,
+    arguments: Vec<Arg>,
+    environment: EnvVars,
+    inputs: Vec<StagedInput>,
+    output: OutputPath,
     timeout: Duration,
     capture_cap: usize,
-    policy: P,
 }
 
-impl ProcessAction<Cooperative> {
-    /// Creates a cooperative action with explicit executable path and declared output directory.
+impl OutputProcess {
+    /// Creates a cooperative process with explicit executable path and declared output directory.
     pub fn new(
         program: impl Into<PathBuf>,
-        output: WorkspaceRelativePath,
+        output: OutputPath,
         timeout: Duration,
-    ) -> Result<Self, ProcessConfigError> {
+    ) -> Result<Self, ConfigError> {
         let program = program.into();
         if program.as_os_str().is_empty() {
-            return Err(ProcessConfigError::EmptyProgram);
+            return Err(ConfigError::EmptyProgram);
         }
         if !program.is_absolute() {
-            return Err(ProcessConfigError::NonAbsoluteProgram(program));
+            return Err(ConfigError::NonAbsoluteProgram(program));
         }
         if timeout.is_zero() {
-            return Err(ProcessConfigError::ZeroTimeout);
+            return Err(ConfigError::ZeroTimeout);
         }
         Ok(Self {
             program,
             arguments: Vec::new(),
-            environment: ExplicitEnvironment::default(),
+            environment: EnvVars::default(),
             inputs: Vec::new(),
             output,
             timeout,
             capture_cap: DEFAULT_CAPTURE_CAP,
-            policy: Cooperative,
         })
     }
 
     /// Replaces the structured program arguments.
-    pub fn with_arguments(mut self, arguments: impl IntoIterator<Item = ActionArgument>) -> Self {
+    pub fn with_arguments(mut self, arguments: impl IntoIterator<Item = Arg>) -> Self {
         self.arguments = arguments.into_iter().collect();
         self
     }
 
     /// Replaces the explicit environment after its reserved-key admission.
-    pub fn with_environment(mut self, environment: ExplicitEnvironment) -> Self {
+    pub fn with_environment(mut self, environment: EnvVars) -> Self {
         self.environment = environment;
         self
     }
@@ -284,7 +644,7 @@ impl ProcessAction<Cooperative> {
     /// Each input is copied to `inputs/<name>` (never linked) with `PULITH_INPUT_ROOT` pointing
     /// at the staged directory; missing sources, collisions, and invalid names fail before the
     /// program spawns.
-    pub fn with_inputs(mut self, inputs: impl IntoIterator<Item = InputSpec>) -> Self {
+    pub fn with_inputs(mut self, inputs: impl IntoIterator<Item = StagedInput>) -> Self {
         self.inputs = inputs.into_iter().collect();
         self
     }
@@ -302,19 +662,26 @@ impl ProcessAction<Cooperative> {
 
 /// Safe facts from a successful cooperative process realization.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessEvidence<P> {
-    pub output: WorkspaceRelativePath,
+pub struct OutputEvidence {
+    pub output: OutputPath,
     pub elapsed: Duration,
-    _policy: std::marker::PhantomData<P>,
 }
 
-/// Capped standard-stream output captured from the admitted process action.
+/// Named material and evidence returned by private-output realization.
+#[derive(Debug)]
+pub struct OutputResult {
+    pub tree: StagedTree,
+    pub evidence: OutputEvidence,
+    pub diagnostics: Diagnostics,
+}
+
+/// Capped standard-stream output captured from the admitted process.
 ///
 /// Diagnostics are payload, not safe-facts attestation: they are never rendered in [`fmt::Display`]
-/// error text and never copied into [`ProcessEvidence`]. Each stream is `None` when capture was
+/// error text and never copied into [`OutputEvidence`]. Each stream is `None` when capture was
 /// disabled (`cap = 0`) or the workspace diagnostic file could not be read back.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProcessDiagnostics {
+pub struct Diagnostics {
     /// First `cap` bytes of standard output, or `None` when unavailable or disabled.
     pub stdout: Option<Vec<u8>>,
     /// First `cap` bytes of standard error, or `None` when unavailable or disabled.
@@ -327,7 +694,7 @@ pub struct ProcessDiagnostics {
     pub cap: usize,
 }
 
-impl ProcessDiagnostics {
+impl Diagnostics {
     fn disabled() -> Self {
         Self {
             stdout: None,
@@ -339,19 +706,19 @@ impl ProcessDiagnostics {
     }
 }
 
-/// Caller-owned cancellation signal for one process action.
+/// Caller-owned cancellation signal for one process.
 ///
 /// The token is sticky (once cancelled it stays cancelled), `Send + Sync`, and carries no data
-/// beyond the cancelled bit. [`ProcessAcquire::acquire_with_cancel`] polls it once per wait-loop
+/// beyond the cancelled bit. [`OutputProcess::acquire_cancellable`] polls it once per wait-loop
 /// tick and stops the admitted tree via the frozen tree-stop path; a token already cancelled at
 /// entry fails fast before the program spawns. Cancellation is the caller's explicit stop request
-/// and is never confused with a timeout: it surfaces as [`ProcessError::Cancelled`].
+/// and is never confused with a timeout: it surfaces as [`RunError::Cancelled`].
 #[derive(Clone, Default)]
-pub struct CancellationToken {
+pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
 }
 
-impl CancellationToken {
+impl CancelToken {
     /// Creates an uncancelled token.
     pub fn new() -> Self {
         Self::default()
@@ -371,15 +738,28 @@ impl CancellationToken {
 /// Failure before a staged output tree could be returned.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum ProcessError {
+pub enum RunError {
     Workspace {
+        source: io::Error,
+    },
+    WorktreeMissing {
+        path: PathBuf,
+    },
+    WorktreeWrongKind {
+        path: PathBuf,
+    },
+    WorktreeInspect {
+        path: PathBuf,
         source: io::Error,
     },
     InputMissing {
         path: PathBuf,
     },
     InputCollision {
-        name: String,
+        name: OsString,
+    },
+    InputWrongKind {
+        path: PathBuf,
     },
     InputStaging {
         path: PathBuf,
@@ -388,60 +768,75 @@ pub enum ProcessError {
     Spawn {
         program: PathBuf,
         source: io::Error,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     Wait {
         program: PathBuf,
         source: io::Error,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     TimedOut {
         program: PathBuf,
         timeout: Duration,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     Cancelled {
         program: PathBuf,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     ExitedNonZero {
         program: PathBuf,
         status: ExitStatus,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     OutputMissing {
         path: PathBuf,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     OutputWrongKind {
         path: PathBuf,
         observed: LocalObservation,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     OutputInspect {
         path: PathBuf,
         source: crate::local::LocalError,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     #[cfg(windows)]
     CapabilityUnavailable {
         program: PathBuf,
         source: io::Error,
-        diagnostics: Box<ProcessDiagnostics>,
+        diagnostics: Box<Diagnostics>,
     },
     WorkspaceCleanup {
-        primary: Box<ProcessError>,
+        primary: Box<RunError>,
         cleanup: io::Error,
     },
 }
 
-impl fmt::Display for ProcessError {
+impl fmt::Display for RunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Captured diagnostics are never rendered here; they may contain program output.
         match self {
             Self::Workspace { source } => {
                 write!(formatter, "failed to create process workspace: {source}")
             }
+            Self::WorktreeMissing { path } => {
+                write!(formatter, "caller worktree is missing: {}", path.display())
+            }
+            Self::WorktreeWrongKind { path } => {
+                write!(
+                    formatter,
+                    "caller worktree is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::WorktreeInspect { path, source } => write!(
+                formatter,
+                "failed to inspect caller worktree {}: {source}",
+                path.display()
+            ),
             Self::InputMissing { path } => write!(
                 formatter,
                 "declared process input is missing or not a readable file: {}",
@@ -453,6 +848,11 @@ impl fmt::Display for ProcessError {
                     "declared process inputs collide on staged name {name:?}"
                 )
             }
+            Self::InputWrongKind { path } => write!(
+                formatter,
+                "declared process input is not a regular non-link file: {}",
+                path.display()
+            ),
             Self::InputStaging { path, source } => write!(
                 formatter,
                 "failed to stage process input {}: {source}",
@@ -524,10 +924,11 @@ impl fmt::Display for ProcessError {
     }
 }
 
-impl std::error::Error for ProcessError {
+impl std::error::Error for RunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Workspace { source }
+            | Self::WorktreeInspect { source, .. }
             | Self::Spawn { source, .. }
             | Self::Wait { source, .. }
             | Self::InputStaging { source, .. } => Some(source),
@@ -540,97 +941,483 @@ impl std::error::Error for ProcessError {
     }
 }
 
-type ProcessAcquired<I> = Acquired<
-    Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-    StagedTree,
-    EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
->;
+/// The material and evidence returned by a successful process realization: the adapter-owned
+/// [`StagedTree`] custody, the safe-facts [`OutputEvidence`], and the capped captured
+/// diagnostics (payload, never part of the safe facts).
+type ProcessAcquiredOutput = OutputResult;
 
-/// Adapter that realizes one cooperative action into local staged-tree custody.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProcessAcquire<P> {
-    _policy: std::marker::PhantomData<P>,
+type WorktreeExecutedOutput = WorktreeResult;
+
+struct WorktreeExecution {
+    session: ChildSession,
+    program: PathBuf,
+    working_dir: PathBuf,
+    _capture: tempfile::TempDir,
 }
 
-impl ProcessAcquire<Cooperative> {
-    /// Creates the cooperative process-realization adapter.
-    pub fn new() -> Self {
-        Self::default()
+struct PrivateExecution {
+    session: ChildSession,
+    workspace: tempfile::TempDir,
+    selected_output: PathBuf,
+    output: OutputPath,
+    program: PathBuf,
+}
+
+impl PrivateExecution {
+    fn wait(self) -> Result<ProcessAcquiredOutput, RunError> {
+        let PrivateExecution {
+            session,
+            workspace,
+            selected_output,
+            output,
+            program,
+        } = self;
+        match session.wait() {
+            Ok(completion) => Self::finish(workspace, selected_output, output, program, completion),
+            Err(error) => fail_cleanup(workspace, error),
+        }
+    }
+
+    fn wait_cancellable(self, cancel: &CancelToken) -> Result<ProcessAcquiredOutput, RunError> {
+        let PrivateExecution {
+            session,
+            workspace,
+            selected_output,
+            output,
+            program,
+        } = self;
+        match session.wait_cancellable(cancel) {
+            Ok(completion) => Self::finish(workspace, selected_output, output, program, completion),
+            Err(error) => fail_cleanup(workspace, error),
+        }
+    }
+
+    fn finish(
+        workspace: tempfile::TempDir,
+        selected_output: PathBuf,
+        output: OutputPath,
+        program: PathBuf,
+        completion: ChildCompletion,
+    ) -> Result<ProcessAcquiredOutput, RunError> {
+        if !completion.status.success() {
+            return fail_cleanup(
+                workspace,
+                RunError::ExitedNonZero {
+                    program,
+                    status: completion.status,
+                    diagnostics: Box::new(completion.diagnostics),
+                },
+            );
+        }
+        let diagnostics = completion.diagnostics;
+        let observation = match Inspect::inspect(
+            LocalTarget::new(selected_output.clone())
+                .expect("a selected output path is always a nonempty contained workspace path"),
+            (),
+        ) {
+            Ok((observation, _)) => observation,
+            Err(source) => {
+                return fail_cleanup(
+                    workspace,
+                    RunError::OutputInspect {
+                        path: selected_output,
+                        source,
+                        diagnostics: Box::new(diagnostics),
+                    },
+                );
+            }
+        };
+        if observation == LocalObservation::Missing {
+            return fail_cleanup(
+                workspace,
+                RunError::OutputMissing {
+                    path: selected_output,
+                    diagnostics: Box::new(diagnostics),
+                },
+            );
+        }
+        if observation != LocalObservation::Directory {
+            return fail_cleanup(
+                workspace,
+                RunError::OutputWrongKind {
+                    path: selected_output,
+                    observed: observation,
+                    diagnostics: Box::new(diagnostics),
+                },
+            );
+        }
+        let evidence = OutputEvidence {
+            output,
+            elapsed: completion.elapsed,
+        };
+        Ok(OutputResult {
+            tree: StagedTree::new(workspace, selected_output),
+            evidence,
+            diagnostics,
+        })
     }
 }
 
-impl<I> Acquire<Materialize<I, ProcessAction<Cooperative>, PathBuf>>
-    for ProcessAcquire<Cooperative>
-{
-    type Error = ProcessError;
-    type Output = Acquired<
-        Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-        StagedTree,
-        EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
-    >;
+impl WorktreeExecution {
+    fn wait(self) -> Result<WorktreeExecutedOutput, RunError> {
+        let WorktreeExecution {
+            session,
+            program,
+            working_dir,
+            _capture,
+        } = self;
+        Self::finish(program, working_dir, session.wait()?)
+    }
 
-    fn acquire(
-        &self,
-        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-    ) -> Result<Self::Output, Self::Error> {
-        acquire_process(input, None)
+    fn wait_cancellable(self, cancel: &CancelToken) -> Result<WorktreeExecutedOutput, RunError> {
+        let WorktreeExecution {
+            session,
+            program,
+            working_dir,
+            _capture,
+        } = self;
+        Self::finish(program, working_dir, session.wait_cancellable(cancel)?)
+    }
+
+    fn finish(
+        program: PathBuf,
+        working_dir: PathBuf,
+        completion: ChildCompletion,
+    ) -> Result<WorktreeExecutedOutput, RunError> {
+        if !completion.status.success() {
+            return Err(RunError::ExitedNonZero {
+                program,
+                status: completion.status,
+                diagnostics: Box::new(completion.diagnostics),
+            });
+        }
+        Ok(WorktreeResult {
+            evidence: WorktreeEvidence {
+                program,
+                working_dir,
+                elapsed: completion.elapsed,
+            },
+            diagnostics: completion.diagnostics,
+        })
     }
 }
 
-impl ProcessAcquire<Cooperative> {
-    /// Runs one cooperative action to staged-tree custody, stopping the admitted tree when the
+struct ChildSession {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: JobHandle,
+    program: PathBuf,
+    timeout: Duration,
+    started: Instant,
+    capture_root: PathBuf,
+    capture_cap: usize,
+}
+
+struct ChildCompletion {
+    status: ExitStatus,
+    diagnostics: Diagnostics,
+    elapsed: Duration,
+}
+
+enum ChildPoll {
+    Running,
+    Completed(ChildCompletion),
+}
+
+impl ChildSession {
+    fn spawn(
+        command: &mut Command,
+        program: &Path,
+        timeout: Duration,
+        capture_root: &Path,
+        capture_cap: usize,
+    ) -> Result<Self, RunError> {
+        if capture_cap > 0 {
+            let stdout = File::create(capture_root.join("stdout.log"));
+            let stderr = File::create(capture_root.join("stderr.log"));
+            match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
+                }
+                (stdout, stderr) => {
+                    let source = match (stdout, stderr) {
+                        (Err(source), _) | (_, Err(source)) => source,
+                        _ => unreachable!(),
+                    };
+                    return Err(RunError::Spawn {
+                        program: program.to_path_buf(),
+                        source,
+                        diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
+                    });
+                }
+            }
+        } else {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_SUSPENDED);
+        let started = Instant::now();
+        let child = command.spawn().map_err(|source| RunError::Spawn {
+            program: program.to_path_buf(),
+            source,
+            diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
+        })?;
+        #[cfg(windows)]
+        let (child, job) = {
+            let mut child = child;
+            let job = assign_to_job(child.id()).map_err(|source| {
+                let _ = child.kill();
+                let _ = child.wait();
+                RunError::CapabilityUnavailable {
+                    program: program.to_path_buf(),
+                    source,
+                    diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
+                }
+            })?;
+            (child, job)
+        };
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+            program: program.to_path_buf(),
+            timeout,
+            started,
+            capture_root: capture_root.to_path_buf(),
+            capture_cap,
+        })
+    }
+
+    fn wait(mut self) -> Result<ChildCompletion, RunError> {
+        loop {
+            match self.poll()? {
+                ChildPoll::Running => thread::sleep(Duration::from_millis(10)),
+                ChildPoll::Completed(completion) => return Ok(completion),
+            }
+        }
+    }
+
+    fn wait_cancellable(mut self, cancel: &CancelToken) -> Result<ChildCompletion, RunError> {
+        loop {
+            if cancel.is_cancelled() {
+                self.stop();
+                return Err(self.cancelled());
+            }
+            match self.poll()? {
+                ChildPoll::Running => thread::sleep(Duration::from_millis(10)),
+                ChildPoll::Completed(completion) => return Ok(completion),
+            }
+        }
+    }
+
+    fn poll(&mut self) -> Result<ChildPoll, RunError> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Ok(ChildPoll::Completed(ChildCompletion {
+                status,
+                diagnostics: self.diagnostics(),
+                elapsed: self.started.elapsed(),
+            })),
+            Ok(None) if self.started.elapsed() >= self.timeout => {
+                self.stop();
+                Err(RunError::TimedOut {
+                    program: self.program.clone(),
+                    timeout: self.timeout,
+                    diagnostics: Box::new(self.diagnostics()),
+                })
+            }
+            Ok(None) => Ok(ChildPoll::Running),
+            Err(source) => Err(RunError::Wait {
+                program: self.program.clone(),
+                source,
+                diagnostics: Box::new(self.diagnostics()),
+            }),
+        }
+    }
+
+    fn stop(&mut self) {
+        #[cfg(unix)]
+        stop_tree(self.child.id() as i32);
+        #[cfg(windows)]
+        stop_tree(&self.job);
+        let _ = self.child.wait();
+    }
+
+    fn cancelled(&self) -> RunError {
+        RunError::Cancelled {
+            program: self.program.clone(),
+            diagnostics: Box::new(self.diagnostics()),
+        }
+    }
+
+    fn diagnostics(&self) -> Diagnostics {
+        read_diagnostics(&self.capture_root, self.capture_cap)
+    }
+}
+
+impl WorktreeProcess {
+    /// Executes the admitted program in its existing caller-owned worktree.
+    pub fn execute(self) -> Result<WorktreeExecutedOutput, RunError> {
+        start_worktree(self)?.wait()
+    }
+
+    /// Executes with only the admitted environment entries instead of inheriting the caller.
+    pub fn execute_in_environment(
+        self,
+        environment: EnvVars,
+    ) -> Result<WorktreeExecutedOutput, RunError> {
+        start_worktree_in_environment(self, environment)?.wait()
+    }
+
+    /// Runs in the admitted caller worktree and stops the admitted tree when cancelled.
+    pub fn execute_cancellable(
+        self,
+        cancel: &CancelToken,
+    ) -> Result<WorktreeExecutedOutput, RunError> {
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled {
+                program: self.program,
+                diagnostics: Box::new(Diagnostics::disabled()),
+            });
+        }
+        start_worktree(self)?.wait_cancellable(cancel)
+    }
+
+    /// Executes with an explicit environment and stops the admitted tree when cancelled.
+    pub fn execute_cancellable_in_environment(
+        self,
+        environment: EnvVars,
+        cancel: &CancelToken,
+    ) -> Result<WorktreeExecutedOutput, RunError> {
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled {
+                program: self.program,
+                diagnostics: Box::new(Diagnostics::disabled()),
+            });
+        }
+        start_worktree_in_environment(self, environment)?.wait_cancellable(cancel)
+    }
+}
+
+fn start_worktree(input: WorktreeProcess) -> Result<WorktreeExecution, RunError> {
+    let mut command = worktree_command(&input);
+    start_worktree_command(input, &mut command)
+}
+
+fn start_worktree_in_environment(
+    input: WorktreeProcess,
+    environment: EnvVars,
+) -> Result<WorktreeExecution, RunError> {
+    let mut command = worktree_command(&input);
+    command.env_clear().envs(environment.entries);
+    start_worktree_command(input, &mut command)
+}
+
+fn worktree_command(input: &WorktreeProcess) -> Command {
+    let mut command = Command::new(&input.program);
+    command
+        .current_dir(&input.working_dir)
+        .stdin(Stdio::null())
+        .args(&input.arguments);
+    command
+}
+
+fn start_worktree_command(
+    input: WorktreeProcess,
+    command: &mut Command,
+) -> Result<WorktreeExecution, RunError> {
+    match std::fs::metadata(&input.working_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(RunError::WorktreeWrongKind {
+                path: input.working_dir,
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(RunError::WorktreeMissing {
+                path: input.working_dir,
+            });
+        }
+        Err(source) => {
+            return Err(RunError::WorktreeInspect {
+                path: input.working_dir,
+                source,
+            });
+        }
+    }
+    let capture = tempfile::Builder::new()
+        .prefix(".pulith-process-capture-")
+        .tempdir()
+        .map_err(|source| RunError::Workspace { source })?;
+    let session = ChildSession::spawn(
+        command,
+        &input.program,
+        input.timeout,
+        capture.path(),
+        input.capture_cap,
+    )?;
+    Ok(WorktreeExecution {
+        session,
+        program: input.program,
+        working_dir: input.working_dir,
+        _capture: capture,
+    })
+}
+
+impl Acquire for OutputProcess {
+    type Error = RunError;
+    type Output = ProcessAcquiredOutput;
+
+    fn acquire(self) -> Result<Self::Output, Self::Error> {
+        start_private(self)?.wait()
+    }
+}
+
+impl OutputProcess {
+    /// Runs one cooperative process to staged-tree custody, stopping the admitted tree when the
     /// caller's token is set (sticky; polled once per wait-loop tick).
     ///
     /// Prefer the trait's [`Acquire::acquire`] for token-free calls; this inherent entry exists so
     /// the caller can stop a long realization without waiting for the timeout. Cancellation
-    /// reuses the frozen tree-stop path and surfaces as [`ProcessError::Cancelled`], never as
-    /// [`ProcessError::TimedOut`].
-    pub fn acquire_with_cancel<I>(
-        &self,
-        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-        cancel: &CancellationToken,
-    ) -> Result<ProcessAcquired<I>, ProcessError> {
-        acquire_process(input, Some(cancel))
+    /// reuses the frozen tree-stop path and surfaces as [`RunError::Cancelled`], never as
+    /// [`RunError::TimedOut`].
+    pub fn acquire_cancellable(
+        self,
+        cancel: &CancelToken,
+    ) -> Result<ProcessAcquiredOutput, RunError> {
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled {
+                program: self.program,
+                diagnostics: Box::new(Diagnostics::disabled()),
+            });
+        }
+        start_private(self)?.wait_cancellable(cancel)
     }
 }
 
-fn acquire_process<I>(
-    input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-    cancel: Option<&CancellationToken>,
-) -> Result<ProcessAcquired<I>, ProcessError> {
-    if cancel.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ProcessError::Cancelled {
-            program: input.source.program.clone(),
-            diagnostics: Box::new(ProcessDiagnostics::disabled()),
-        });
-    }
+fn start_private(input: OutputProcess) -> Result<PrivateExecution, RunError> {
     let workspace = tempfile::Builder::new()
         .prefix(".pulith-process-")
         .tempdir()
-        .map_err(|source| ProcessError::Workspace { source })?;
+        .map_err(|source| RunError::Workspace { source })?;
     let output_base = workspace.path().join("output");
     if let Err(source) = std::fs::create_dir(&output_base) {
-        return fail_cleanup(workspace, ProcessError::Workspace { source });
+        return fail_cleanup(workspace, RunError::Workspace { source });
     }
-    let selected_output = output_base.join(input.source.output.as_path());
+    let selected_output = output_base.join(input.output.as_path());
     let input_root = workspace.path().join("inputs");
-    let capture_cap = input.source.capture_cap;
-    let started = Instant::now();
-
-    if let Err(error) = stage_inputs(workspace.path(), &input.source.inputs) {
+    let capture_cap = input.capture_cap;
+    if let Err(error) = stage_inputs(workspace.path(), &input.inputs) {
         return fail_cleanup(workspace, error);
     }
 
-    let stdout_path = workspace.path().join("stdout.log");
-    let stderr_path = workspace.path().join("stderr.log");
-
-    let mut command = Command::new(&input.source.program);
+    let mut command = Command::new(&input.program);
     command
         .current_dir(workspace.path())
         .env_clear()
         .envs(
             input
-                .source
                 .environment
                 .entries
                 .iter()
@@ -638,216 +1425,55 @@ fn acquire_process<I>(
         )
         .env(OUTPUT_ENV, &selected_output)
         .stdin(Stdio::null());
-    if !input.source.inputs.is_empty() {
+    if !input.inputs.is_empty() {
         command.env(INPUT_ENV, &input_root);
     }
-    if capture_cap > 0 {
-        match (File::create(&stdout_path), File::create(&stderr_path)) {
-            (Ok(stdout), Ok(stderr)) => {
-                command.stdout(stdout).stderr(stderr);
-            }
-            (stdout, stderr) => {
-                let source = match (stdout, stderr) {
-                    (Err(source), _) | (_, Err(source)) => source,
-                    _ => unreachable!(),
-                };
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::Spawn {
-                        program: input.source.program.clone(),
-                        source,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-        }
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    for argument in &input.source.arguments {
+    for argument in &input.arguments {
         command.arg(resolve_argument(
             argument,
             workspace.path(),
             &selected_output,
         ));
     }
-    #[cfg(unix)]
-    command.process_group(0);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_SUSPENDED);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(source) => {
-            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-            return fail_cleanup(
-                workspace,
-                ProcessError::Spawn {
-                    program: input.source.program.clone(),
-                    source,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
+    let session = match ChildSession::spawn(
+        &mut command,
+        &input.program,
+        input.timeout,
+        workspace.path(),
+        capture_cap,
+    ) {
+        Ok(session) => session,
+        Err(error) => return fail_cleanup(workspace, error),
     };
-
-    #[cfg(windows)]
-    let job = match assign_to_job(child.id()) {
-        Ok(job) => job,
-        Err(source) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-            return fail_cleanup(
-                workspace,
-                ProcessError::CapabilityUnavailable {
-                    program: input.source.program.clone(),
-                    source,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
-    };
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= input.source.timeout => {
-                #[cfg(unix)]
-                stop_tree(child.id() as i32);
-                #[cfg(windows)]
-                stop_tree(&job);
-                let _ = child.wait();
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::TimedOut {
-                        program: input.source.program.clone(),
-                        timeout: input.source.timeout,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-            Ok(None) if cancel.is_some_and(CancellationToken::is_cancelled) => {
-                #[cfg(unix)]
-                stop_tree(child.id() as i32);
-                #[cfg(windows)]
-                stop_tree(&job);
-                let _ = child.wait();
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::Cancelled {
-                        program: input.source.program.clone(),
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(source) => {
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::Wait {
-                        program: input.source.program.clone(),
-                        source,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-        }
-    };
-    if !status.success() {
-        let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-        return fail_cleanup(
-            workspace,
-            ProcessError::ExitedNonZero {
-                program: input.source.program.clone(),
-                status,
-                diagnostics: Box::new(diagnostics),
-            },
-        );
-    }
-    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-    let observation = match LocalInspect.inspect((&selected_output).into()) {
-        Ok(inspected) => inspected.observation,
-        Err(source) => {
-            return fail_cleanup(
-                workspace,
-                ProcessError::OutputInspect {
-                    path: selected_output,
-                    source,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
-    };
-    if observation == LocalObservation::Missing {
-        return fail_cleanup(
-            workspace,
-            ProcessError::OutputMissing {
-                path: selected_output,
-                diagnostics: Box::new(diagnostics),
-            },
-        );
-    }
-    if observation != LocalObservation::Directory {
-        return fail_cleanup(
-            workspace,
-            ProcessError::OutputWrongKind {
-                path: selected_output,
-                observed: observation,
-                diagnostics: Box::new(diagnostics),
-            },
-        );
-    }
-    let evidence = ProcessEvidence {
-        output: input.source.output.clone(),
-        elapsed: started.elapsed(),
-        _policy: std::marker::PhantomData,
-    };
-    Ok(Acquired {
-        input,
-        material: StagedTree::new(workspace, selected_output),
-        evidence: EvidenceChain {
-            previous: evidence,
-            current: diagnostics,
-        },
+    Ok(PrivateExecution {
+        session,
+        workspace,
+        selected_output,
+        output: input.output,
+        program: input.program,
     })
 }
 
-fn stage_inputs(workspace: &Path, inputs: &[InputSpec]) -> Result<(), ProcessError> {
+fn stage_inputs(workspace: &Path, inputs: &[StagedInput]) -> Result<(), RunError> {
     if inputs.is_empty() {
         return Ok(());
     }
     let input_root = workspace.join("inputs");
-    std::fs::create_dir(&input_root).map_err(|source| ProcessError::InputStaging {
+    std::fs::create_dir(&input_root).map_err(|source| RunError::InputStaging {
         path: input_root.clone(),
         source,
     })?;
     let mut seen = std::collections::HashSet::new();
     for spec in inputs {
-        // Component law: the staged name must be a single non-empty path component, so it can
-        // never escape the workspace (rejects separators, `.`, `..`, and empty names).
-        let mut components = Path::new(&spec.name).components();
-        let valid = matches!(
-            (components.next(), components.next()),
-            (Some(Component::Normal(part)), None) if !part.is_empty()
-        );
-        if !valid || !seen.insert(spec.name.clone()) {
-            return Err(ProcessError::InputCollision {
+        if !seen.insert(spec.name.clone()) {
+            return Err(RunError::InputCollision {
                 name: spec.name.clone(),
             });
         }
-        if !spec.source.is_file() {
-            return Err(ProcessError::InputMissing {
-                path: spec.source.clone(),
-            });
-        }
+        admit_staged_source(&spec.source)?;
         let destination = input_root.join(&spec.name);
         if let Err(source) = std::fs::copy(&spec.source, &destination) {
-            return Err(ProcessError::InputStaging {
+            return Err(RunError::InputStaging {
                 path: destination,
                 source,
             });
@@ -856,275 +1482,297 @@ fn stage_inputs(workspace: &Path, inputs: &[InputSpec]) -> Result<(), ProcessErr
     Ok(())
 }
 
-#[cfg(feature = "process-async")]
-impl<I> AsyncAcquire<Materialize<I, ProcessAction<Cooperative>, PathBuf>>
-    for ProcessAcquire<Cooperative>
-{
-    type Error = ProcessError;
-    type Output = Acquired<
-        Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-        StagedTree,
-        EvidenceChain<ProcessEvidence<Cooperative>, ProcessDiagnostics>,
-    >;
-
-    #[allow(
-        clippy::manual_async_fn,
-        reason = "async fn cannot express the trait's explicit `'a` + `where N: 'a` bounds on the returned future"
-    )]
-    fn acquire<'a>(
-        &'a self,
-        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-    ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + 'a
-    where
-        Materialize<I, ProcessAction<Cooperative>, PathBuf>: 'a,
-    {
-        async move { acquire_process_async(input, None).await }
-    }
-}
-
-#[cfg(feature = "process-async")]
-impl ProcessAcquire<Cooperative> {
-    /// Awaitable token-cancellable entry, mirroring [`ProcessAcquire::acquire_with_cancel`] for
-    /// the async path: the wait loop polls the same token, so the caller can cancel while keeping
-    /// the future alive to await the outcome. Dropping the future still stops the tree.
-    pub async fn acquire_with_token<I>(
-        &self,
-        input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-        cancel: &CancellationToken,
-    ) -> Result<ProcessAcquired<I>, ProcessError> {
-        acquire_process_async(input, Some(cancel)).await
-    }
-}
-
-#[cfg(feature = "process-async")]
-async fn acquire_process_async<I>(
-    input: Materialize<I, ProcessAction<Cooperative>, PathBuf>,
-    cancel: Option<&CancellationToken>,
-) -> Result<ProcessAcquired<I>, ProcessError> {
-    if cancel.is_some_and(CancellationToken::is_cancelled) {
-        return Err(ProcessError::Cancelled {
-            program: input.source.program.clone(),
-            diagnostics: Box::new(ProcessDiagnostics::disabled()),
+fn admit_staged_source(path: &Path) -> Result<(), RunError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(RunError::InputMissing {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(RunError::InputStaging {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = false;
+    if !metadata.file_type().is_file() || reparse {
+        return Err(RunError::InputWrongKind {
+            path: path.to_path_buf(),
         });
     }
-    let workspace = tempfile::Builder::new()
-        .prefix(".pulith-process-")
-        .tempdir()
-        .map_err(|source| ProcessError::Workspace { source })?;
-    let output_base = workspace.path().join("output");
-    if let Err(source) = std::fs::create_dir(&output_base) {
-        return fail_cleanup(workspace, ProcessError::Workspace { source });
-    }
-    let selected_output = output_base.join(input.source.output.as_path());
-    let input_root = workspace.path().join("inputs");
-    let capture_cap = input.source.capture_cap;
-    let started = Instant::now();
+    Ok(())
+}
 
-    if let Err(error) = stage_inputs(workspace.path(), &input.source.inputs) {
-        return fail_cleanup(workspace, error);
+#[cfg(feature = "process-async")]
+impl AsyncAcquire for OutputProcess {
+    type Error = RunError;
+    type Output = ProcessAcquiredOutput;
+
+    async fn acquire(self) -> Result<Self::Output, Self::Error> {
+        self.acquire_async().await
+    }
+}
+
+#[cfg(feature = "process-async")]
+impl OutputProcess {
+    async fn acquire_async(self) -> Result<ProcessAcquiredOutput, RunError> {
+        let cancel = CancelToken::new();
+        self.acquire_async_cancellable_inner(&cancel).await
     }
 
-    let stdout_path = workspace.path().join("stdout.log");
-    let stderr_path = workspace.path().join("stderr.log");
-
-    let mut command = tokio::process::Command::new(&input.source.program);
-    command
-        .current_dir(workspace.path())
-        .env_clear()
-        .envs(
-            input
-                .source
-                .environment
-                .entries
-                .iter()
-                .map(|(key, value)| (key, value)),
-        )
-        .env(OUTPUT_ENV, &selected_output)
-        .stdin(Stdio::null());
-    if !input.source.inputs.is_empty() {
-        command.env(INPUT_ENV, &input_root);
+    /// Awaitable token-cancellable entry, mirroring [`OutputProcess::acquire_cancellable`] for
+    /// the async path: the wait loop polls the same token, so the caller can cancel while keeping
+    /// the future alive to await the outcome. Dropping the future still stops the tree.
+    pub async fn acquire_async_cancellable(
+        self,
+        cancel: &CancelToken,
+    ) -> Result<ProcessAcquiredOutput, RunError> {
+        self.acquire_async_cancellable_inner(cancel).await
     }
-    if capture_cap > 0 {
-        match (File::create(&stdout_path), File::create(&stderr_path)) {
-            (Ok(stdout), Ok(stderr)) => {
-                command.stdout(stdout).stderr(stderr);
+
+    async fn acquire_async_cancellable_inner(
+        self,
+        cancel: &CancelToken,
+    ) -> Result<ProcessAcquiredOutput, RunError> {
+        let input = self;
+        if cancel.is_cancelled() {
+            return Err(RunError::Cancelled {
+                program: input.program.clone(),
+                diagnostics: Box::new(Diagnostics::disabled()),
+            });
+        }
+        let workspace = tempfile::Builder::new()
+            .prefix(".pulith-process-")
+            .tempdir()
+            .map_err(|source| RunError::Workspace { source })?;
+        let output_base = workspace.path().join("output");
+        if let Err(source) = std::fs::create_dir(&output_base) {
+            return fail_cleanup(workspace, RunError::Workspace { source });
+        }
+        let selected_output = output_base.join(input.output.as_path());
+        let input_root = workspace.path().join("inputs");
+        let capture_cap = input.capture_cap;
+        let started = Instant::now();
+
+        if let Err(error) = stage_inputs(workspace.path(), &input.inputs) {
+            return fail_cleanup(workspace, error);
+        }
+
+        let stdout_path = workspace.path().join("stdout.log");
+        let stderr_path = workspace.path().join("stderr.log");
+
+        let mut command = tokio::process::Command::new(&input.program);
+        command
+            .current_dir(workspace.path())
+            .env_clear()
+            .envs(
+                input
+                    .environment
+                    .entries
+                    .iter()
+                    .map(|(key, value)| (key, value)),
+            )
+            .env(OUTPUT_ENV, &selected_output)
+            .stdin(Stdio::null());
+        if !input.inputs.is_empty() {
+            command.env(INPUT_ENV, &input_root);
+        }
+        if capture_cap > 0 {
+            match (File::create(&stdout_path), File::create(&stderr_path)) {
+                (Ok(stdout), Ok(stderr)) => {
+                    command.stdout(stdout).stderr(stderr);
+                }
+                (stdout, stderr) => {
+                    let source = match (stdout, stderr) {
+                        (Err(source), _) | (_, Err(source)) => source,
+                        _ => unreachable!(),
+                    };
+                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+                    return fail_cleanup(
+                        workspace,
+                        RunError::Spawn {
+                            program: input.program.clone(),
+                            source,
+                            diagnostics: Box::new(diagnostics),
+                        },
+                    );
+                }
             }
-            (stdout, stderr) => {
-                let source = match (stdout, stderr) {
-                    (Err(source), _) | (_, Err(source)) => source,
-                    _ => unreachable!(),
-                };
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::Spawn {
-                        program: input.source.program.clone(),
-                        source,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
+        } else {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
         }
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    for argument in &input.source.arguments {
-        command.arg(resolve_argument(
-            argument,
-            workspace.path(),
-            &selected_output,
-        ));
-    }
-    #[cfg(unix)]
-    command.process_group(0);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_SUSPENDED);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(source) => {
-            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-            return fail_cleanup(
-                workspace,
-                ProcessError::Spawn {
-                    program: input.source.program.clone(),
-                    source,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
+        for argument in &input.arguments {
+            command.arg(resolve_argument(
+                argument,
+                workspace.path(),
+                &selected_output,
+            ));
         }
-    };
-
-    #[cfg(windows)]
-    let job = match assign_to_job(
-        child
-            .id()
-            .expect("a freshly spawned child always has a process id"),
-    ) {
-        Ok(job) => job,
-        Err(source) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-            return fail_cleanup(
-                workspace,
-                ProcessError::CapabilityUnavailable {
-                    program: input.source.program.clone(),
-                    source,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
-    };
-
-    let mut guard = AsyncTreeGuard::new(
-        child,
+        #[cfg(unix)]
+        command.process_group(0);
         #[cfg(windows)]
-        job,
-    );
+        command.creation_flags(CREATE_SUSPENDED);
 
-    let status = loop {
-        match guard.child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= input.source.timeout => {
-                guard.stop();
-                let _ = guard.child.wait().await;
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::TimedOut {
-                        program: input.source.program.clone(),
-                        timeout: input.source.timeout,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-            Ok(None) if cancel.is_some_and(CancellationToken::is_cancelled) => {
-                guard.stop();
-                let _ = guard.child.wait().await;
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                return fail_cleanup(
-                    workspace,
-                    ProcessError::Cancelled {
-                        program: input.source.program.clone(),
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+        let child = match command.spawn() {
+            Ok(child) => child,
             Err(source) => {
                 let diagnostics = read_diagnostics(workspace.path(), capture_cap);
                 return fail_cleanup(
                     workspace,
-                    ProcessError::Wait {
-                        program: input.source.program.clone(),
+                    RunError::Spawn {
+                        program: input.program.clone(),
                         source,
                         diagnostics: Box::new(diagnostics),
                     },
                 );
             }
-        }
-    };
-    if !status.success() {
-        guard.disarm();
-        let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-        return fail_cleanup(
-            workspace,
-            ProcessError::ExitedNonZero {
-                program: input.source.program.clone(),
-                status,
-                diagnostics: Box::new(diagnostics),
-            },
+        };
+
+        #[cfg(windows)]
+        let mut child = child;
+
+        #[cfg(windows)]
+        let job = match assign_to_job(
+            child
+                .id()
+                .expect("a freshly spawned child always has a process id"),
+        ) {
+            Ok(job) => job,
+            Err(source) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+                return fail_cleanup(
+                    workspace,
+                    RunError::CapabilityUnavailable {
+                        program: input.program.clone(),
+                        source,
+                        diagnostics: Box::new(diagnostics),
+                    },
+                );
+            }
+        };
+
+        let mut guard = AsyncTreeGuard::new(
+            child,
+            #[cfg(windows)]
+            job,
         );
-    }
-    guard.disarm();
-    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-    let observation = match LocalInspect.inspect((&selected_output).into()) {
-        Ok(inspected) => inspected.observation,
-        Err(source) => {
+
+        let status = loop {
+            match guard.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() >= input.timeout => {
+                    guard.stop();
+                    let _ = guard.child.wait().await;
+                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+                    return fail_cleanup(
+                        workspace,
+                        RunError::TimedOut {
+                            program: input.program.clone(),
+                            timeout: input.timeout,
+                            diagnostics: Box::new(diagnostics),
+                        },
+                    );
+                }
+                Ok(None) if cancel.is_cancelled() => {
+                    guard.stop();
+                    let _ = guard.child.wait().await;
+                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+                    return fail_cleanup(
+                        workspace,
+                        RunError::Cancelled {
+                            program: input.program.clone(),
+                            diagnostics: Box::new(diagnostics),
+                        },
+                    );
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(source) => {
+                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+                    return fail_cleanup(
+                        workspace,
+                        RunError::Wait {
+                            program: input.program.clone(),
+                            source,
+                            diagnostics: Box::new(diagnostics),
+                        },
+                    );
+                }
+            }
+        };
+        if !status.success() {
+            guard.disarm();
+            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
             return fail_cleanup(
                 workspace,
-                ProcessError::OutputInspect {
-                    path: selected_output,
-                    source,
+                RunError::ExitedNonZero {
+                    program: input.program.clone(),
+                    status,
                     diagnostics: Box::new(diagnostics),
                 },
             );
         }
-    };
-    if observation == LocalObservation::Missing {
-        return fail_cleanup(
-            workspace,
-            ProcessError::OutputMissing {
-                path: selected_output,
-                diagnostics: Box::new(diagnostics),
-            },
-        );
+        guard.disarm();
+        let diagnostics = read_diagnostics(workspace.path(), capture_cap);
+        let observation = match Inspect::inspect(
+            LocalTarget::new(selected_output.clone())
+                .expect("a selected output path is always a nonempty contained workspace path"),
+            (),
+        ) {
+            Ok((observation, _)) => observation,
+            Err(source) => {
+                return fail_cleanup(
+                    workspace,
+                    RunError::OutputInspect {
+                        path: selected_output,
+                        source,
+                        diagnostics: Box::new(diagnostics),
+                    },
+                );
+            }
+        };
+        if observation == LocalObservation::Missing {
+            return fail_cleanup(
+                workspace,
+                RunError::OutputMissing {
+                    path: selected_output,
+                    diagnostics: Box::new(diagnostics),
+                },
+            );
+        }
+        if observation != LocalObservation::Directory {
+            return fail_cleanup(
+                workspace,
+                RunError::OutputWrongKind {
+                    path: selected_output,
+                    observed: observation,
+                    diagnostics: Box::new(diagnostics),
+                },
+            );
+        }
+        let evidence = OutputEvidence {
+            output: input.output.clone(),
+            elapsed: started.elapsed(),
+        };
+        drop(guard);
+        Ok(OutputResult {
+            tree: StagedTree::new(workspace, selected_output),
+            evidence,
+            diagnostics,
+        })
     }
-    if observation != LocalObservation::Directory {
-        return fail_cleanup(
-            workspace,
-            ProcessError::OutputWrongKind {
-                path: selected_output,
-                observed: observation,
-                diagnostics: Box::new(diagnostics),
-            },
-        );
-    }
-    let evidence = ProcessEvidence {
-        output: input.source.output.clone(),
-        elapsed: started.elapsed(),
-        _policy: std::marker::PhantomData,
-    };
-    drop(guard);
-    Ok(Acquired {
-        input,
-        material: StagedTree::new(workspace, selected_output),
-        evidence: EvidenceChain {
-            previous: evidence,
-            current: diagnostics,
-        },
-    })
 }
 
 /// Stops the admitted tree when the async acquire future is dropped or aborted.
@@ -1183,12 +1831,12 @@ impl Drop for AsyncTreeGuard {
     }
 }
 
-fn resolve_argument(argument: &ActionArgument, workspace: &Path, output: &Path) -> OsString {
+fn resolve_argument(argument: &Arg, workspace: &Path, output: &Path) -> OsString {
     match argument {
-        ActionArgument::Literal(argument) => argument.clone(),
-        ActionArgument::WorkspaceRoot => workspace.as_os_str().to_os_string(),
-        ActionArgument::OutputRoot => output.as_os_str().to_os_string(),
-        ActionArgument::OutputPath(relative) => output.join(relative.as_path()).into_os_string(),
+        Arg::Literal(argument) => argument.clone(),
+        Arg::WorkspaceRoot => workspace.as_os_str().to_os_string(),
+        Arg::OutputRoot => output.as_os_str().to_os_string(),
+        Arg::OutputPath(relative) => output.join(relative.as_path()).into_os_string(),
     }
 }
 
@@ -1299,13 +1947,13 @@ fn assign_to_job(pid: u32) -> io::Result<JobHandle> {
 }
 
 /// Reads the workspace diagnostic files under the per-stream cap.
-fn read_diagnostics(workspace: &Path, cap: usize) -> ProcessDiagnostics {
+fn read_diagnostics(workspace: &Path, cap: usize) -> Diagnostics {
     if cap == 0 {
-        return ProcessDiagnostics::disabled();
+        return Diagnostics::disabled();
     }
     let (stdout, stdout_truncated) = read_capped(&workspace.join("stdout.log"), cap);
     let (stderr, stderr_truncated) = read_capped(&workspace.join("stderr.log"), cap);
-    ProcessDiagnostics {
+    Diagnostics {
         stdout,
         stderr,
         stdout_truncated,
@@ -1331,10 +1979,10 @@ fn read_capped(path: &Path, cap: usize) -> (Option<Vec<u8>>, bool) {
     (Some(buffer), truncated)
 }
 
-fn fail_cleanup<T>(workspace: tempfile::TempDir, primary: ProcessError) -> Result<T, ProcessError> {
+fn fail_cleanup<T>(workspace: tempfile::TempDir, primary: RunError) -> Result<T, RunError> {
     match workspace.close() {
         Ok(()) => Err(primary),
-        Err(error) => Err(ProcessError::WorkspaceCleanup {
+        Err(error) => Err(RunError::WorkspaceCleanup {
             primary: Box::new(primary),
             cleanup: error,
         }),
@@ -1351,29 +1999,29 @@ mod tests {
     }
 
     #[test]
-    fn workspace_relative_path_rejects_parent_traversal() {
-        assert!(WorkspaceRelativePath::new("../outside").is_err());
-        assert!(WorkspaceRelativePath::new("tree").is_ok());
+    fn output_path_rejects_parent_traversal() {
+        assert!(OutputPath::new("../outside").is_err());
+        assert!(OutputPath::new("tree").is_ok());
     }
 
     #[test]
-    fn explicit_environment_reserves_pulith_keys_and_rejects_duplicates() {
+    fn env_vars_reserve_pulith_keys_and_reject_duplicates() {
         assert!(
-            ExplicitEnvironment::new([(
+            EnvVars::new([(
                 OsString::from("PULITH_OUTPUT_ROOT"),
                 OsString::from("outside"),
             )])
             .is_err()
         );
         assert!(
-            ExplicitEnvironment::new([(
+            EnvVars::new([(
                 OsString::from("PULITH_INPUT_ROOT"),
                 OsString::from("outside"),
             )])
             .is_err()
         );
         assert!(
-            ExplicitEnvironment::new([
+            EnvVars::new([
                 (OsString::from("PULITH_TEST"), OsString::from("one")),
                 (OsString::from("PULITH_TEST"), OsString::from("two")),
             ])
@@ -1383,9 +2031,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn explicit_environment_reserves_keys_case_insensitively() {
+    fn env_vars_reserve_keys_case_insensitively() {
         assert!(
-            ExplicitEnvironment::new([(
+            EnvVars::new([(
                 OsString::from("pulith_output_root"),
                 OsString::from("outside"),
             )])
@@ -1394,11 +2042,27 @@ mod tests {
     }
 
     #[test]
-    fn cooperative_action_rejects_relative_program_and_zero_timeout() {
-        let output = WorkspaceRelativePath::new("tree").unwrap();
+    fn output_process_rejects_relative_program_and_zero_timeout() {
+        let output = OutputPath::new("tree").unwrap();
         assert!(
-            ProcessAction::new("relative-program", output.clone(), Duration::from_secs(1)).is_err()
+            OutputProcess::new("relative-program", output.clone(), Duration::from_secs(1)).is_err()
         );
-        assert!(ProcessAction::new(absolute_program(), output, Duration::ZERO).is_err());
+        assert!(OutputProcess::new(absolute_program(), output, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn staged_input_preserves_a_non_unicode_platform_name() {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let input = StagedInput::new(absolute_program(), name.clone()).unwrap();
+        assert_eq!(input.name, name);
     }
 }

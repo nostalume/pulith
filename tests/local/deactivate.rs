@@ -1,30 +1,64 @@
 #![cfg(feature = "local")]
+//! The unlink law removes exactly one active directory-symlink view, is idempotent when missing,
+//! and refuses any other entry without removing it.
+//! The published tree is never touched.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
-use crate::common::{directory_symlink, publish_tree};
+use pulith::archive::ArchivePolicy;
 use pulith::local::{
-    LocalActivate, LocalDeactivate, LocalDeactivateError, LocalDeactivatePrior, LocalObservation,
+    LinkChange, LocalObservation, LocalSource, LocalTarget, UnlinkChange, UnlinkError,
 };
+use pulith::{Acquire, Link, Unlink};
+
+/// Publish one versioned tree at `root/artifacts/demo-tool/<version>` via the trait-only local
+/// chain (acquire -> prepare -> apply) and return the target path.
+fn publish_tree(root: &Path, version: &'static str, contents: &'static [u8]) -> PathBuf {
+    let source = root.join(format!("source-{version}"));
+    let target = root.join(format!("artifacts/demo-tool/{version}"));
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(source.join("tool.txt"), contents).unwrap();
+
+    let material = LocalSource::new(source).unwrap().acquire().unwrap();
+    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let stage = admitted.stage().unwrap();
+    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    tree.publish(admitted).unwrap();
+    target
+}
+
+/// Link the published tree's root at `view` (occupied views auto-switch) and return the outcome.
+fn activate_root(target: &Path, view: &Path) -> LinkChange {
+    LocalTarget::new(target)
+        .unwrap()
+        .link_root(view)
+        .unwrap()
+        .change
+}
+
+#[cfg(unix)]
+fn file_symlink(original: &Path, link: &Path) {
+    std::os::unix::fs::symlink(original, link).unwrap();
+}
+
+#[cfg(windows)]
+fn file_symlink(original: &Path, link: &Path) {
+    std::os::windows::fs::symlink_file(original, link).unwrap();
+}
 
 #[test]
-fn deactivate_removes_only_the_active_view_and_preserves_the_tree() {
+fn unlink_removes_only_the_active_view_and_preserves_the_tree() {
     let root = tempfile::tempdir().unwrap();
-    let (target, applied) = publish_tree(root.path(), "1.0.0", b"artifact payload");
+    let target = publish_tree(root.path(), "1.0.0", b"artifact payload");
     let view = root.path().join("views/demo-tool");
-    fs::create_dir_all(view.parent().unwrap()).unwrap();
-    let _activated = LocalActivate
-        .activate(applied.clone(), view.clone())
-        .unwrap();
+    assert_eq!(activate_root(&target, &view), LinkChange::Created);
 
-    let deactivated = LocalDeactivate.activate(applied, view.clone()).unwrap();
+    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
 
-    assert_eq!(deactivated.input, view);
-    assert_eq!(deactivated.evidence.current.view, view);
-    assert_eq!(
-        deactivated.evidence.current.prior,
-        LocalDeactivatePrior::DirectorySymlink
-    );
+    assert_eq!(evidence.view, view);
+    assert_eq!(evidence.change, UnlinkChange::Removed);
     // The view link is gone (Windows: the symlink_dir/junction is removed; the tree stays).
     assert!(fs::symlink_metadata(&view).is_err());
     assert_eq!(
@@ -35,64 +69,58 @@ fn deactivate_removes_only_the_active_view_and_preserves_the_tree() {
 }
 
 #[test]
-fn deactivate_on_missing_view_is_idempotent_with_missing_prior() {
+fn unlink_on_missing_view_is_idempotent_with_missing_prior() {
     let root = tempfile::tempdir().unwrap();
-    let (_target, applied) = publish_tree(root.path(), "1.0.0", b"artifact payload");
     let view = root.path().join("views/never-activated");
 
-    let deactivated = LocalDeactivate.activate(applied, view.clone()).unwrap();
+    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
 
-    assert_eq!(deactivated.input, view);
-    assert_eq!(
-        deactivated.evidence.current.prior,
-        LocalDeactivatePrior::Missing
-    );
+    assert_eq!(evidence.view, view);
+    assert_eq!(evidence.change, UnlinkChange::Unchanged);
     assert!(fs::symlink_metadata(&view).is_err());
 }
 
 #[test]
-fn deactivate_rejects_a_regular_file_view_without_removal() {
+fn unlink_rejects_a_regular_file_view_without_removal() {
     let root = tempfile::tempdir().unwrap();
-    let (_target, applied) = publish_tree(root.path(), "1.0.0", b"artifact payload");
     let view = root.path().join("views/plain-file");
     fs::create_dir_all(view.parent().unwrap()).unwrap();
     fs::write(&view, b"not a view").unwrap();
 
-    let error = LocalDeactivate
-        .activate(applied, view.clone())
+    let error = LocalTarget::new(&view)
+        .unwrap()
+        .unlink()
         .expect_err("a regular file is not an active view");
 
     match error {
-        LocalDeactivateError::NotActiveView {
+        UnlinkError::NotActiveView {
             view: seen,
             observed,
-            ..
         } => {
             assert_eq!(seen, view);
             assert_eq!(observed, LocalObservation::File { bytes: 10 });
         }
-        other => panic!("expected NotActiveView, got {other:?}"),
+        other => panic!("expected UnlinkNotActiveView, got {other:?}"),
     }
     assert_eq!(fs::read(&view).unwrap(), b"not a view");
 }
 
 #[test]
-fn deactivate_rejects_directory_and_file_symlink_views_without_removal() {
+fn unlink_rejects_directory_and_file_symlink_views_without_removal() {
     let root = tempfile::tempdir().unwrap();
-    let (_target, applied) = publish_tree(root.path(), "1.0.0", b"artifact payload");
 
     // A real directory at the view path is refused and left intact.
     let directory_view = root.path().join("views/plain-directory");
     fs::create_dir_all(&directory_view).unwrap();
-    let error = LocalDeactivate
-        .activate(applied.clone(), directory_view.clone())
+    let error = LocalTarget::new(&directory_view)
+        .unwrap()
+        .unlink()
         .expect_err("a directory is not an active view");
     assert!(matches!(
         error,
-        LocalDeactivateError::NotActiveView {
+        UnlinkError::NotActiveView {
             view: _,
             observed: LocalObservation::Directory,
-            ..
         }
     ));
     assert!(directory_view.is_dir());
@@ -101,17 +129,21 @@ fn deactivate_rejects_directory_and_file_symlink_views_without_removal() {
     let file = root.path().join("some-file.txt");
     fs::write(&file, b"target file").unwrap();
     let file_symlink_view = root.path().join("views/file-symlink");
-    directory_symlink(&file, &file_symlink_view);
-    let error = LocalDeactivate
-        .activate(applied, file_symlink_view.clone())
+    fs::create_dir_all(file_symlink_view.parent().unwrap()).unwrap();
+    file_symlink(&file, &file_symlink_view);
+    let error = LocalTarget::new(&file_symlink_view)
+        .unwrap()
+        .unlink()
         .expect_err("a file symlink is not an active directory view");
     match error {
-        LocalDeactivateError::NotActiveView {
+        UnlinkError::NotActiveView {
             view: seen,
-            observed: LocalObservation::SymlinkToFile,
-            ..
-        } => assert_eq!(seen, file_symlink_view),
-        other => panic!("expected NotActiveView with the link-target kind, got {other:?}"),
+            observed,
+        } => {
+            assert_eq!(seen, file_symlink_view);
+            assert_eq!(observed, LocalObservation::SymlinkToFile);
+        }
+        other => panic!("expected UnlinkNotActiveView with the link-target kind, got {other:?}"),
     }
     assert!(
         fs::symlink_metadata(&file_symlink_view)
@@ -122,30 +154,20 @@ fn deactivate_rejects_directory_and_file_symlink_views_without_removal() {
 }
 
 #[test]
-fn deactivate_holds_the_view_state_cycle() {
+fn unlink_holds_the_view_state_cycle() {
     let root = tempfile::tempdir().unwrap();
-    let (first_target, first_applied) = publish_tree(root.path(), "1.0.0", b"first artifact");
-    let (_second_target, second_applied) = publish_tree(root.path(), "2.0.0", b"second artifact");
+    let first_target = publish_tree(root.path(), "1.0.0", b"first artifact");
+    let second_target = publish_tree(root.path(), "2.0.0", b"second artifact");
     let view = root.path().join("views/demo-tool");
-    fs::create_dir_all(view.parent().unwrap()).unwrap();
 
-    // activate -> deactivate -> activate -> switch -> deactivate
-    let _activated = LocalActivate
-        .activate(first_applied.clone(), view.clone())
-        .unwrap();
-    let deactivated = LocalDeactivate
-        .activate(first_applied.clone(), view.clone())
-        .unwrap();
-    assert_eq!(
-        deactivated.evidence.current.prior,
-        LocalDeactivatePrior::DirectorySymlink
-    );
+    // link_root -> unlink -> link_root -> link_root (auto-switch) -> unlink
+    assert_eq!(activate_root(&first_target, &view), LinkChange::Created);
+    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    assert_eq!(evidence.change, UnlinkChange::Removed);
     assert!(fs::symlink_metadata(&view).is_err());
 
-    let _activated = LocalActivate.activate(first_applied, view.clone()).unwrap();
-    let _switched = pulith::local::LocalSwitch
-        .activate(second_applied.clone(), view.clone())
-        .unwrap();
+    assert_eq!(activate_root(&first_target, &view), LinkChange::Created);
+    assert_eq!(activate_root(&second_target, &view), LinkChange::Replaced);
     assert!(
         fs::symlink_metadata(&view)
             .unwrap()
@@ -153,13 +175,9 @@ fn deactivate_holds_the_view_state_cycle() {
             .is_symlink()
     );
 
-    let deactivated = LocalDeactivate
-        .activate(second_applied, view.clone())
-        .unwrap();
-    assert_eq!(
-        deactivated.evidence.current.prior,
-        LocalDeactivatePrior::DirectorySymlink
-    );
+    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    assert_eq!(evidence.change, UnlinkChange::Removed);
+    assert_eq!(evidence.view, view);
     assert!(fs::symlink_metadata(&view).is_err());
     assert_eq!(
         fs::read(first_target.join("tool.txt")).unwrap(),

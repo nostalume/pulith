@@ -14,13 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(feature = "process")]
-use pulith::process::{
-    ActionArgument, Cooperative, ExplicitEnvironment, ProcessAcquire, ProcessAction,
-    WorkspaceRelativePath,
-};
+use pulith::process::{Arg, EnvVars, OutputPath, OutputProcess};
 
-use pulith::local::{LocalAcquire, LocalApply};
-use pulith::{Acquire, Materialize, MaterializeMode};
+use pulith::Acquire;
+use pulith::archive::ArchivePolicy;
+use pulith::local::{LocalSource, LocalTarget};
 
 /// Runs one real process fixture: a hand-rolled local server or child process script.
 #[derive(Clone, Copy)]
@@ -44,52 +42,25 @@ pub fn temp_dir() -> tempfile::TempDir {
 // Local publish/receipt helpers (previously duplicated in activation.rs and switch.rs)
 // ---------------------------------------------------------------------------
 
-pub type PublishedTree = pulith::Applied<
-    Materialize<&'static str, PathBuf, PathBuf>,
-    pulith::EvidenceChain<pulith::local::LocalAcquireEvidence, pulith::local::ApplyEvidence>,
->;
-
 /// Publishes one artifact tree at `root/artifacts/demo-tool/<version>` and returns target + receipt.
 pub fn publish_tree(
     root: &Path,
     version: &'static str,
     contents: &'static [u8],
-) -> (PathBuf, PublishedTree) {
+) -> (PathBuf, pulith::local::ApplyEvidence) {
     let source = root.join(format!("source-{version}"));
     let target = root.join(format!("artifacts/demo-tool/{version}"));
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(source.join("tool.txt"), contents).unwrap();
 
-    let applied = LocalApply
-        .apply(
-            LocalAcquire
-                .acquire(Materialize::new(
-                    "demo-tool",
-                    source.clone(),
-                    target.clone(),
-                    MaterializeMode::CreateNew,
-                ))
-                .unwrap(),
-        )
-        .unwrap();
+    let material = LocalSource::new(source).unwrap().acquire().unwrap();
+    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let stage = admitted.stage().unwrap();
+    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let evidence = tree.publish(admitted).unwrap();
 
-    (target, applied)
-}
-
-/// A synthetic apply receipt for a target, for activation tests that need only the target shape.
-pub fn receipt_for(
-    target: &Path,
-) -> pulith::Applied<Materialize<&'static str, PathBuf, PathBuf>, ()> {
-    pulith::Applied {
-        input: Materialize::new(
-            "demo-tool",
-            PathBuf::from("unused"),
-            target.to_path_buf(),
-            MaterializeMode::CreateNew,
-        ),
-        evidence: (),
-    }
+    (target, evidence)
 }
 
 #[cfg(unix)]
@@ -141,11 +112,10 @@ pub fn absolute_program() -> PathBuf {
 
 /// Builds the `MARKER` (+ `LOOP_SCRIPT` on windows) environment for a descendant-loop fixture.
 #[cfg(feature = "process")]
-pub fn marker_environment(marker: &Path) -> ExplicitEnvironment {
+pub fn marker_environment(marker: &Path) -> EnvVars {
     #[cfg(unix)]
     {
-        ExplicitEnvironment::new([(OsString::from("MARKER"), marker.as_os_str().to_os_string())])
-            .unwrap()
+        EnvVars::new([(OsString::from("MARKER"), marker.as_os_str().to_os_string())]).unwrap()
     }
     #[cfg(windows)]
     {
@@ -155,7 +125,7 @@ pub fn marker_environment(marker: &Path) -> ExplicitEnvironment {
             "while($true){[IO.File]::AppendAllText($env:MARKER,'x'); Start-Sleep -Milliseconds 50}",
         )
         .unwrap();
-        ExplicitEnvironment::new([
+        EnvVars::new([
             (
                 OsString::from("SystemRoot"),
                 std::env::var_os("SystemRoot").unwrap(),
@@ -171,11 +141,7 @@ pub fn marker_environment(marker: &Path) -> ExplicitEnvironment {
 }
 
 #[cfg(feature = "process")]
-pub fn fixture_action(
-    fixture: Fixture,
-    output: &str,
-    timeout: Duration,
-) -> ProcessAction<pulith::process::Cooperative> {
+pub fn fixture_process(fixture: Fixture, output: &str, timeout: Duration) -> OutputProcess {
     #[cfg(unix)]
     let script = match fixture {
         Fixture::Success => {
@@ -207,7 +173,7 @@ pub fn fixture_action(
         }
         Fixture::Sleeps => "Start-Sleep -Seconds 1",
         Fixture::SpawnsDescendant => {
-            "Write-Output 'spawned'; [Console]::Out.Flush(); Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-File',$env:LOOP_SCRIPT -NoNewWindow -PassThru | ForEach-Object { $_.WaitForExit() }"
+            "Write-Output 'spawned'; [Console]::Out.Flush(); Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$env:LOOP_SCRIPT -NoNewWindow -PassThru | ForEach-Object { $_.WaitForExit() }"
         }
         Fixture::CopiesInputEnv => {
             "$out = $env:PULITH_OUTPUT_ROOT; New-Item -ItemType Directory -Force -Path $out | Out-Null; Copy-Item -Path (Join-Path $env:PULITH_INPUT_ROOT 'input.txt') -Destination (Join-Path $out 'file.txt')"
@@ -218,66 +184,58 @@ pub fn fixture_action(
     };
 
     #[cfg(unix)]
-    let arguments: Vec<ActionArgument> = match fixture {
+    let arguments: Vec<Arg> = match fixture {
         Fixture::CopiesInputArg => [
-            ActionArgument::Literal(OsString::from("-c")),
-            ActionArgument::Literal(OsString::from(script)),
-            ActionArgument::Literal(OsString::from("-")),
-            ActionArgument::WorkspaceRoot,
+            Arg::Literal(OsString::from("-c")),
+            Arg::Literal(OsString::from(script)),
+            Arg::Literal(OsString::from("-")),
+            Arg::WorkspaceRoot,
         ]
         .into_iter()
-        .collect::<Vec<ActionArgument>>(),
+        .collect::<Vec<Arg>>(),
         _ => [
-            ActionArgument::Literal(OsString::from("-c")),
-            ActionArgument::Literal(OsString::from(script)),
+            Arg::Literal(OsString::from("-c")),
+            Arg::Literal(OsString::from(script)),
         ]
         .into_iter()
-        .collect::<Vec<ActionArgument>>(),
+        .collect::<Vec<Arg>>(),
     };
     #[cfg(windows)]
-    let arguments: Vec<ActionArgument> = {
+    let arguments: Vec<Arg> = {
         let base = [
-            ActionArgument::Literal(OsString::from("-NoProfile")),
-            ActionArgument::Literal(OsString::from("-NonInteractive")),
-            ActionArgument::Literal(OsString::from("-Command")),
+            Arg::Literal(OsString::from("-NoProfile")),
+            Arg::Literal(OsString::from("-NonInteractive")),
+            Arg::Literal(OsString::from("-Command")),
         ];
         if matches!(fixture, Fixture::CopiesInputArg) {
             [
                 base.as_slice(),
                 &[
-                    ActionArgument::Literal(OsString::from(format!(
-                        "& {{ param($src) {script} }}"
-                    ))),
-                    ActionArgument::WorkspaceRoot,
+                    Arg::Literal(OsString::from(format!("& {{ param($src) {script} }}"))),
+                    Arg::WorkspaceRoot,
                 ][..],
             ]
             .concat()
         } else {
-            [
-                base.as_slice(),
-                &[ActionArgument::Literal(OsString::from(script))][..],
-            ]
-            .concat()
+            [base.as_slice(), &[Arg::Literal(OsString::from(script))][..]].concat()
         }
     };
 
-    let mut action = ProcessAction::new(
+    let action = OutputProcess::new(
         absolute_program(),
-        WorkspaceRelativePath::new(output).unwrap(),
+        OutputPath::new(output).unwrap(),
         timeout,
     )
     .unwrap()
     .with_arguments(arguments);
     #[cfg(windows)]
-    {
-        action = action.with_environment(
-            ExplicitEnvironment::new([(
-                OsString::from("SystemRoot"),
-                std::env::var_os("SystemRoot").unwrap(),
-            )])
-            .unwrap(),
-        );
-    }
+    let action = action.with_environment(
+        EnvVars::new([(
+            OsString::from("SystemRoot"),
+            std::env::var_os("SystemRoot").unwrap(),
+        )])
+        .unwrap(),
+    );
     action
 }
 
@@ -286,16 +244,11 @@ pub fn fixture_action(
 pub fn assert_failure_keeps_target_missing(
     fixture: Fixture,
     timeout: Duration,
-    is_expected: impl FnOnce(&pulith::process::ProcessError) -> bool,
+    is_expected: impl FnOnce(&pulith::process::RunError) -> bool,
 ) {
     let root = temp_dir();
     let target = root.path().join("published");
-    let result = ProcessAcquire::<Cooperative>::new().acquire(Materialize::new(
-        "process-fixture",
-        fixture_action(fixture, "tree", timeout),
-        target.clone(),
-        MaterializeMode::CreateNew,
-    ));
+    let result = fixture_process(fixture, "tree", timeout).acquire();
 
     assert!(
         matches!(&result, Err(error) if is_expected(error)),
@@ -311,7 +264,7 @@ pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(feature = "process")]
-pub fn captured_contains(diagnostics: &pulith::process::ProcessDiagnostics, needle: &[u8]) -> bool {
+pub fn captured_contains(diagnostics: &pulith::process::Diagnostics, needle: &[u8]) -> bool {
     diagnostics
         .stdout
         .as_deref()

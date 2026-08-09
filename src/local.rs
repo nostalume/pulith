@@ -13,43 +13,164 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{
-    Acquire, Acquired, Applied, EvidenceChain, Forget, Inspect, Inspected, Materialize, Reconcile,
-    Reconciled,
-};
+use crate::{Acquire, Inspect, Reconcile};
 
 mod apply;
-#[cfg(all(feature = "hash", any(feature = "zip", feature = "tar")))]
+#[cfg(any(feature = "zip", feature = "tar"))]
 mod materialize;
 mod view;
 
+pub use apply::{ApplyEvidence, LocalPlacement};
 #[cfg(any(feature = "zip", feature = "tar"))]
-pub(crate) use apply::apply_material;
-pub use apply::{ApplyEvidence, LocalApply, LocalPlacement};
-#[cfg(all(feature = "hash", any(feature = "zip", feature = "tar")))]
-pub use materialize::{LocalMaterialize, MaterializeError, MaterializeEvidence};
-pub use view::{
-    LinkError, LinkOutcome, LocalActivate, LocalActivateError, LocalActivationEvidence,
-    LocalActivationStrategy, LocalDeactivate, LocalDeactivateError, LocalDeactivateEvidence,
-    LocalDeactivatePrior, LocalSwitch, LocalSwitchBackend, LocalSwitchError, LocalSwitchEvidence,
-    OccupiedViewPolicy,
-};
+pub use materialize::{MaterializeError, PreparationEvidence};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkChange {
+    Created,
+    Replaced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkEvidence {
+    pub source: PathBuf,
+    pub view: PathBuf,
+    pub change: LinkChange,
+}
+
+#[derive(Debug)]
+pub enum LinkError {
+    BeforeLink {
+        view: PathBuf,
+        cause: LocalError,
+    },
+    InvalidExpose {
+        expose: PathBuf,
+    },
+    ExposeNotDirectory {
+        path: PathBuf,
+        observed: LocalObservation,
+    },
+    ViewConflict {
+        view: PathBuf,
+        observed: LocalObservation,
+    },
+    CapabilityUnavailable {
+        view: PathBuf,
+        cause: LocalError,
+    },
+}
+
+impl fmt::Display for LinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeLink { cause, .. } => write!(formatter, "link failed: {cause}"),
+            Self::InvalidExpose { expose } => write!(
+                formatter,
+                "expose path {} must be a relative, non-escaping subpath",
+                expose.display()
+            ),
+            Self::ExposeNotDirectory { path, .. } => write!(
+                formatter,
+                "expose path {} is not a directory",
+                path.display()
+            ),
+            Self::ViewConflict { view, observed } => write!(
+                formatter,
+                "view {} holds {observed:?}, which is not a directory-symlink view; nothing replaced",
+                view.display()
+            ),
+            Self::CapabilityUnavailable { cause, .. } => write!(
+                formatter,
+                "directory symlink activation is unavailable: {cause}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeLink { cause, .. } | Self::CapabilityUnavailable { cause, .. } => {
+                Some(cause)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum UnlinkError {
+    Observe {
+        view: PathBuf,
+        cause: LocalError,
+    },
+    NotActiveView {
+        view: PathBuf,
+        observed: LocalObservation,
+    },
+    Remove {
+        view: PathBuf,
+        cause: LocalError,
+    },
+}
+
+impl fmt::Display for UnlinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observe { view, .. } => {
+                write!(formatter, "failed to observe view {}", view.display())
+            }
+            Self::NotActiveView { view, observed } => write!(
+                formatter,
+                "view {} holds {observed:?}, which is not an active view",
+                view.display()
+            ),
+            Self::Remove { view, .. } => {
+                write!(formatter, "failed to remove active view {}", view.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnlinkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observe { cause, .. } | Self::Remove { cause, .. } => Some(cause),
+            Self::NotActiveView { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnlinkChange {
+    Removed,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnlinkEvidence {
+    pub view: PathBuf,
+    pub change: UnlinkChange,
+}
 
 /// Errors produced by local acquisition, observation, activation, and publication behaviors.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum LocalError {
     MissingSource(PathBuf),
-    /// A `CreateNew` publication found an existing predecessor and did not commit the target.
-    ApplyWouldOverwrite(PathBuf),
-    ApplyMissingTarget(PathBuf),
-    ApplySameFile(PathBuf),
-    ApplyPathConflict {
-        source: PathBuf,
-        target: PathBuf,
-    },
+    /// Immutable publication found an existing predecessor and did not commit the target.
+    AlreadyPublished(PathBuf),
     UnsupportedLocalEntry(PathBuf),
+    InvalidStagePath(PathBuf),
+    PublishUnavailable {
+        path: PathBuf,
+        source: io::Error,
+    },
     InvalidPreparation(String),
+    /// The source law: the empty path is not a valid source reference.
+    InvalidSource(PathBuf),
+    /// The target law: the empty path is not a valid target reference.
+    InvalidTarget(PathBuf),
     Io {
         action: &'static str,
         path: PathBuf,
@@ -71,30 +192,8 @@ impl fmt::Display for LocalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSource(path) => write!(f, "source does not exist: {}", path.display()),
-            Self::ApplyWouldOverwrite(path) => {
-                write!(
-                    f,
-                    "apply would overwrite existing target: {}",
-                    path.display()
-                )
-            }
-            Self::ApplyMissingTarget(path) => {
-                write!(f, "target does not exist: {}", path.display())
-            }
-            Self::ApplySameFile(path) => {
-                write!(
-                    f,
-                    "source and target refer to the same file: {}",
-                    path.display()
-                )
-            }
-            Self::ApplyPathConflict { source, target } => {
-                write!(
-                    f,
-                    "source and target paths conflict: {} -> {}",
-                    source.display(),
-                    target.display()
-                )
+            Self::AlreadyPublished(path) => {
+                write!(f, "target is already published: {}", path.display())
             }
             Self::UnsupportedLocalEntry(path) => {
                 write!(
@@ -103,7 +202,27 @@ impl fmt::Display for LocalError {
                     path.display()
                 )
             }
+            Self::InvalidStagePath(path) => {
+                write!(
+                    f,
+                    "stage destination must be a contained relative path: {}",
+                    path.display()
+                )
+            }
+            Self::PublishUnavailable { path, source } => {
+                write!(
+                    f,
+                    "atomic no-replace publication is unavailable for {}: {source}",
+                    path.display()
+                )
+            }
             Self::InvalidPreparation(message) => write!(f, "invalid preparation: {message}"),
+            Self::InvalidSource(path) => {
+                write!(f, "invalid source (empty path): {}", path.display())
+            }
+            Self::InvalidTarget(path) => {
+                write!(f, "invalid target (empty path): {}", path.display())
+            }
             Self::Io {
                 action,
                 path,
@@ -118,7 +237,7 @@ impl fmt::Display for LocalError {
 impl std::error::Error for LocalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::PublishUnavailable { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -267,41 +386,63 @@ pub struct LocalAcquireEvidence {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalAcquire;
+/// A local acquisition source: a non-empty filesystem reference (restricted law newtype —
+/// carries the acquire behavior; the pure-data law is enforced here, I/O laws stay in acquire).
+pub struct LocalSource(PathBuf);
 
-impl LocalAcquire {
-    /// Inherent mirror of [`Acquire::acquire`] — callable without importing the trait.
-    pub fn acquire<N>(
-        &self,
-        node: N,
-    ) -> Result<<Self as Acquire<N>>::Output, <Self as Acquire<N>>::Error>
-    where
-        Self: Acquire<N>,
-    {
-        Acquire::acquire(self, node)
+impl LocalSource {
+    /// Admit one non-empty local path. Relative/absolute and `..` are allowed (an input
+    /// reference — the caller's own filesystem); only the empty path is refused.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, LocalError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(LocalError::InvalidSource(path));
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
     }
 }
 
-impl<I, T> Acquire<Materialize<I, PathBuf, T>> for LocalAcquire {
+impl Acquire for LocalSource {
     type Error = LocalError;
-    type Output = Acquired<Materialize<I, PathBuf, T>, LocalMaterial, LocalAcquireEvidence>;
+    type Output = LocalMaterial;
 
-    fn acquire(&self, node: Materialize<I, PathBuf, T>) -> Result<Self::Output, Self::Error> {
-        let path = node.source.clone();
+    fn acquire(self) -> Result<Self::Output, Self::Error> {
+        let path = self.0;
         if !path.exists() {
             return Err(LocalError::MissingSource(path));
         }
-        let material = if path.is_dir() {
-            LocalMaterial::Directory { path: path.clone() }
+        Ok(if path.is_dir() {
+            LocalMaterial::Directory { path }
         } else {
-            LocalMaterial::File { path: path.clone() }
-        };
-        Ok(Acquired {
-            input: node,
-            material,
-            evidence: LocalAcquireEvidence { path },
+            LocalMaterial::File { path }
         })
+    }
+}
+
+/// A local target path for observation, activation, or removal (restricted law newtype —
+/// non-empty; I/O laws stay in each behavior).
+pub struct LocalTarget(PathBuf);
+
+impl LocalTarget {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, LocalError> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(LocalError::InvalidTarget(path));
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Creates eager private custody beside this target without publishing it.
+    pub fn stage(&self) -> Result<StagedTree, LocalError> {
+        apply::stage(self.as_path())
     }
 }
 
@@ -309,15 +450,6 @@ impl<I, T> Acquire<Materialize<I, PathBuf, T>> for LocalAcquire {
 ///
 /// `File` and `Directory` paths survive drop. `StagedFile` owns its temporary path and removes it
 /// when the material or any canonical state carrying it is dropped.
-/// The local family's acquired node: an acquire receipt over a local material.
-///
-/// The shape repeated by every local acquire behavior and its consumers (materialize, apply,
-/// activation). Named once so callers and the lib never write the full typestate.
-pub type LocalAcquired<I, S, E> = Acquired<Materialize<I, S, PathBuf>, LocalMaterial, E>;
-
-/// The local family's applied node: an applied receipt over a local materialization.
-pub type LocalApplied<I, S, E> = Applied<Materialize<I, S, PathBuf>, E>;
-
 #[derive(Debug)]
 pub enum LocalMaterial {
     /// A caller-owned regular-file path. Dropping the value does not remove the file.
@@ -347,7 +479,8 @@ impl PartialEq for LocalMaterial {
 impl Eq for LocalMaterial {}
 
 impl LocalMaterial {
-    pub(crate) fn path(&self) -> &Path {
+    /// Returns the material path without changing its caller-owned or staged custody.
+    pub fn path(&self) -> &Path {
         match self {
             Self::File { path } | Self::Directory { path } => path,
             Self::StagedFile { path } => path.as_ref(),
@@ -363,12 +496,36 @@ impl LocalMaterial {
 pub struct StagedTree {
     workspace: tempfile::TempDir,
     root: PathBuf,
+    placement: StagePlacement,
+}
+
+#[derive(Debug)]
+enum StagePlacement {
+    #[cfg(feature = "process")]
+    Scratch,
+    Destination(PathBuf),
 }
 
 impl StagedTree {
     #[cfg(feature = "process")]
     pub(crate) fn new(workspace: tempfile::TempDir, root: PathBuf) -> Self {
-        Self { workspace, root }
+        Self {
+            workspace,
+            root,
+            placement: StagePlacement::Scratch,
+        }
+    }
+
+    pub(crate) fn destination(
+        workspace: tempfile::TempDir,
+        root: PathBuf,
+        parent: PathBuf,
+    ) -> Self {
+        Self {
+            workspace,
+            root,
+            placement: StagePlacement::Destination(parent),
+        }
     }
 
     /// Returns the selected tree root by shared reference.
@@ -388,10 +545,9 @@ pub enum LocalEntryKind {
     Other,
 }
 
-/// No-follow local artifact facts with an optional regular-file attestation payload.
+/// No-follow local artifact facts with an optional regular-file attestation.
 ///
-/// Local owns every entry-kind variant. A separate adapter supplies `T` only after it has read a
-/// regular file admitted by the local no-follow opening boundary.
+/// The exact-inspection behavior supplies `T` only after it has admitted and read a regular file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalArtifactObservation<T> {
     Missing,
@@ -402,9 +558,8 @@ pub enum LocalArtifactObservation<T> {
     Other,
 }
 
-#[cfg(feature = "hash")]
 impl<T> LocalArtifactObservation<T> {
-    pub(crate) fn kind(&self) -> LocalEntryKind {
+    pub fn kind(&self) -> LocalEntryKind {
         match self {
             Self::Missing => LocalEntryKind::Missing,
             Self::File { .. } => LocalEntryKind::File,
@@ -432,9 +587,11 @@ pub enum LocalObservation {
     Other,
 }
 
-/// Evidence that no-follow metadata produced the local observation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LocalInspectEvidence;
+/// The observation law's receipt: the observed path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalInspectEvidence {
+    pub path: PathBuf,
+}
 
 impl LocalObservation {
     pub fn kind(&self) -> LocalEntryKind {
@@ -448,7 +605,7 @@ impl LocalObservation {
     }
 }
 
-/// Caller-owned expected state used by [`LocalReconcile`].
+/// Caller-owned expected state compared by the [`Reconcile`] trait.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalExpectation {
     Missing,
@@ -493,34 +650,12 @@ pub struct LocalReconcileEvidence {
     pub observed: LocalObservation,
 }
 
-/// Read-only, no-follow inspection of one local target.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalInspect;
-
-impl LocalInspect {
-    /// Inherent mirror of [`Inspect::inspect`] — callable without importing the trait.
-    pub fn inspect<N>(
-        &self,
-        node: N,
-    ) -> Result<<Self as Inspect<N>>::Output, <Self as Inspect<N>>::Error>
-    where
-        Self: Inspect<N>,
-    {
-        Inspect::inspect(self, node)
-    }
-
-    /// Observe one path directly: the observation law's direct output.
-    pub fn observe(&self, path: impl AsRef<Path>) -> Result<LocalObservation, LocalError> {
-        observe_path(path.as_ref())
-    }
-}
-
 /// The observation law: classify one path (the single home of the classification).
 ///
 /// A symlink is classified by its resolved target (`SymlinkToDirectory`/`SymlinkToFile`); a
 /// missing path is `Missing`. `Inspect` builds its receipt node from this, so the observation
 /// is never produced by discarding a node's field.
-fn observe_path(path: &Path) -> Result<LocalObservation, LocalError> {
+pub(crate) fn observe_path(path: &Path) -> Result<LocalObservation, LocalError> {
     Ok(match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
@@ -541,17 +676,14 @@ fn observe_path(path: &Path) -> Result<LocalObservation, LocalError> {
     })
 }
 
-impl Inspect<PathBuf> for LocalInspect {
+impl Inspect<()> for LocalTarget {
     type Error = LocalError;
-    type Output = Inspected<PathBuf, LocalObservation, LocalInspectEvidence>;
+    type Output = (LocalObservation, LocalInspectEvidence);
 
-    fn inspect(&self, node: PathBuf) -> Result<Self::Output, Self::Error> {
-        let observation = observe_path(&node)?;
-        Ok(Inspected {
-            input: node,
-            observation,
-            evidence: LocalInspectEvidence,
-        })
+    fn inspect(self, (): ()) -> Result<Self::Output, Self::Error> {
+        let path = self.0;
+        let observation = observe_path(&path)?;
+        Ok((observation, LocalInspectEvidence { path }))
     }
 }
 
@@ -576,107 +708,14 @@ fn classify_symlink(path: &Path) -> LocalObservation {
     }
 }
 
-/// Read-only local observation performed after a completed local target effect.
-///
-/// This adapter accepts only local [`Applied`] receipts that retain an exact [`PathBuf`]. It
-/// preserves prior apply evidence on success, while its error preserves the completed receipt when
-/// no valid observation can be produced. It does not publish, remove, repair, or decide desired
-/// state; callers may pass the result to [`LocalReconcile`] with their own [`LocalExpectation`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalPostInspect;
-
-/// An unavailable post-apply observation together with the completed local effect receipt.
-///
-/// The effect represented by [`Self::applied`] has already completed. Retaining it prevents a
-/// later read failure from being mistaken for a failed or safely repeatable apply.
-#[derive(Debug)]
-pub struct LocalPostInspectError<N, E> {
-    pub applied: Applied<N, E>,
-    pub cause: LocalError,
-}
-
-impl<N, E> fmt::Display for LocalPostInspectError<N, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "post-apply local inspection failed: {}", self.cause)
-    }
-}
-
-impl<N: fmt::Debug, E: fmt::Debug> std::error::Error for LocalPostInspectError<N, E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.cause)
-    }
-}
-
-type LocalPostInspected<E> =
-    Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
-
-fn post_inspect<N, E>(
-    applied: Applied<N, E>,
-    target: PathBuf,
-) -> Result<LocalPostInspected<E>, LocalPostInspectError<N, E>> {
-    match LocalInspect.inspect(target) {
-        Ok(Inspected {
-            input,
-            observation,
-            evidence,
-        }) => Ok(Inspected {
-            input,
-            observation,
-            evidence: EvidenceChain {
-                previous: applied.evidence,
-                current: evidence,
-            },
-        }),
-        Err(cause) => Err(LocalPostInspectError { applied, cause }),
-    }
-}
-
-impl<I, S, E> Inspect<Applied<Materialize<I, S, PathBuf>, E>> for LocalPostInspect {
-    type Error = LocalPostInspectError<Materialize<I, S, PathBuf>, E>;
-    type Output = Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
-
-    fn inspect(
-        &self,
-        applied: Applied<Materialize<I, S, PathBuf>, E>,
-    ) -> Result<Self::Output, Self::Error> {
-        let target = applied.input.target.clone();
-        post_inspect(applied, target)
-    }
-}
-
-impl<I, E> Inspect<Applied<Forget<I, PathBuf>, E>> for LocalPostInspect {
-    type Error = LocalPostInspectError<Forget<I, PathBuf>, E>;
-    type Output = Inspected<PathBuf, LocalObservation, EvidenceChain<E, LocalInspectEvidence>>;
-
-    fn inspect(
-        &self,
-        applied: Applied<Forget<I, PathBuf>, E>,
-    ) -> Result<Self::Output, Self::Error> {
-        let target = applied.input.target.clone();
-        post_inspect(applied, target)
-    }
-}
-
-/// Pure local expected/observed comparison; it never mutates the target.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalReconcile;
-
-impl<E> Reconcile<Inspected<PathBuf, LocalObservation, E>, LocalExpectation> for LocalReconcile {
+/// Pure local expected/observed comparison; it never mutates the target. The observation is
+/// the impl caller: `LocalObservation::reconcile(expected)`.
+impl Reconcile<LocalExpectation> for LocalObservation {
     type Error = std::convert::Infallible;
-    type Output =
-        Reconciled<PathBuf, LocalReconciliation, EvidenceChain<E, LocalReconcileEvidence>>;
+    type Output = (LocalReconciliation, LocalReconcileEvidence);
 
-    fn reconcile(
-        &self,
-        node: Inspected<PathBuf, LocalObservation, E>,
-        expected: LocalExpectation,
-    ) -> Result<Self::Output, Self::Error> {
-        let Inspected {
-            input,
-            observation,
-            evidence: inspect_evidence,
-        } = node;
-        let reconciliation = match (&expected, &observation) {
+    fn reconcile(self, expected: LocalExpectation) -> Result<Self::Output, Self::Error> {
+        let reconciliation = match (&expected, &self) {
             (LocalExpectation::Missing, LocalObservation::Missing) => LocalReconciliation::Matches,
             (LocalExpectation::Missing, _) => LocalReconciliation::Unexpected,
             (_, LocalObservation::Missing) => LocalReconciliation::Missing,
@@ -688,25 +727,19 @@ impl<E> Reconcile<Inspected<PathBuf, LocalObservation, E>, LocalExpectation> for
                     observed_bytes: *bytes,
                 }
             }
-            _ if expected.kind() == observation.kind() => LocalReconciliation::Matches,
+            _ if expected.kind() == self.kind() => LocalReconciliation::Matches,
             _ => LocalReconciliation::WrongKind {
                 expected: expected.kind(),
-                observed: observation.kind(),
+                observed: self.kind(),
             },
         };
-        let evidence = EvidenceChain {
-            previous: inspect_evidence,
-            current: LocalReconcileEvidence {
-                expected,
-                observed: observation,
-            },
-        };
-
-        Ok(Reconciled {
-            input,
+        Ok((
             reconciliation,
-            evidence,
-        })
+            LocalReconcileEvidence {
+                expected,
+                observed: self,
+            },
+        ))
     }
 }
 
@@ -720,7 +753,7 @@ mod tests {
     use std::os::windows::fs::symlink_file;
 
     use super::*;
-    use crate::Reconcile;
+    use crate::{Inspect, Reconcile};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -773,15 +806,24 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let missing = LocalInspect.inspect((&missing).into()).unwrap();
-        let file = LocalInspect.inspect((&file).into()).unwrap();
-        let directory = LocalInspect.inspect((&directory).into()).unwrap();
+        let (missing_observation, _) = LocalTarget::new(missing.as_path())
+            .unwrap()
+            .inspect(())
+            .unwrap();
+        let (file_observation, file_evidence) = LocalTarget::new(file.as_path())
+            .unwrap()
+            .inspect(())
+            .unwrap();
+        let (directory_observation, _) = LocalTarget::new(directory.as_path())
+            .unwrap()
+            .inspect(())
+            .unwrap();
 
-        assert_eq!(missing.observation, LocalObservation::Missing);
-        assert_eq!(file.observation, LocalObservation::File { bytes: 6 });
-        assert_eq!(directory.observation, LocalObservation::Directory);
-        assert_eq!(file.evidence, LocalInspectEvidence);
-        assert_eq!(fs::read_to_string(&file.input).unwrap(), "pulith");
+        assert_eq!(missing_observation, LocalObservation::Missing);
+        assert_eq!(file_observation, LocalObservation::File { bytes: 6 });
+        assert_eq!(directory_observation, LocalObservation::Directory);
+        assert_eq!(file_evidence, LocalInspectEvidence { path: file.clone() });
+        assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -793,9 +835,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         symlink_file(root.join("missing-source"), &target).unwrap();
 
-        let inspected = LocalInspect.inspect(target.clone()).unwrap();
+        let (observation, _) = LocalTarget::new(target.clone())
+            .unwrap()
+            .inspect(())
+            .unwrap();
 
-        assert_eq!(inspected.observation, LocalObservation::SymlinkToFile);
+        assert_eq!(observation, LocalObservation::SymlinkToFile);
         assert!(
             fs::symlink_metadata(&target)
                 .unwrap()
@@ -816,36 +861,40 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let matched = reconcile(&file, LocalExpectation::FileSize(6));
-        let missing = reconcile(&missing, LocalExpectation::File);
-        let unexpected = reconcile(&file, LocalExpectation::Missing);
-        let wrong_kind = reconcile(&directory, LocalExpectation::File);
-        let modified = reconcile(&file, LocalExpectation::FileSize(7));
+        let (matched, matched_reconcile_evidence, matched_inspect_evidence) =
+            reconcile(&file, LocalExpectation::FileSize(6));
+        let (missing, _, _) = reconcile(&missing, LocalExpectation::File);
+        let (unexpected, _, _) = reconcile(&file, LocalExpectation::Missing);
+        let (wrong_kind, _, _) = reconcile(&directory, LocalExpectation::File);
+        let (modified, _, _) = reconcile(&file, LocalExpectation::FileSize(7));
 
-        assert_eq!(matched.reconciliation, LocalReconciliation::Matches);
-        assert_eq!(missing.reconciliation, LocalReconciliation::Missing);
-        assert_eq!(unexpected.reconciliation, LocalReconciliation::Unexpected);
+        assert_eq!(matched, LocalReconciliation::Matches);
+        assert_eq!(missing, LocalReconciliation::Missing);
+        assert_eq!(unexpected, LocalReconciliation::Unexpected);
         assert_eq!(
-            wrong_kind.reconciliation,
+            wrong_kind,
             LocalReconciliation::WrongKind {
                 expected: LocalEntryKind::File,
                 observed: LocalEntryKind::Directory,
             }
         );
         assert_eq!(
-            modified.reconciliation,
+            modified,
             LocalReconciliation::Modified {
                 expected_bytes: 7,
                 observed_bytes: 6,
             }
         );
-        assert_eq!(matched.evidence.previous, LocalInspectEvidence);
         assert_eq!(
-            matched.evidence.current.expected,
+            matched_inspect_evidence,
+            LocalInspectEvidence { path: file.clone() }
+        );
+        assert_eq!(
+            matched_reconcile_evidence.expected,
             LocalExpectation::FileSize(6)
         );
         assert_eq!(
-            matched.evidence.current.observed,
+            matched_reconcile_evidence.observed,
             LocalObservation::File { bytes: 6 }
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
@@ -856,13 +905,13 @@ mod tests {
     fn reconcile(
         path: &std::path::Path,
         expected: LocalExpectation,
-    ) -> crate::Reconciled<
-        PathBuf,
+    ) -> (
         LocalReconciliation,
-        crate::EvidenceChain<LocalInspectEvidence, LocalReconcileEvidence>,
-    > {
-        LocalReconcile
-            .reconcile(LocalInspect.inspect((path).into()).unwrap(), expected)
-            .unwrap()
+        LocalReconcileEvidence,
+        LocalInspectEvidence,
+    ) {
+        let (observation, inspect_evidence) = LocalTarget::new(path).unwrap().inspect(()).unwrap();
+        let (reconciliation, reconcile_evidence) = observation.reconcile(expected).unwrap();
+        (reconciliation, reconcile_evidence, inspect_evidence)
     }
 }
