@@ -2,9 +2,8 @@
 //!
 //! Owns the exact single-target effect law: a native no-replace rename commit boundary and direct
 //! idempotent target removal. It never republishes, follows
-//! links, claims ownership, or retries. Evidence (`ApplyEvidence`, `LocalPlacement`,
-//! `LocalApplyStats`) is adapter-attested effect data, not an authorization. Feature-gated on
-//! `local`.
+//! links, claims ownership, or retries. Evidence is adapter-attested effect data, not an
+//! authorization. Feature-gated on `local`.
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,42 +15,12 @@ pub struct ApplyEvidence {
     pub files: usize,
     pub directories: usize,
     pub bytes: u64,
-    pub strategy: LocalPlacement,
-}
-
-impl ApplyEvidence {
-    pub(crate) fn new(stats: LocalApplyStats) -> Self {
-        Self {
-            files: stats.files,
-            directories: stats.directories,
-            bytes: stats.bytes,
-            strategy: stats.strategy,
-        }
-    }
-
-    pub(crate) fn removed() -> Self {
-        Self {
-            files: 0,
-            directories: 0,
-            bytes: 0,
-            strategy: LocalPlacement::Removed,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalPlacement {
-    Copied,
-    Moved,
+pub enum RemoveEvidence {
     Removed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LocalApplyStats {
-    pub files: usize,
-    pub directories: usize,
-    pub bytes: u64,
-    pub strategy: LocalPlacement,
+    Unchanged,
 }
 
 pub(crate) fn stage(target: &Path) -> Result<StagedTree, LocalError> {
@@ -145,12 +114,11 @@ impl StagedTree {
             let stats = inspect_regular_tree(&root)?;
             rename_no_replace(&root, &target_path)?;
             drop(workspace);
-            return Ok(ApplyEvidence::new(LocalApplyStats {
+            return Ok(ApplyEvidence {
                 files: stats.files,
                 directories: stats.directories,
                 bytes: stats.bytes,
-                strategy: LocalPlacement::Moved,
-            }));
+            });
         }
 
         let destination = stage(&target_path)?;
@@ -321,27 +289,21 @@ fn rename_no_replace(source: &Path, target: &Path) -> Result<(), LocalError> {
 /// Remove one exact local target directly (no source, no verification, no ownership claim).
 impl crate::Remove for crate::local::LocalTarget {
     type Error = LocalError;
-    type Output = ApplyEvidence;
+    type Output = RemoveEvidence;
 
     fn remove(self) -> Result<Self::Output, Self::Error> {
         let target = self.as_path();
         match remove_existing(target) {
-            Ok(()) => {}
-            Err(LocalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Ok(()) => Ok(RemoveEvidence::Removed),
+            Err(LocalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(RemoveEvidence::Unchanged)
+            }
+            Err(error) => Err(error),
         }
-        Ok(ApplyEvidence::removed())
     }
 }
 
-fn copy_directory_to_stage(source: &Path, stage: &Path) -> Result<LocalApplyStats, LocalError> {
-    let mut stats = LocalApplyStats {
-        files: 0,
-        directories: 0,
-        bytes: 0,
-        strategy: LocalPlacement::Copied,
-    };
-
+fn copy_directory_to_stage(source: &Path, stage: &Path) -> Result<(), LocalError> {
     for entry in walkdir::WalkDir::new(source).follow_links(false) {
         let entry = entry.map_err(|error| walk_error("walk source directory", source, error))?;
         let relative = entry.path().strip_prefix(source).map_err(|err| {
@@ -352,7 +314,6 @@ fn copy_directory_to_stage(source: &Path, stage: &Path) -> Result<LocalApplyStat
             )
         })?;
         if relative.as_os_str().is_empty() {
-            stats.directories += 1;
             continue;
         }
 
@@ -361,23 +322,20 @@ fn copy_directory_to_stage(source: &Path, stage: &Path) -> Result<LocalApplyStat
             RegularEntry::Directory => {
                 fs::create_dir_all(&destination)
                     .map_err(|err| LocalError::io("create staged directory", &destination, err))?;
-                stats.directories += 1;
             }
             RegularEntry::File => {
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|err| LocalError::io("create staged file parent", parent, err))?;
                 }
-                let copied = fs::copy(entry.path(), &destination).map_err(|err| {
+                fs::copy(entry.path(), &destination).map_err(|err| {
                     LocalError::io("copy file to staged directory", &destination, err)
                 })?;
-                stats.files += 1;
-                stats.bytes += copied;
             }
         }
     }
 
-    Ok(stats)
+    Ok(())
 }
 
 fn remove_existing(path: &Path) -> Result<(), LocalError> {

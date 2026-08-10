@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pulith::Verify;
 use pulith::archive::ArchivePolicy;
 use pulith::local::{
-    LocalExpectation, LocalObservation, LocalPlacement, LocalReconciliation, LocalSource,
-    LocalTarget,
+    LocalExpectation, LocalObservation, LocalReconciliation, LocalSource, LocalTarget,
+    RemoveEvidence,
 };
 
 #[test]
@@ -57,7 +57,9 @@ fn materialize_local_file_without_synthetic_transitions() {
     let evidence = tree.publish(target).unwrap();
 
     assert_eq!(fs::read_to_string(&target_path).unwrap(), "pulith");
-    assert_eq!(evidence.strategy, LocalPlacement::Moved);
+    assert_eq!(evidence.files, 1);
+    assert_eq!(evidence.directories, 0);
+    assert_eq!(evidence.bytes, 6);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -265,16 +267,18 @@ fn verify_then_apply_exact_local_artifact() {
 }
 
 #[test]
-fn forget_local_target_directly() {
+fn remove_local_target_reports_changed_and_unchanged() {
     let root = temp_root("forget");
     let target = root.join("target.txt");
     fs::create_dir_all(&root).unwrap();
     fs::write(&target, "obsolete").unwrap();
 
-    let evidence = LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    let removed = LocalTarget::new(target.clone()).unwrap().remove().unwrap();
 
     assert!(!target.exists());
-    assert_eq!(evidence.strategy, LocalPlacement::Removed);
+    assert_eq!(removed, RemoveEvidence::Removed);
+    let unchanged = LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    assert_eq!(unchanged, RemoveEvidence::Unchanged);
 
     fs::remove_dir_all(root).unwrap();
 }

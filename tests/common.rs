@@ -8,6 +8,7 @@
 
 #[cfg(feature = "process")]
 use std::ffi::OsString;
+#[cfg(any(feature = "zip", feature = "tar"))]
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "process")]
@@ -16,8 +17,11 @@ use std::time::Duration;
 #[cfg(feature = "process")]
 use pulith::process::{Arg, EnvVars, OutputPath, OutputProcess};
 
+#[cfg(any(feature = "process", feature = "zip", feature = "tar"))]
 use pulith::Acquire;
+#[cfg(any(feature = "zip", feature = "tar"))]
 use pulith::archive::ArchivePolicy;
+#[cfg(any(feature = "zip", feature = "tar"))]
 use pulith::local::{LocalSource, LocalTarget};
 
 /// Runs one real process fixture: a hand-rolled local server or child process script.
@@ -43,6 +47,7 @@ pub fn temp_dir() -> tempfile::TempDir {
 // ---------------------------------------------------------------------------
 
 /// Publishes one artifact tree at `root/artifacts/demo-tool/<version>` and returns target + receipt.
+#[cfg(any(feature = "zip", feature = "tar"))]
 pub fn publish_tree(
     root: &Path,
     version: &'static str,
@@ -248,7 +253,9 @@ pub fn assert_failure_keeps_target_missing(
 ) {
     let root = temp_dir();
     let target = root.path().join("published");
-    let result = fixture_process(fixture, "tree", timeout).acquire();
+    let result = fixture_process(fixture, "tree", timeout)
+        .prepare()
+        .and_then(Acquire::acquire);
 
     assert!(
         matches!(&result, Err(error) if is_expected(error)),
@@ -281,13 +288,13 @@ pub fn captured_contains(diagnostics: &pulith::process::Diagnostics, needle: &[u
 // reqwest does not match a `127.*` no_proxy glob).
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 pub struct HttpFixture {
     pub url: String,
     handle: std::thread::JoinHandle<()>,
 }
 
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 impl HttpFixture {
     pub fn get(body: &'static [u8]) -> Self {
         use std::io::{Read, Write};

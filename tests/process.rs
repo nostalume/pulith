@@ -18,7 +18,7 @@ type ProcessOutput = OutputResult;
 
 fn acquire(root: &std::path::Path, action: OutputProcess) -> Result<ProcessOutput, RunError> {
     let _ = root;
-    action.acquire()
+    action.prepare()?.acquire()
 }
 
 #[test]
@@ -474,7 +474,7 @@ fn timeout_stops_descendant_and_carries_captured_diagnostics() {
     let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(10))
         .with_environment(marker_environment(&marker));
 
-    let result = action.acquire();
+    let result = action.prepare().and_then(Acquire::acquire);
 
     match result {
         Err(RunError::TimedOut { diagnostics, .. }) => {
@@ -533,7 +533,9 @@ fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
         }
     });
 
-    let result = action.acquire_cancellable(&token);
+    let result = action
+        .prepare()
+        .and_then(|prepared| prepared.acquire_cancellable(&token));
 
     canceler.join().unwrap();
 
@@ -574,7 +576,8 @@ fn pre_cancelled_token_fails_fast_without_spawning() {
 
     let result = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_capture_cap(4096)
-        .acquire_cancellable(&token);
+        .prepare()
+        .and_then(|prepared| prepared.acquire_cancellable(&token));
 
     match result {
         Err(RunError::Cancelled { diagnostics, .. }) => {
@@ -638,7 +641,7 @@ fn missing_declared_input_fails_pre_spawn_and_keeps_target_missing() {
     let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_inputs([StagedInput::new(&missing, "nope.txt").unwrap()]);
 
-    let result = action.acquire();
+    let result = action.prepare().and_then(Acquire::acquire);
 
     match result {
         Err(RunError::InputMissing { path }) => assert_eq!(path, missing),
@@ -655,7 +658,7 @@ fn non_regular_declared_input_fails_pre_spawn() {
     let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_inputs([StagedInput::new(&directory, "input").unwrap()]);
     assert!(matches!(
-        action.acquire(),
+        action.prepare().and_then(Acquire::acquire),
         Err(RunError::InputWrongKind { path }) if path == directory
     ));
 
@@ -666,7 +669,7 @@ fn non_regular_declared_input_fails_pre_spawn() {
         let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
             .with_inputs([StagedInput::new(&link, "input").unwrap()]);
         assert!(matches!(
-            action.acquire(),
+            action.prepare().and_then(Acquire::acquire),
             Err(RunError::InputWrongKind { path }) if path == link
         ));
     }
@@ -686,7 +689,7 @@ fn colliding_staged_names_fail_pre_spawn() {
         StagedInput::new(&second, "same").unwrap(),
     ]);
 
-    let result = action.acquire();
+    let result = action.prepare().and_then(Acquire::acquire);
 
     match result {
         Err(RunError::InputCollision { name }) => assert_eq!(name, "same"),

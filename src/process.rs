@@ -11,9 +11,10 @@
 //! group (Unix) or breaks away from the job (Windows) is outside the claim. No sandbox, namespace,
 //! cgroup, resource-limit, or network-isolation guarantee is made.
 //!
-//! Standard output and error are captured to files inside the workspace and read back with a
-//! caller-configurable byte cap. The cap bounds the retained memory only: during the run the child
-//! may write unbounded bytes to those files, bounded only by workspace lifetime and disk.
+//! Standard output and error are captured with a caller-configurable byte cap. The synchronous
+//! adapter drains workspace files after exit; the Tokio adapter concurrently drains pipes while
+//! retaining only the cap, so a noisy child cannot fill a pipe or grow retained memory without
+//! bound.
 //! Captured diagnostics are payload, not safe-facts attestation; they are never rendered in
 //! [`fmt::Display`] error text and never copied into [`OutputEvidence`].
 //!
@@ -23,7 +24,7 @@
 //! program's visible input world is exactly the declared copies, the explicit environment, and the
 //! workspace, but ambient host reads are not guaranteed blocked.
 //!
-//! With the `process-async` feature, [`OutputProcess`] also implements [`AsyncAcquire`]: the same
+//! With the `process-tokio` feature, [`PreparedProcess`] also implements [`AsyncAcquire`]: the same
 //! realization law with a tokio-awaited wait loop. Dropping or aborting the acquire future stops
 //! the admitted tree (the same tree-stop path as sync, plus a direct-child kill signal), so an
 //! abandoned build does not leak a running process tree. The async entry reuses the shared
@@ -50,7 +51,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-#[cfg(feature = "process-async")]
+#[cfg(feature = "process-tokio")]
 use crate::AsyncAcquire;
 use crate::local::{LocalObservation, LocalTarget, StagedTree};
 use crate::{Acquire, Inspect};
@@ -599,6 +600,17 @@ pub struct OutputProcess {
     capture_cap: usize,
 }
 
+/// Exclusive private workspace, staged inputs, and admitted command awaiting one process run.
+pub struct PreparedProcess {
+    command: Command,
+    workspace: tempfile::TempDir,
+    selected_output: PathBuf,
+    output: OutputPath,
+    program: PathBuf,
+    timeout: Duration,
+    capture_cap: usize,
+}
+
 impl OutputProcess {
     /// Creates a cooperative process with explicit executable path and declared output directory.
     pub fn new(
@@ -651,12 +663,60 @@ impl OutputProcess {
 
     /// Bounds each captured stream to `cap` bytes at read time.
     ///
-    /// The cap bounds the retained memory only; during the run the child may write unbounded bytes
-    /// to the workspace diagnostic files. `cap = 0` disables capture entirely (streams use
-    /// [`Stdio::null`] and no files are created). Defaults to 1 MiB per stream.
+    /// The cap bounds retained memory; both adapters continue draining bytes beyond it to avoid
+    /// blocking the child. `cap = 0` disables capture entirely. Defaults to 1 MiB per stream.
     pub fn with_capture_cap(mut self, cap: usize) -> Self {
         self.capture_cap = cap;
         self
+    }
+
+    /// Creates exclusive workspace custody and snapshots every declared input before process spawn.
+    pub fn prepare(self) -> Result<PreparedProcess, RunError> {
+        let workspace = tempfile::Builder::new()
+            .prefix(".pulith-process-")
+            .tempdir()
+            .map_err(|source| RunError::Workspace { source })?;
+        let output_base = workspace.path().join("output");
+        if let Err(source) = std::fs::create_dir(&output_base) {
+            return fail_cleanup(workspace, RunError::Workspace { source });
+        }
+        let selected_output = output_base.join(self.output.as_path());
+        let input_root = workspace.path().join("inputs");
+        if let Err(error) = stage_inputs(workspace.path(), &self.inputs) {
+            return fail_cleanup(workspace, error);
+        }
+
+        let mut command = Command::new(&self.program);
+        command
+            .current_dir(workspace.path())
+            .env_clear()
+            .envs(
+                self.environment
+                    .entries
+                    .iter()
+                    .map(|(key, value)| (key, value)),
+            )
+            .env(OUTPUT_ENV, &selected_output)
+            .stdin(Stdio::null());
+        if !self.inputs.is_empty() {
+            command.env(INPUT_ENV, &input_root);
+        }
+        for argument in &self.arguments {
+            command.arg(resolve_argument(
+                argument,
+                workspace.path(),
+                &selected_output,
+            ));
+        }
+        Ok(PreparedProcess {
+            command,
+            workspace,
+            selected_output,
+            output: self.output,
+            program: self.program,
+            timeout: self.timeout,
+            capture_cap: self.capture_cap,
+        })
     }
 }
 
@@ -709,7 +769,7 @@ impl Diagnostics {
 /// Caller-owned cancellation signal for one process.
 ///
 /// The token is sticky (once cancelled it stays cancelled), `Send + Sync`, and carries no data
-/// beyond the cancelled bit. [`OutputProcess::acquire_cancellable`] polls it once per wait-loop
+/// beyond the cancelled bit. [`PreparedProcess::acquire_cancellable`] polls it once per wait-loop
 /// tick and stops the admitted tree via the frozen tree-stop path; a token already cancelled at
 /// entry fails fast before the program spawns. Cancellation is the caller's explicit stop request
 /// and is never confused with a timeout: it surfaces as [`RunError::Cancelled`].
@@ -732,6 +792,13 @@ impl CancelToken {
     /// Returns whether the token has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "process-tokio")]
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -1365,16 +1432,16 @@ fn start_worktree_command(
     })
 }
 
-impl Acquire for OutputProcess {
+impl Acquire for PreparedProcess {
     type Error = RunError;
     type Output = ProcessAcquiredOutput;
 
     fn acquire(self) -> Result<Self::Output, Self::Error> {
-        start_private(self)?.wait()
+        self.start()?.wait()
     }
 }
 
-impl OutputProcess {
+impl PreparedProcess {
     /// Runs one cooperative process to staged-tree custody, stopping the admitted tree when the
     /// caller's token is set (sticky; polled once per wait-loop tick).
     ///
@@ -1392,66 +1459,28 @@ impl OutputProcess {
                 diagnostics: Box::new(Diagnostics::disabled()),
             });
         }
-        start_private(self)?.wait_cancellable(cancel)
-    }
-}
-
-fn start_private(input: OutputProcess) -> Result<PrivateExecution, RunError> {
-    let workspace = tempfile::Builder::new()
-        .prefix(".pulith-process-")
-        .tempdir()
-        .map_err(|source| RunError::Workspace { source })?;
-    let output_base = workspace.path().join("output");
-    if let Err(source) = std::fs::create_dir(&output_base) {
-        return fail_cleanup(workspace, RunError::Workspace { source });
-    }
-    let selected_output = output_base.join(input.output.as_path());
-    let input_root = workspace.path().join("inputs");
-    let capture_cap = input.capture_cap;
-    if let Err(error) = stage_inputs(workspace.path(), &input.inputs) {
-        return fail_cleanup(workspace, error);
+        self.start()?.wait_cancellable(cancel)
     }
 
-    let mut command = Command::new(&input.program);
-    command
-        .current_dir(workspace.path())
-        .env_clear()
-        .envs(
-            input
-                .environment
-                .entries
-                .iter()
-                .map(|(key, value)| (key, value)),
-        )
-        .env(OUTPUT_ENV, &selected_output)
-        .stdin(Stdio::null());
-    if !input.inputs.is_empty() {
-        command.env(INPUT_ENV, &input_root);
+    fn start(mut self) -> Result<PrivateExecution, RunError> {
+        let session = match ChildSession::spawn(
+            &mut self.command,
+            &self.program,
+            self.timeout,
+            self.workspace.path(),
+            self.capture_cap,
+        ) {
+            Ok(session) => session,
+            Err(error) => return fail_cleanup(self.workspace, error),
+        };
+        Ok(PrivateExecution {
+            session,
+            workspace: self.workspace,
+            selected_output: self.selected_output,
+            output: self.output,
+            program: self.program,
+        })
     }
-    for argument in &input.arguments {
-        command.arg(resolve_argument(
-            argument,
-            workspace.path(),
-            &selected_output,
-        ));
-    }
-    let session = match ChildSession::spawn(
-        &mut command,
-        &input.program,
-        input.timeout,
-        workspace.path(),
-        capture_cap,
-    ) {
-        Ok(session) => session,
-        Err(error) => return fail_cleanup(workspace, error),
-    };
-    Ok(PrivateExecution {
-        session,
-        workspace,
-        selected_output,
-        output: input.output,
-        program: input.program,
-    })
 }
 
 fn stage_inputs(workspace: &Path, inputs: &[StagedInput]) -> Result<(), RunError> {
@@ -1514,8 +1543,8 @@ fn admit_staged_source(path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-#[cfg(feature = "process-async")]
-impl AsyncAcquire for OutputProcess {
+#[cfg(feature = "process-tokio")]
+impl AsyncAcquire for PreparedProcess {
     type Error = RunError;
     type Output = ProcessAcquiredOutput;
 
@@ -1524,14 +1553,51 @@ impl AsyncAcquire for OutputProcess {
     }
 }
 
-#[cfg(feature = "process-async")]
-impl OutputProcess {
+#[cfg(feature = "process-tokio")]
+enum Awaited {
+    Exit(ExitStatus),
+    Wait(io::Error),
+    Timeout,
+    Cancelled,
+}
+
+#[cfg(feature = "process-tokio")]
+impl Awaited {
+    fn finish(
+        self,
+        program: &Path,
+        timeout: Duration,
+        diagnostics: Diagnostics,
+    ) -> Result<(ExitStatus, Diagnostics), RunError> {
+        let error = match self {
+            Self::Exit(status) => return Ok((status, diagnostics)),
+            Self::Wait(source) => RunError::Wait {
+                program: program.to_path_buf(),
+                source,
+                diagnostics: Box::new(diagnostics),
+            },
+            Self::Timeout => RunError::TimedOut {
+                program: program.to_path_buf(),
+                timeout,
+                diagnostics: Box::new(diagnostics),
+            },
+            Self::Cancelled => RunError::Cancelled {
+                program: program.to_path_buf(),
+                diagnostics: Box::new(diagnostics),
+            },
+        };
+        Err(error)
+    }
+}
+
+#[cfg(feature = "process-tokio")]
+impl PreparedProcess {
     async fn acquire_async(self) -> Result<ProcessAcquiredOutput, RunError> {
         let cancel = CancelToken::new();
         self.acquire_async_cancellable_inner(&cancel).await
     }
 
-    /// Awaitable token-cancellable entry, mirroring [`OutputProcess::acquire_cancellable`] for
+    /// Awaitable token-cancellable entry, mirroring [`PreparedProcess::acquire_cancellable`] for
     /// the async path: the wait loop polls the same token, so the caller can cancel while keeping
     /// the future alive to await the outcome. Dropping the future still stops the tree.
     pub async fn acquire_async_cancellable(
@@ -1545,79 +1611,28 @@ impl OutputProcess {
         self,
         cancel: &CancelToken,
     ) -> Result<ProcessAcquiredOutput, RunError> {
-        let input = self;
+        let PreparedProcess {
+            command,
+            workspace,
+            selected_output,
+            output,
+            program,
+            timeout,
+            capture_cap,
+        } = self;
         if cancel.is_cancelled() {
             return Err(RunError::Cancelled {
-                program: input.program.clone(),
+                program,
                 diagnostics: Box::new(Diagnostics::disabled()),
             });
         }
-        let workspace = tempfile::Builder::new()
-            .prefix(".pulith-process-")
-            .tempdir()
-            .map_err(|source| RunError::Workspace { source })?;
-        let output_base = workspace.path().join("output");
-        if let Err(source) = std::fs::create_dir(&output_base) {
-            return fail_cleanup(workspace, RunError::Workspace { source });
-        }
-        let selected_output = output_base.join(input.output.as_path());
-        let input_root = workspace.path().join("inputs");
-        let capture_cap = input.capture_cap;
         let started = Instant::now();
 
-        if let Err(error) = stage_inputs(workspace.path(), &input.inputs) {
-            return fail_cleanup(workspace, error);
-        }
-
-        let stdout_path = workspace.path().join("stdout.log");
-        let stderr_path = workspace.path().join("stderr.log");
-
-        let mut command = tokio::process::Command::new(&input.program);
-        command
-            .current_dir(workspace.path())
-            .env_clear()
-            .envs(
-                input
-                    .environment
-                    .entries
-                    .iter()
-                    .map(|(key, value)| (key, value)),
-            )
-            .env(OUTPUT_ENV, &selected_output)
-            .stdin(Stdio::null());
-        if !input.inputs.is_empty() {
-            command.env(INPUT_ENV, &input_root);
-        }
+        let mut command = tokio::process::Command::from(command);
         if capture_cap > 0 {
-            match (File::create(&stdout_path), File::create(&stderr_path)) {
-                (Ok(stdout), Ok(stderr)) => {
-                    command.stdout(stdout).stderr(stderr);
-                }
-                (stdout, stderr) => {
-                    let source = match (stdout, stderr) {
-                        (Err(source), _) | (_, Err(source)) => source,
-                        _ => unreachable!(),
-                    };
-                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                    return fail_cleanup(
-                        workspace,
-                        RunError::Spawn {
-                            program: input.program.clone(),
-                            source,
-                            diagnostics: Box::new(diagnostics),
-                        },
-                    );
-                }
-            }
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-        for argument in &input.arguments {
-            command.arg(resolve_argument(
-                argument,
-                workspace.path(),
-                &selected_output,
-            ));
         }
         #[cfg(unix)]
         command.process_group(0);
@@ -1627,13 +1642,12 @@ impl OutputProcess {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(source) => {
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
                 return fail_cleanup(
                     workspace,
                     RunError::Spawn {
-                        program: input.program.clone(),
+                        program: program.clone(),
                         source,
-                        diagnostics: Box::new(diagnostics),
+                        diagnostics: Box::new(Diagnostics::disabled()),
                     },
                 );
             }
@@ -1652,13 +1666,12 @@ impl OutputProcess {
             Err(source) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                let diagnostics = read_diagnostics(workspace.path(), capture_cap);
                 return fail_cleanup(
                     workspace,
                     RunError::CapabilityUnavailable {
-                        program: input.program.clone(),
+                        program: program.clone(),
                         source,
-                        diagnostics: Box::new(diagnostics),
+                        diagnostics: Box::new(Diagnostics::disabled()),
                     },
                 );
             }
@@ -1669,109 +1682,97 @@ impl OutputProcess {
             #[cfg(windows)]
             job,
         );
+        let stdout = guard.child.stdout.take();
+        let stderr = guard.child.stderr.take();
 
-        let status = loop {
-            match guard.child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() >= input.timeout => {
-                    guard.stop();
-                    let _ = guard.child.wait().await;
-                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                    return fail_cleanup(
-                        workspace,
-                        RunError::TimedOut {
-                            program: input.program.clone(),
-                            timeout: input.timeout,
-                            diagnostics: Box::new(diagnostics),
-                        },
-                    );
-                }
-                Ok(None) if cancel.is_cancelled() => {
-                    guard.stop();
-                    let _ = guard.child.wait().await;
-                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                    return fail_cleanup(
-                        workspace,
-                        RunError::Cancelled {
-                            program: input.program.clone(),
-                            diagnostics: Box::new(diagnostics),
-                        },
-                    );
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(source) => {
-                    let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-                    return fail_cleanup(
-                        workspace,
-                        RunError::Wait {
-                            program: input.program.clone(),
-                            source,
-                            diagnostics: Box::new(diagnostics),
-                        },
-                    );
-                }
+        let wait = async {
+            let awaited = tokio::select! {
+                status = guard.child.wait() => status.map_or_else(Awaited::Wait, Awaited::Exit),
+                () = tokio::time::sleep(timeout) => Awaited::Timeout,
+                () = cancel.cancelled() => Awaited::Cancelled,
+            };
+            if !matches!(awaited, Awaited::Exit(_)) {
+                guard.stop();
+                let _ = guard.child.wait().await;
             }
+            awaited
         };
-        if !status.success() {
-            guard.disarm();
-            let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-            return fail_cleanup(
-                workspace,
-                RunError::ExitedNonZero {
-                    program: input.program.clone(),
-                    status,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
+        let (awaited, stdout, stderr) = tokio::join!(
+            wait,
+            capture_optional_pipe(stdout, capture_cap),
+            capture_optional_pipe(stderr, capture_cap),
+        );
+        let diagnostics = pipe_diagnostics(stdout, stderr, capture_cap);
+        let (status, diagnostics) = match awaited.finish(&program, timeout, diagnostics) {
+            Ok(completion) => completion,
+            Err(error) => return fail_cleanup(workspace, error),
+        };
         guard.disarm();
-        let diagnostics = read_diagnostics(workspace.path(), capture_cap);
-        let observation = match Inspect::inspect(
-            LocalTarget::new(selected_output.clone())
-                .expect("a selected output path is always a nonempty contained workspace path"),
-            (),
-        ) {
-            Ok((observation, _)) => observation,
-            Err(source) => {
-                return fail_cleanup(
-                    workspace,
-                    RunError::OutputInspect {
-                        path: selected_output,
-                        source,
-                        diagnostics: Box::new(diagnostics),
-                    },
-                );
-            }
-        };
-        if observation == LocalObservation::Missing {
-            return fail_cleanup(
-                workspace,
-                RunError::OutputMissing {
-                    path: selected_output,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
-        if observation != LocalObservation::Directory {
-            return fail_cleanup(
-                workspace,
-                RunError::OutputWrongKind {
-                    path: selected_output,
-                    observed: observation,
-                    diagnostics: Box::new(diagnostics),
-                },
-            );
-        }
-        let evidence = OutputEvidence {
-            output: input.output.clone(),
-            elapsed: started.elapsed(),
-        };
         drop(guard);
-        Ok(OutputResult {
-            tree: StagedTree::new(workspace, selected_output),
-            evidence,
-            diagnostics,
-        })
+        PrivateExecution::finish(
+            workspace,
+            selected_output,
+            output,
+            program,
+            ChildCompletion {
+                status,
+                diagnostics,
+                elapsed: started.elapsed(),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "process-tokio")]
+async fn capture_pipe<R>(mut stream: R, cap: usize) -> (Option<Vec<u8>>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut retained = Vec::with_capacity(cap.min(8192));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => return (None, false),
+        };
+        let available = cap.saturating_sub(retained.len());
+        let keep = read.min(available);
+        retained.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < read;
+    }
+    (Some(retained), truncated)
+}
+
+#[cfg(feature = "process-tokio")]
+async fn capture_optional_pipe<R>(stream: Option<R>, cap: usize) -> (Option<Vec<u8>>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match stream {
+        Some(stream) => capture_pipe(stream, cap).await,
+        None => (None, false),
+    }
+}
+
+#[cfg(feature = "process-tokio")]
+fn pipe_diagnostics(
+    stdout: (Option<Vec<u8>>, bool),
+    stderr: (Option<Vec<u8>>, bool),
+    cap: usize,
+) -> Diagnostics {
+    if cap == 0 {
+        return Diagnostics::disabled();
+    }
+    Diagnostics {
+        stdout: stdout.0,
+        stderr: stderr.0,
+        stdout_truncated: stdout.1,
+        stderr_truncated: stderr.1,
+        cap,
     }
 }
 
@@ -1782,7 +1783,7 @@ impl OutputProcess {
 /// signal) with tokio reaping the direct child; best-effort per the S2.7-D4 boundary, no
 /// zero-survivor claim. Once the child has produced an exit status the guard is disarmed, so
 /// normal completion leaves surviving descendants running exactly like the sync adapter.
-#[cfg(feature = "process-async")]
+#[cfg(feature = "process-tokio")]
 struct AsyncTreeGuard {
     child: tokio::process::Child,
     #[cfg(unix)]
@@ -1792,7 +1793,7 @@ struct AsyncTreeGuard {
     job: JobHandle,
 }
 
-#[cfg(feature = "process-async")]
+#[cfg(feature = "process-tokio")]
 impl AsyncTreeGuard {
     fn new(child: tokio::process::Child, #[cfg(windows)] job: JobHandle) -> Self {
         #[cfg(unix)]
@@ -1822,7 +1823,7 @@ impl AsyncTreeGuard {
     }
 }
 
-#[cfg(feature = "process-async")]
+#[cfg(feature = "process-tokio")]
 impl Drop for AsyncTreeGuard {
     fn drop(&mut self) {
         if self.armed {

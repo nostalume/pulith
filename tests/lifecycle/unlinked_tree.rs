@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use pulith::archive::{ArchiveKind, ArchivePolicy};
 use pulith::local::{
-    LocalError, LocalExpectation, LocalObservation, LocalPlacement, LocalReconciliation,
-    LocalSource, LocalTarget, PreparationEvidence,
+    LocalError, LocalExpectation, LocalObservation, LocalReconciliation, LocalSource, LocalTarget,
+    PreparationEvidence,
 };
 use pulith::{Acquire, Inspect, Reconcile};
 
@@ -44,7 +44,8 @@ fn flow(root: &std::path::Path) -> (PathBuf, pulith::local::ApplyEvidence) {
     assert!(!target.exists());
 
     let apply_evidence = tree.publish(admitted).unwrap();
-    assert_eq!(apply_evidence.strategy, LocalPlacement::Moved);
+    assert_eq!(apply_evidence.files, 1);
+    assert_eq!(apply_evidence.bytes, 16);
     assert_eq!(
         fs::read(target.join("bin/tool.txt")).unwrap(),
         b"artifact payload"

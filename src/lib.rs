@@ -26,15 +26,14 @@ pub trait AsyncAcquire {
     type Error;
     type Output;
 
-    fn acquire(self) -> impl Future<Output = Result<Self::Output, Self::Error>>;
+    fn acquire(self) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
-#[cfg(feature = "http-async")]
 pub trait AsyncInspect {
     type Error;
     type Output;
 
-    fn inspect(self) -> impl Future<Output = Result<Self::Output, Self::Error>>;
+    fn inspect(self) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
 /// Establishes one factual proof about the consumed material against a caller-supplied

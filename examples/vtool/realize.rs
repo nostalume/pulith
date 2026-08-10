@@ -19,7 +19,7 @@ impl Resolved {
         let stage = target.stage()?;
         let material = match source {
             Source::Local { path } => LocalSource::new(path)?.acquire()?,
-            Source::Url { url } => RemoteSource::new(*url).acquire()?.0,
+            Source::Url { url } => RemoteSource::new(*url).prepare()?.acquire()?.0,
         };
         let material = match material {
             LocalMaterial::Directory { .. } => material,

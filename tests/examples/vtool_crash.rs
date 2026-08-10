@@ -4,7 +4,7 @@
 
 #![cfg(all(
     feature = "local",
-    feature = "http-sync",
+    feature = "http-ureq",
     feature = "zip",
     feature = "sha2"
 ))]

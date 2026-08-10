@@ -2,27 +2,33 @@
 
 use std::path::PathBuf;
 
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 use crate::common::HttpFixture;
-#[cfg(any(feature = "http-sync", feature = "http-async", feature = "zip"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest", feature = "zip"))]
 use std::io::Write;
 
-#[cfg(all(feature = "blake3", feature = "http-sync"))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::Verify;
 use pulith::archive::{ArchiveKind, ArchivePolicy};
-#[cfg(all(feature = "blake3", feature = "http-sync"))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::hash::{DigestAlgorithmKind, DigestValue};
 use pulith::local::{LocalObservation, LocalSource, LocalTarget, PreparationEvidence};
 use pulith::{Acquire, Remove};
-#[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
+#[cfg(all(
+    feature = "blake3",
+    any(feature = "http-ureq", feature = "http-reqwest")
+))]
 use pulith::{Inspect, Reconcile};
 
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 use pulith::local::{LocalExpectation, LocalReconciliation};
-#[cfg(any(feature = "http-sync", feature = "http-async"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 use pulith::net::{RemoteSource, RemoteUrl};
 
-#[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
+#[cfg(all(
+    feature = "blake3",
+    any(feature = "http-ureq", feature = "http-reqwest")
+))]
 fn assert_applied_then_reconciled(target: &std::path::Path, body: &[u8]) {
     assert_eq!(std::fs::read(target).unwrap(), body);
 
@@ -36,7 +42,7 @@ fn assert_applied_then_reconciled(target: &std::path::Path, body: &[u8]) {
     assert_eq!(reconciliation, LocalReconciliation::Matches);
 }
 
-#[cfg(all(feature = "blake3", feature = "http-sync"))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 #[test]
 fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
     let body = b"sync artifact";
@@ -45,6 +51,8 @@ fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
     let target = root.path().join("sync-artifact");
 
     let (artifact, evidence) = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
+        .prepare()
+        .unwrap()
         .acquire()
         .unwrap();
     server.join();
@@ -65,7 +73,7 @@ fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
     assert_applied_then_reconciled(&target, body);
 }
 
-#[cfg(all(feature = "blake3", feature = "http-async"))]
+#[cfg(all(feature = "blake3", feature = "http-reqwest"))]
 #[test]
 fn async_http_acquire_stages_artifact_with_evidence() {
     use pulith::AsyncAcquire;
@@ -79,9 +87,11 @@ fn async_http_acquire_stages_artifact_with_evidence() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(AsyncAcquire::acquire(RemoteSource::new(
-            RemoteUrl::parse(&server.url).unwrap(),
-        )))
+        .block_on(AsyncAcquire::acquire(
+            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
+                .prepare()
+                .unwrap(),
+        ))
         .unwrap();
     server.join();
     assert!(!target.exists());
@@ -210,7 +220,10 @@ fn forget_applies_directly_without_a_synthetic_predecessor() {
     assert!(!target.exists());
 }
 
-#[cfg(all(feature = "blake3", any(feature = "http-sync", feature = "http-async")))]
+#[cfg(all(
+    feature = "blake3",
+    any(feature = "http-ureq", feature = "http-reqwest")
+))]
 #[test]
 fn local_file_materialization_verification_and_reconciliation() {
     let body = b"local artifact";
@@ -228,7 +241,7 @@ fn local_file_materialization_verification_and_reconciliation() {
     assert_applied_then_reconciled(&target, body);
 }
 
-/// A plain placeholder so the http-async-only build keeps a non-empty target.
+/// A plain placeholder so the http-reqwest-only build keeps a non-empty target.
 #[allow(dead_code)]
 fn _unused() {
     let _ = PathBuf::new();

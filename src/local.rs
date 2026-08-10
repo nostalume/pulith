@@ -20,7 +20,7 @@ mod apply;
 mod materialize;
 mod view;
 
-pub use apply::{ApplyEvidence, LocalPlacement};
+pub use apply::{ApplyEvidence, RemoveEvidence};
 #[cfg(any(feature = "zip", feature = "tar"))]
 pub use materialize::{MaterializeError, PreparationEvidence};
 

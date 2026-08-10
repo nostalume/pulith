@@ -143,7 +143,7 @@ fallback.
 
 Async execution is concrete for HTTP acquisition through `AsyncAcquire`/`AsyncHttpAcquire`,
 HTTP inspection through `AsyncInspect`/`AsyncHttpInspect`, and process realization through
-`AsyncAcquire`/`ProcessAcquire` under `process-async`; the other transitions currently expose
+`AsyncAcquire`/`ProcessAcquire` under `process-tokio`; the other transitions currently expose
 synchronous behavior laws only. Pulith does
 not provide source discovery, dependency solving, a durable installation database, multi-target
 transactions, automatic repair, or system package-manager integration. Those require demonstrated
@@ -167,8 +167,8 @@ archive -> zip + gzip + xz + zstd
 
 network:
   net
-  http-sync -> net + local
-  http-async -> net + local + tokio
+  http-ureq -> net + local
+  http-reqwest -> net + local + tokio
 
 hashing:
   hash
@@ -182,7 +182,7 @@ archives:
 
 process:
   process
-  process-async -> process + tokio
+  process-tokio -> process + tokio
 ```
 
 `archive` is a concrete bundle of the supported archive decoders; it is not an empty compatibility
@@ -199,14 +199,14 @@ archive adapter.
 | local ZIP/TAR archive preparation and observation | default features, or `default-features = false, features = ["archive"]` |
 | local acquisition, staged apply, link/unlink, inspection, and reconciliation without archive preparation | `default-features = false, features = ["local"]` |
 | network URL/policy/attempt vocabulary only | `default-features = false, features = ["net"]` |
-| synchronous HTTP HEAD/acquire | `default-features = false, features = ["http-sync"]` |
-| Tokio asynchronous HTTP HEAD/acquire | `default-features = false, features = ["http-async"]` |
+| synchronous HTTP HEAD/acquire | `default-features = false, features = ["http-ureq"]` |
+| Tokio asynchronous HTTP HEAD/acquire | `default-features = false, features = ["http-reqwest"]` |
 | typed digest/descriptor vocabulary only | `default-features = false, features = ["hash"]` |
 | exact local BLAKE3 or SHA-256 artifact observation | `default-features = false, features = ["blake3"]` or `features = ["sha2"]` |
 | ZIP or plain TAR preparation | `default-features = false, features = ["zip"]` or `features = ["tar"]` |
 | gzip, xz, or zstd TAR preparation | `default-features = false, features = ["gzip"]`, `features = ["xz"]`, or `features = ["zstd"]`; standalone compression streams are not archive inputs |
 | bounded process realization and managed process sessions | `default-features = false, features = ["process"]` |
-| async process realization (tokio) | `default-features = false, features = ["process-async"]` |
+| async process realization (tokio) | `default-features = false, features = ["process-tokio"]` |
 
 `--all-features` is an integration-validation profile, not a consumer-facing `full` feature.
 Default features provide ordinary local archive preparation without selecting a digest engine.
@@ -217,7 +217,7 @@ decoder; consumers that require digest verification select BLAKE3 or SHA-256 exp
 
 ```toml
 [dependencies]
-pulith = { path = "../pulith", features = ["http-sync", "blake3", "zip"] }
+pulith = { path = "../pulith", features = ["http-ureq", "blake3", "zip"] }
 ```
 
 The `toolhost` example exercises build/harvest, compiled shims, exact child environments, and the
@@ -301,7 +301,7 @@ Feature-gated behavior must also compile with `--no-default-features` and its sm
   factual evidence plus capped `Diagnostics`, use method-separated `CancelToken`/`EnvVars`
   behavior, and stop the admitted tree on timeout or cancellation. Fallible `StagedInput`
   admission preserves platform names, requires an absolute source, and supplies copied input
-  closure through `PULITH_INPUT_ROOT`. The async adapter (`process-async`) shares the same laws.
+  closure through `PULITH_INPUT_ROOT`. The async adapter (`process-tokio`) shares the same laws.
 - **Stage-2 axis closures (S2.11–S2.13):** configuration interpretation, the durable manager
   aggregate, and the repair/controller decision are frozen as caller-owned boundaries: Pulith
   defines no data contract, program type, script engine, durable vocabulary, or controller loop.

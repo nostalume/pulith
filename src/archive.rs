@@ -353,54 +353,30 @@ impl ArchiveEvidence {
     }
 }
 
-/// Prepare a source archive into caller-owned exclusive custody and return extraction evidence.
-/// `Plain` is a copy operation and is therefore rejected here.
-pub fn prepare(
-    source: &Path,
-    workspace: &Path,
-    policy: ArchivePolicy,
-    kind: ArchiveKind,
-) -> Result<ArchiveEvidence, ArchiveError> {
-    match kind {
-        ArchiveKind::Plain => Err(ArchiveError::InvalidPreparation(
-            "a plain material is copied, not extracted".into(),
-        )),
-        #[cfg(feature = "zip")]
-        ArchiveKind::Zip => {
-            extract_source(source, workspace, policy, ArchiveKind::Zip, extract_zip)
+impl ArchiveKind {
+    /// Prepare a source archive into caller-owned exclusive custody and return extraction evidence.
+    /// `Plain` is a copy operation and is therefore rejected here.
+    pub fn prepare(
+        self,
+        source: &Path,
+        workspace: &Path,
+        policy: ArchivePolicy,
+    ) -> Result<ArchiveEvidence, ArchiveError> {
+        match self {
+            Self::Plain => Err(ArchiveError::InvalidPreparation(
+                "a plain material is copied, not extracted".into(),
+            )),
+            #[cfg(feature = "zip")]
+            Self::Zip => extract_source(source, workspace, policy, extract_zip),
+            #[cfg(feature = "tar")]
+            Self::Tar => extract_source(source, workspace, policy, extract_tar_plain),
+            #[cfg(feature = "gzip")]
+            Self::TarGz => extract_source(source, workspace, policy, extract_tar_gzip),
+            #[cfg(feature = "xz")]
+            Self::TarXz => extract_source(source, workspace, policy, extract_tar_xz),
+            #[cfg(feature = "zstd")]
+            Self::TarZstd => extract_source(source, workspace, policy, extract_tar_zstd),
         }
-        #[cfg(feature = "tar")]
-        ArchiveKind::Tar => extract_source(
-            source,
-            workspace,
-            policy,
-            ArchiveKind::Tar,
-            extract_tar_plain,
-        ),
-        #[cfg(feature = "gzip")]
-        ArchiveKind::TarGz => extract_source(
-            source,
-            workspace,
-            policy,
-            ArchiveKind::TarGz,
-            extract_tar_gzip,
-        ),
-        #[cfg(feature = "xz")]
-        ArchiveKind::TarXz => extract_source(
-            source,
-            workspace,
-            policy,
-            ArchiveKind::TarXz,
-            extract_tar_xz,
-        ),
-        #[cfg(feature = "zstd")]
-        ArchiveKind::TarZstd => extract_source(
-            source,
-            workspace,
-            policy,
-            ArchiveKind::TarZstd,
-            extract_tar_zstd,
-        ),
     }
 }
 
@@ -410,7 +386,6 @@ fn extract_source(
     source: &Path,
     root: &Path,
     policy: ArchivePolicy,
-    _format: ArchiveKind,
     extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence, ArchiveError>,
 ) -> Result<ArchiveEvidence, ArchiveError> {
     let root = root.to_path_buf();
@@ -1024,8 +999,17 @@ mod tests {
 
     use super::{
         ArchiveEntryKind, ArchiveError, ArchiveKind, ArchivePathIndex, ArchivePolicy,
-        combine_archive_failure, prepare,
+        combine_archive_failure,
     };
+
+    fn prepare(
+        source: &Path,
+        workspace: &Path,
+        policy: ArchivePolicy,
+        kind: ArchiveKind,
+    ) -> Result<super::ArchiveEvidence, ArchiveError> {
+        kind.prepare(source, workspace, policy)
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1568,7 +1552,16 @@ mod tar_tests {
     use std::io::{self, Cursor, Write};
     use std::path::{Path, PathBuf};
 
-    use super::{ArchiveError, ArchiveKind, ArchivePolicy, prepare};
+    use super::{ArchiveError, ArchiveKind, ArchivePolicy};
+
+    fn prepare(
+        source: &Path,
+        workspace: &Path,
+        policy: ArchivePolicy,
+        kind: ArchiveKind,
+    ) -> Result<super::ArchiveEvidence, ArchiveError> {
+        kind.prepare(source, workspace, policy)
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

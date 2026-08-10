@@ -1,4 +1,4 @@
-#![cfg(feature = "process-async")]
+#![cfg(feature = "process-tokio")]
 
 use std::time::Duration;
 
@@ -21,11 +21,16 @@ type AcquireOutput = OutputResult;
 fn async_success_stages_tree_before_local_apply_and_preserves_evidence_order() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("published");
-    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(fixture_process(
-        Fixture::Success,
-        "tree",
-        Duration::from_secs(10),
-    )))
+    let prepared = fixture_process(Fixture::Success, "tree", Duration::from_secs(10))
+        .prepare()
+        .unwrap();
+    fn assert_send(_: impl Send) {}
+    assert_send(AsyncAcquire::acquire(prepared));
+    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(
+        fixture_process(Fixture::Success, "tree", Duration::from_secs(10))
+            .prepare()
+            .unwrap(),
+    ))
     .unwrap();
 
     assert!(!target.exists());
@@ -70,7 +75,8 @@ fn async_staged_input_is_reachable_with_exact_bytes_via_input_root() {
     let action = fixture_process(Fixture::CopiesInputEnv, "tree", Duration::from_secs(30))
         .with_inputs([StagedInput::new(&source, "input.txt").unwrap()]);
 
-    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(action)).unwrap();
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
     acquired
         .tree
         .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
@@ -92,7 +98,7 @@ fn async_timeout_stops_descendant_and_carries_captured_diagnostics() {
     let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(10))
         .with_environment(environment);
 
-    let result = block_on(AsyncAcquire::acquire(action));
+    let result = block_on(AsyncAcquire::acquire(action.prepare().unwrap()));
 
     match result {
         Err(RunError::TimedOut { diagnostics, .. }) => {
@@ -126,7 +132,8 @@ fn async_capture_truncates_streams_at_the_cap() {
     let _target = root.path().join("published");
     let action =
         fixture_process(Fixture::Success, "tree", Duration::from_secs(10)).with_capture_cap(16);
-    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(action)).unwrap();
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
 
     let current = &acquired.diagnostics;
     assert_eq!(current.cap, 16);
@@ -141,7 +148,8 @@ fn async_capture_cap_zero_disables_capture() {
     let _target = root.path().join("published");
     let action =
         fixture_process(Fixture::Success, "tree", Duration::from_secs(10)).with_capture_cap(0);
-    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(action)).unwrap();
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
 
     let current = &acquired.diagnostics;
     assert_eq!(current.cap, 0);
@@ -174,9 +182,9 @@ fn async_wrong_kind_output_carries_captured_diagnostics() {
 fn assert_failure(fixture: Fixture, timeout: Duration, check: impl Fn(&RunError) -> bool) {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("published");
-    let result = block_on(AsyncAcquire::acquire(fixture_process(
-        fixture, "tree", timeout,
-    )));
+    let result = block_on(AsyncAcquire::acquire(
+        fixture_process(fixture, "tree", timeout).prepare().unwrap(),
+    ));
     let error = match result {
         Err(error) => error,
         Ok(output) => panic!(
@@ -201,7 +209,7 @@ fn async_drop_cancellation_stops_the_admitted_tree() {
 
     block_on(async {
         {
-            let mut future = std::pin::pin!(AsyncAcquire::acquire(action));
+            let mut future = std::pin::pin!(AsyncAcquire::acquire(action.prepare().unwrap()));
             let waker = noop_waker();
             let mut context = std::task::Context::from_waker(&waker);
             // First poll starts the spawn and reaches the awaited wait loop.
@@ -244,7 +252,8 @@ fn async_token_cancel_stops_tree_while_future_stays_alive() {
     let token = CancelToken::new();
 
     let result = block_on(async {
-        let mut future = std::pin::pin!(action.acquire_async_cancellable(&token));
+        let mut future =
+            std::pin::pin!(action.prepare().unwrap().acquire_async_cancellable(&token));
         let waker = noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         // First poll starts the spawn and reaches the awaited wait loop.

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::archive::{ArchiveError, ArchiveEvidence, ArchiveKind, ArchivePolicy, prepare};
+use crate::archive::{ArchiveError, ArchiveEvidence, ArchiveKind, ArchivePolicy};
 use crate::local::{LocalError, LocalMaterial, LocalSource, StagedTree};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,37 +49,38 @@ impl LocalMaterial {
         stage: StagedTree,
         policy: ArchivePolicy,
     ) -> Result<(StagedTree, PreparationEvidence), MaterializeError> {
-        let (path, directory, staged_file) = match self {
-            Self::Directory { path } => (path, true, None),
-            Self::File { path } => (path, false, None),
-            Self::StagedFile { path } => (path.to_path_buf(), false, Some(path)),
-        };
-        if directory {
-            let stage = stage
+        match self {
+            Self::Directory { path } => stage
                 .copy_tree(
                     LocalSource::new(path).map_err(MaterializeError::Copy)?,
                     PathBuf::new(),
                 )
-                .map_err(MaterializeError::Copy)?;
-            return Ok((stage, PreparationEvidence::Copied));
+                .map(|stage| (stage, PreparationEvidence::Copied))
+                .map_err(MaterializeError::Copy),
+            Self::File { path } => stage.prepare_file(path, policy),
+            Self::StagedFile { path } => stage.prepare_file(path.to_path_buf(), policy),
         }
+    }
+}
+
+impl StagedTree {
+    fn prepare_file(
+        self,
+        path: PathBuf,
+        policy: ArchivePolicy,
+    ) -> Result<(Self, PreparationEvidence), MaterializeError> {
         match ArchiveKind::sniff(&path).map_err(MaterializeError::Sniff)? {
-            Some(kind) => {
-                let evidence = prepare(&path, stage.root(), policy, kind)
-                    .map_err(MaterializeError::Prepare)?;
-                Ok((stage, PreparationEvidence::Extracted(evidence)))
-            }
-            None => {
-                let stage = stage
-                    .copy_file(
-                        LocalSource::new(path).map_err(MaterializeError::Copy)?,
-                        PathBuf::new(),
-                    )
-                    .map_err(MaterializeError::Copy)?;
-                let result = Ok((stage, PreparationEvidence::Copied));
-                drop(staged_file);
-                result
-            }
+            Some(kind) => kind
+                .prepare(&path, self.root(), policy)
+                .map(|evidence| (self, PreparationEvidence::Extracted(evidence)))
+                .map_err(MaterializeError::Prepare),
+            None => self
+                .copy_file(
+                    LocalSource::new(path).map_err(MaterializeError::Copy)?,
+                    PathBuf::new(),
+                )
+                .map(|stage| (stage, PreparationEvidence::Copied))
+                .map_err(MaterializeError::Copy),
         }
     }
 }
