@@ -67,7 +67,44 @@ macro_rules! openers {
 }
 openers! {
     binding = BINDING_ACCESS, repair = REPAIR_ACCESS, configure = CONFIGURE_ACCESS,
-    rebind = REBIND_ACCESS, start = START_ACCESS, stop = STOP_ACCESS, removal = REMOVE_ACCESS,
+    rebind = REBIND_ACCESS, start = START_ACCESS, stop = STOP_ACCESS,
+}
+
+pub(super) enum Removal {
+    Missing,
+    Removing,
+    Present(ServiceHandle),
+}
+
+pub(super) fn observe_for_removal(declaration: &NormalizedDecl) -> Result<Removal, ServiceError> {
+    let manager = manager(SC_MANAGER_CONNECT)?;
+    let name = wide(declaration.id.as_str());
+    let raw = unsafe { OpenServiceW(manager.0, name.as_ptr(), REMOVE_ACCESS) };
+    if !raw.is_null() {
+        return Ok(Removal::Present(ServiceHandle(raw)));
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(1060) => Ok(Removal::Missing),
+        Some(1072) => Ok(Removal::Removing),
+        _ => Err(last("open service for removal")),
+    }
+}
+
+pub(super) fn await_missing(declaration: &NormalizedDecl) -> Result<(), ServiceError> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(35) {
+        match observe(declaration)? {
+            OpenedService::Missing => return Ok(()),
+            OpenedService::Removing => std::thread::sleep(std::time::Duration::from_millis(100)),
+            OpenedService::Present(_) => {
+                return Err(ServiceError::invalid("service deletion conflicts"));
+            }
+        }
+    }
+    Err(ServiceError::operation(
+        "service deletion",
+        "exceeded 35 seconds",
+    ))
 }
 
 pub(super) fn create(

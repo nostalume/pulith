@@ -166,11 +166,13 @@ impl PlatformService<'_> {
     }
 
     pub(super) fn remove(&self) -> Result<(), ServiceError> {
-        systemctl(self.root, ["disable", self.declaration.id.as_str()])?;
+        if self.observe()?.registration != Registration::Missing {
+            systemctl(self.root, ["disable", self.declaration.id.as_str()])?;
+        }
         let path = unit_path(self.root, self.declaration);
         let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
         ServiceError::effect(target.remove())?;
-        Ok(())
+        systemctl(self.root, ["daemon-reload"]).map(drop)
     }
 }
 

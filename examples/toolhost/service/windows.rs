@@ -1,6 +1,6 @@
 use super::{
-    Binding, Boot, ManagerObservation, NormalizedDecl, Registration, Runtime, ServiceError,
-    ServiceRoot,
+    AcceptedEffect, Binding, Boot, ManagerObservation, NormalizedDecl, Observation, Registration,
+    Runtime, ServiceError, ServiceRoot,
 };
 use std::path::Path;
 use windows_sys::Win32::System::Services::{SERVICE_AUTO_START, SERVICE_DEMAND_START};
@@ -12,7 +12,7 @@ pub(crate) mod scm;
 #[path = "windows/security.rs"]
 mod security;
 
-use access::AccessJournal;
+use access::AccessState;
 pub(super) use security::{secure_ancestor, secure_input, secure_leaf};
 
 pub(super) const ACCOUNT: &str = "NT AUTHORITY\\LocalService";
@@ -44,7 +44,7 @@ impl<'a> WindowsService<'a> {
         let registration = if !exact {
             Registration::Conflict
         } else if service.security_is_exact()?
-            && self.journal().is_exact(binding.as_ref().unwrap())?
+            && self.state().is_exact(binding.as_ref().unwrap())?
         {
             Registration::Exact
         } else {
@@ -75,7 +75,7 @@ impl<'a> WindowsService<'a> {
         let command = render_definition(self.root, self.declaration, binding);
         let service = scm::create(self.declaration, &command, ACCOUNT)?;
         service.configure_security()?;
-        self.journal().apply(binding)
+        self.state().apply(binding)
     }
 
     pub(super) fn repair(&self) -> Result<(), ServiceError> {
@@ -88,7 +88,7 @@ impl<'a> WindowsService<'a> {
             return Err(ServiceError::invalid("service registration conflicts"));
         }
         service.configure_security()?;
-        self.journal().apply(&binding)
+        self.state().apply(&binding)
     }
 
     pub(super) fn enable(&self) -> Result<(), ServiceError> {
@@ -100,9 +100,23 @@ impl<'a> WindowsService<'a> {
     }
 
     pub(super) fn rebind(&self, binding: &Binding) -> Result<(), ServiceError> {
-        self.journal().apply(binding)?;
-        let command = render_definition(self.root, self.declaration, binding);
-        scm::rebind(self.declaration)?.set_binding(&command)
+        let observed = self.binding()?;
+        let transition = self.state().begin_rebind(&observed, binding)?;
+        transition.ensure_target()?;
+        if transition.needs_switch(&observed)? {
+            let service = scm::rebind(self.declaration)?;
+            let config = service.config()?;
+            let current = self.binding_from_command(&config.command)?;
+            if !transition.needs_switch(&current)? {
+                return Err(ServiceError::invalid(
+                    "manager binding changed during rebind",
+                ));
+            }
+            let command = render_definition(self.root, self.declaration, binding);
+            service.set_binding(&command)?;
+        }
+        let observed = self.binding()?;
+        transition.finish(&observed)
     }
 
     pub(super) fn start(&self) -> Result<(), ServiceError> {
@@ -114,18 +128,42 @@ impl<'a> WindowsService<'a> {
     }
 
     pub(super) fn remove(&self) -> Result<(), ServiceError> {
-        let service = scm::removal(self.declaration)?;
-        let config = service.config()?;
-        let binding = self.binding_from_command(&config.command)?;
-        if config.command != render_definition(self.root, self.declaration, &binding) {
-            return Err(ServiceError::invalid("service binding conflicts"));
+        match scm::observe_for_removal(self.declaration)? {
+            scm::Removal::Missing => {}
+            scm::Removal::Removing => self.await_removal()?,
+            scm::Removal::Present(service) => {
+                let config = service.config()?;
+                let binding = self.binding_from_command(&config.command)?;
+                if config.command != render_definition(self.root, self.declaration, &binding) {
+                    return Err(ServiceError::invalid("service binding conflicts"));
+                }
+                service.delete()?;
+                self.await_removal()?;
+            }
         }
-        service.delete()?;
-        self.journal().remove()
+        self.state().cleanup_removed()
     }
 
-    fn journal(&self) -> AccessJournal<'a> {
-        AccessJournal::new(self)
+    fn await_removal(&self) -> Result<(), ServiceError> {
+        let definition = self.root.observe(self.declaration)?;
+        scm::await_missing(self.declaration).map_err(|error| {
+            let manager = removing();
+            ServiceError::partial(
+                AcceptedEffect::DeletionRequested,
+                Observation {
+                    definition,
+                    registration: manager.registration,
+                    boot: manager.boot,
+                    runtime: manager.runtime,
+                },
+                "await service deletion",
+                error,
+            )
+        })
+    }
+
+    fn state(&self) -> AccessState<'a> {
+        AccessState::new(self)
     }
 
     fn binding_from_command(&self, command: &str) -> Result<Binding, ServiceError> {
@@ -146,7 +184,7 @@ pub(super) fn access_plan(
     declaration: &NormalizedDecl,
     binding: &Binding,
 ) -> [security::AccessGrant; 2] {
-    AccessJournal::new(&WindowsService::new(root, declaration)).plan(binding)
+    AccessState::new(&WindowsService::new(root, declaration)).plan(binding)
 }
 
 pub(super) fn render_definition(

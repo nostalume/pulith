@@ -11,6 +11,8 @@ mod platform;
 pub(super) use lifecycle::ManagerObservation;
 #[allow(unused_imports)]
 pub use lifecycle::{Boot, Change, Definition, Observation, Registration, Runtime, Service};
+#[cfg(test)]
+use lifecycle::{RemovalPlan, removal_plan};
 #[cfg(windows)]
 #[path = "service/windows.rs"]
 mod platform;
@@ -301,6 +303,7 @@ impl ServiceRoot {
             ServiceError::effect(pulith::local::LocalTarget::new(self.directory(declaration)))?;
         let stage = ServiceError::effect(target.stage())?;
         let stage = ServiceError::effect(stage.write_file(declaration.bytes(), "service.toml"))?;
+        let stage = ServiceError::effect(stage.write_file([], "state/lock"))?;
         ServiceError::effect(stage.publish(target))?;
         Ok(true)
     }

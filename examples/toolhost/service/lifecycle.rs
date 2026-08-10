@@ -125,13 +125,9 @@ impl Service {
 
     pub fn remove(self) -> Result<Change, ServiceError> {
         let before = self.observe()?;
-        if before.registration == Registration::Missing {
-            return Ok(Change::unchanged(before));
-        }
-        if before.runtime != Runtime::Stopped || before.boot != Boot::Disabled {
-            return Err(ServiceError::invalid(
-                "remove requires stopped and disabled",
-            ));
+        match removal_plan(before)? {
+            RemovalPlan::Unchanged => return Ok(Change::unchanged(before)),
+            RemovalPlan::Delete | RemovalPlan::AwaitDeletion | RemovalPlan::CleanupOnly => {}
         }
         self.platform().remove()?;
         self.root.recheck()?;
@@ -171,6 +167,43 @@ impl Service {
 
     fn platform(&self) -> platform::PlatformService<'_> {
         platform::PlatformService::new(&self.root, &self.declaration)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RemovalPlan {
+    Unchanged,
+    Delete,
+    AwaitDeletion,
+    CleanupOnly,
+}
+
+pub(super) fn removal_plan(observed: Observation) -> Result<RemovalPlan, ServiceError> {
+    if observed.definition == Definition::Missing && observed.registration == Registration::Missing
+    {
+        return Ok(RemovalPlan::Unchanged);
+    }
+    if !matches!(observed.definition, Definition::Exact | Definition::Broken)
+        || observed.registration == Registration::Conflict
+    {
+        return Err(ServiceError::conflict(
+            "service ownership conflicts",
+            observed,
+        ));
+    }
+    match observed.registration {
+        Registration::Missing => Ok(RemovalPlan::CleanupOnly),
+        Registration::Removing => Ok(RemovalPlan::AwaitDeletion),
+        Registration::Exact | Registration::Broken
+            if observed.runtime == Runtime::Stopped && observed.boot == Boot::Disabled =>
+        {
+            Ok(RemovalPlan::Delete)
+        }
+        Registration::Exact | Registration::Broken => Err(ServiceError::conflict(
+            "remove requires stopped and disabled",
+            observed,
+        )),
+        Registration::Conflict => unreachable!(),
     }
 }
 

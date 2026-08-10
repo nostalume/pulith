@@ -25,7 +25,8 @@ pub use apply::{ApplyEvidence, RemoveEvidence};
 #[cfg(any(feature = "zip", feature = "tar"))]
 pub use materialize::{MaterializeError, PreparationEvidence};
 pub use record::{
-    RecordChange, RecordError, RecordEvidence, RecordLimit, RecordObservation, RecordStore,
+    RecordChange, RecordEdit, RecordError, RecordEvidence, RecordLimit, RecordObservation,
+    RecordStore,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

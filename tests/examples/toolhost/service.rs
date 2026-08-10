@@ -131,6 +131,74 @@ fn service_errors_preserve_conflict_and_accepted_progress() {
 }
 
 #[test]
+fn removal_planning_preserves_manager_first_cleanup() {
+    let observed = |definition, registration, boot, runtime| Observation {
+        definition,
+        registration,
+        boot,
+        runtime,
+    };
+    assert_eq!(
+        removal_plan(observed(
+            Definition::Missing,
+            Registration::Missing,
+            Boot::Disabled,
+            Runtime::Stopped
+        ))
+        .unwrap(),
+        RemovalPlan::Unchanged
+    );
+    assert_eq!(
+        removal_plan(observed(
+            Definition::Exact,
+            Registration::Missing,
+            Boot::Disabled,
+            Runtime::Stopped
+        ))
+        .unwrap(),
+        RemovalPlan::CleanupOnly
+    );
+    assert_eq!(
+        removal_plan(observed(
+            Definition::Exact,
+            Registration::Removing,
+            Boot::Conflict,
+            Runtime::Stopping
+        ))
+        .unwrap(),
+        RemovalPlan::AwaitDeletion
+    );
+    assert_eq!(
+        removal_plan(observed(
+            Definition::Exact,
+            Registration::Exact,
+            Boot::Disabled,
+            Runtime::Stopped
+        ))
+        .unwrap(),
+        RemovalPlan::Delete
+    );
+    assert!(
+        removal_plan(observed(
+            Definition::Exact,
+            Registration::Conflict,
+            Boot::Disabled,
+            Runtime::Stopped
+        ))
+        .is_err()
+    );
+    assert!(
+        removal_plan(observed(
+            Definition::Exact,
+            Registration::Exact,
+            Boot::Enabled,
+            Runtime::Stopped
+        ))
+        .is_err()
+    );
+}
+
+#[test]
 fn manager_definition_pins_one_immutable_release() {
     let temporary = tempfile::tempdir().unwrap();
     let root = ServiceRoot(temporary.path().canonicalize().unwrap());

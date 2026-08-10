@@ -182,7 +182,6 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
-use std::fs;
 use std::io::Cursor;
 
 use pulith::local::{RecordError, RecordLimit, RecordObservation, RecordStore};
@@ -206,6 +205,7 @@ pub enum Phase {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Snapshot {
     schema: u8,
     records: Vec<Record>,
@@ -218,12 +218,28 @@ pub struct State {
 impl State {
     pub fn open(root: &Path) -> Result<Self, StateError> {
         let legacy = root.join(".pulith-state");
-        if fs::symlink_metadata(&legacy).is_ok() {
-            return Err(StateError::Legacy { path: legacy });
+        match std::fs::symlink_metadata(&legacy) {
+            Ok(_) => return Err(StateError::Legacy { path: legacy }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(StateError::io("inspect legacy state", &legacy, source)),
         }
         let directory = root.join(".vtool/state");
-        fs::create_dir_all(&directory)
-            .map_err(|source| StateError::io("create state directory", &directory, source))?;
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(StateError::Conflict { path: directory }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&directory).map_err(|source| {
+                    StateError::io("create state directory", &directory, source)
+                })?;
+            }
+            Err(source) => {
+                return Err(StateError::io(
+                    "inspect state directory",
+                    &directory,
+                    source,
+                ));
+            }
+        }
         Ok(Self { directory })
     }
 
@@ -272,6 +288,16 @@ impl State {
                 message: error.to_string(),
             })?;
         if snapshot.schema != 1 {
+            return Err(StateError::Conflict {
+                path: directory.join(SNAPSHOT),
+            });
+        }
+        let mut identities = std::collections::HashSet::new();
+        if snapshot
+            .records
+            .iter()
+            .any(|record| !identities.insert((record.name.as_str(), record.version.as_str())))
+        {
             return Err(StateError::Conflict {
                 path: directory.join(SNAPSHOT),
             });

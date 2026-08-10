@@ -514,3 +514,13 @@ fn legacy_state_is_an_explicit_conflict() {
     assert!(matches!(State::open(&root), Err(StateError::Legacy { .. })));
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn duplicate_snapshot_identity_is_an_explicit_conflict() {
+    let root = temp_root("duplicate");
+    let state = State::open(&root).unwrap();
+    let duplicate = r#"{"schema":1,"records":[{"name":"demo","version":"1","phase":"Installed","generation":1},{"name":"demo","version":"1","phase":"Installed","generation":2}]}"#;
+    std::fs::write(root.join(".vtool/state/snapshot.json"), duplicate).unwrap();
+    assert!(matches!(state.read(), Err(StateError::Conflict { .. })));
+    std::fs::remove_dir_all(&root).unwrap();
+}
