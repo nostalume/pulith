@@ -1,4 +1,4 @@
-//! Typed TOML recipe and durable intent journal for the vtool vertical.
+//! Typed TOML recipe and durable intent snapshot for the vtool vertical.
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -182,10 +182,14 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::Cursor;
 
+use pulith::local::{RecordError, RecordLimit, RecordObservation, RecordStore};
 use serde::Serialize;
+
+const STATE_LIMIT: u64 = 1024 * 1024;
+const SNAPSHOT: &str = "snapshot.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -201,63 +205,82 @@ pub enum Phase {
     Deactivated,
 }
 
-pub struct Journal {
-    path: PathBuf,
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    schema: u8,
+    records: Vec<Record>,
 }
 
-impl Journal {
+pub struct State {
+    directory: PathBuf,
+}
+
+impl State {
     pub fn open(root: &Path) -> Result<Self, StateError> {
-        let dir = root.join(".pulith-state");
-        fs::create_dir_all(&dir)
-            .map_err(|source| StateError::io("create state directory", &dir, source))?;
-        Ok(Self {
-            path: dir.join("journal.jsonl"),
-        })
+        let legacy = root.join(".pulith-state");
+        if fs::symlink_metadata(&legacy).is_ok() {
+            return Err(StateError::Legacy { path: legacy });
+        }
+        let directory = root.join(".vtool/state");
+        fs::create_dir_all(&directory)
+            .map_err(|source| StateError::io("create state directory", &directory, source))?;
+        Ok(Self { directory })
     }
 
-    pub fn append(&mut self, record: &Record) -> Result<(), StateError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| StateError::io("open journal for append", &self.path, source))?;
-        serde_json::to_writer(&mut file, record)
-            .map_err(|error| StateError::encode(&self.path, error))?;
-        file.write_all(b"\n")
-            .map_err(|source| StateError::io("write journal line", &self.path, source))?;
-        if std::env::var("PULITH_VT_CRASH_AFTER").as_deref() == Ok("journal-append") {
-            std::process::abort();
-        }
-        file.sync_all()
-            .map_err(|source| StateError::io("fsync journal", &self.path, source))?;
-        if std::env::var("PULITH_VT_CRASH_AFTER").as_deref() == Ok("journal-fsync") {
-            std::process::abort();
+    pub fn read(&self) -> Result<Vec<Record>, StateError> {
+        let store = RecordStore::new(&self.directory)?;
+        Self::decode(store.inspect(SNAPSHOT, Self::limit())?.0, &self.directory)
+    }
+
+    pub fn commit(&self, name: &str, version: &str, phase: Phase) -> Result<(), StateError> {
+        let store = RecordStore::new(&self.directory)?;
+        let mut edit = store.edit()?;
+        let observed = edit.inspect(SNAPSHOT, Self::limit())?.0;
+        let missing = matches!(observed, RecordObservation::Missing);
+        let mut records = Self::decode(observed, &self.directory)?;
+        let generation = records
+            .iter()
+            .filter(|record| record.name == name && record.version == version)
+            .map(|record| record.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        records.retain(|record| record.name != name || record.version != version);
+        records.push(Record {
+            name: name.into(),
+            version: version.into(),
+            phase,
+            generation,
+        });
+        let bytes = serde_json::to_vec(&Snapshot { schema: 1, records })
+            .map_err(|error| StateError::encode(&self.directory.join(SNAPSHOT), error))?;
+        if missing {
+            edit.create_from(SNAPSHOT, Self::limit(), Cursor::new(bytes))?;
+        } else {
+            edit.replace_from(SNAPSHOT, Self::limit(), Cursor::new(bytes))?;
         }
         Ok(())
     }
 
-    pub fn read(&self) -> Result<Vec<Record>, StateError> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(StateError::io("open journal for read", &self.path, source)),
+    fn decode(observed: RecordObservation, directory: &Path) -> Result<Vec<Record>, StateError> {
+        let RecordObservation::Present(bytes) = observed else {
+            return Ok(Vec::new());
         };
-        let mut records = Vec::new();
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line =
-                line.map_err(|source| StateError::io("read journal line", &self.path, source))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            records.push(
-                serde_json::from_str(&line).map_err(|error| StateError::Decode {
-                    path: self.path.clone(),
-                    line: index + 1,
-                    message: error.to_string(),
-                })?,
-            );
+        let snapshot: Snapshot =
+            serde_json::from_slice(&bytes).map_err(|error| StateError::Decode {
+                path: directory.join(SNAPSHOT),
+                message: error.to_string(),
+            })?;
+        if snapshot.schema != 1 {
+            return Err(StateError::Conflict {
+                path: directory.join(SNAPSHOT),
+            });
         }
-        Ok(records)
+        Ok(snapshot.records)
+    }
+
+    fn limit() -> RecordLimit {
+        RecordLimit::new(STATE_LIMIT).expect("positive constant state limit")
     }
 }
 
@@ -270,13 +293,19 @@ pub enum StateError {
     },
     Decode {
         path: PathBuf,
-        line: usize,
         message: String,
     },
     Encode {
         path: PathBuf,
         message: String,
     },
+    Legacy {
+        path: PathBuf,
+    },
+    Conflict {
+        path: PathBuf,
+    },
+    Record(RecordError),
 }
 
 impl StateError {
@@ -296,6 +325,12 @@ impl StateError {
     }
 }
 
+impl From<RecordError> for StateError {
+    fn from(error: RecordError) -> Self {
+        Self::Record(error)
+    }
+}
+
 impl std::fmt::Display for StateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -304,20 +339,21 @@ impl std::fmt::Display for StateError {
                 path,
                 source,
             } => write!(f, "{action} `{}`: {source}", path.display()),
-            Self::Decode {
-                path,
-                line,
-                message,
-            } => {
-                write!(
-                    f,
-                    "corrupt journal line {line} in `{}`: {message}",
-                    path.display()
-                )
+            Self::Decode { path, message } => {
+                write!(f, "decode state snapshot `{}`: {message}", path.display())
             }
             Self::Encode { path, message } => {
-                write!(f, "encode journal record `{}`: {message}", path.display())
+                write!(f, "encode state snapshot `{}`: {message}", path.display())
             }
+            Self::Legacy { path } => write!(
+                f,
+                "legacy state at `{}` conflicts; migrate or remove it explicitly",
+                path.display()
+            ),
+            Self::Conflict { path } => {
+                write!(f, "state snapshot conflicts at `{}`", path.display())
+            }
+            Self::Record(error) => write!(f, "state record: {error}"),
         }
     }
 }
@@ -326,6 +362,7 @@ impl std::error::Error for StateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Record(error) => Some(error),
             _ => None,
         }
     }

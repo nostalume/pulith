@@ -1,4 +1,4 @@
-//! Caller-owned vtool realization: acquire, verify, prepare, apply, link, and journal repair.
+//! Caller-owned vtool realization: acquire, verify, prepare, apply, link, and state repair.
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use pulith::local::{
 use pulith::net::RemoteSource;
 use pulith::{Acquire, Inspect, Link, Reconcile, Unlink, Verify};
 
-use crate::manifest::{Journal, Phase, Record, Resolved, Source, StateError};
+use crate::manifest::{Phase, Resolved, Source, State, StateError};
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -89,7 +89,7 @@ pub fn repair(
     attempts: usize,
     backoff: Duration,
 ) -> Result<RepairReport, StateError> {
-    let journal = Journal::open(root)?;
+    let state = State::open(root)?;
     let mut report = RepairReport::default();
     let address = || {
         format!(
@@ -99,7 +99,7 @@ pub fn repair(
         )
     };
 
-    let records = journal.read()?;
+    let records = state.read()?;
     let Some(latest) = records
         .iter()
         .filter(|record| {
@@ -181,22 +181,7 @@ fn reconciles(path: &Path, expectation: LocalExpectation) -> bool {
 }
 
 fn commit(root: &Path, name: &str, version: &str, phase: Phase) -> Result<(), StateError> {
-    let mut journal = Journal::open(root)?;
-    let generation = journal
-        .read()?
-        .iter()
-        .filter(|record| record.name == name && record.version == version)
-        .map(|record| record.generation)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    journal.append(&Record {
-        name: name.to_string(),
-        version: version.to_string(),
-        phase,
-        generation,
-    })?;
-    Ok(())
+    State::open(root)?.commit(name, version, phase)
 }
 
 #[cfg(test)]

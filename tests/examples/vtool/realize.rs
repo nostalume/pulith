@@ -86,16 +86,11 @@ fn make_directory_symlink(target: &Path, view: &Path) {
     std::os::unix::fs::symlink(target, view).unwrap();
 }
 
-/// A journal seed for a repair address (the committed intent repair reconciles against).
+/// A state seed for a repair address (the committed intent repair reconciles against).
 fn seed_intent(root: &Path, name: &str, version: &str, phase: Phase) {
-    let mut journal = Journal::open(root).unwrap();
-    journal
-        .append(&Record {
-            name: name.to_string(),
-            version: version.to_string(),
-            phase,
-            generation: 1,
-        })
+    State::open(root)
+        .unwrap()
+        .commit(name, version, phase)
         .unwrap();
 }
 
@@ -477,7 +472,7 @@ fn repair_restores_a_missing_view_and_commits_the_next_generation() {
     );
     assert!(view.is_symlink() || view.join("tool").exists());
     // The repair committed the next generation (supersede: latest record wins).
-    let records = Journal::open(root.path()).unwrap().read().unwrap();
+    let records = State::open(root.path()).unwrap().read().unwrap();
     let latest = records.iter().max_by_key(|r| r.generation).unwrap();
     assert_eq!(latest.generation, 2);
 }

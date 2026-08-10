@@ -446,38 +446,7 @@ fn rejects_a_platform_without_a_pair() {
     assert!(matches!(error, ResolveError::NoSourceForPlatform { .. }));
 }
 
-// --- journal tests (the state machinery lives with the manifest types) ---
-
-fn record(name: &str, version: &str, generation: u64) -> Record {
-    Record {
-        name: name.to_string(),
-        version: version.to_string(),
-        phase: Phase::Installed,
-        generation,
-    }
-}
-
-use std::collections::HashMap;
-
-/// Keep the highest generation per `name@version` (supersede), first-appearance order.
-/// The production paths (`commit`, `repair`) query the address directly; this is the
-/// fold semantics under test.
-fn fold(records: &[Record]) -> Vec<Record> {
-    let mut best: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut folded: Vec<Record> = Vec::new();
-    for record in records {
-        let key = (record.name.as_str(), record.version.as_str());
-        match best.get(&key) {
-            Some(&index) if folded[index].generation >= record.generation => {}
-            Some(&index) => folded[index] = record.clone(),
-            None => {
-                best.insert(key, folded.len());
-                folded.push(record.clone());
-            }
-        }
-    }
-    folded
-}
+// --- durable snapshot tests ---
 
 fn temp_root(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -490,13 +459,14 @@ fn temp_root(label: &str) -> PathBuf {
 }
 
 #[test]
-fn append_persists_across_reopen() {
+fn state_persists_across_reopen() {
     let root = temp_root("persist");
-    let mut journal = Journal::open(&root).unwrap();
-    journal.append(&record("demo", "1.0.0", 1)).unwrap();
-    drop(journal);
+    State::open(&root)
+        .unwrap()
+        .commit("demo", "1.0.0", Phase::Installed)
+        .unwrap();
 
-    let reopened = Journal::open(&root).unwrap();
+    let reopened = State::open(&root).unwrap();
     let records = reopened.read().unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].name, "demo");
@@ -505,48 +475,42 @@ fn append_persists_across_reopen() {
 }
 
 #[test]
-fn read_of_missing_journal_is_empty() {
+fn read_of_missing_snapshot_is_empty() {
     let root = temp_root("missing");
-    let journal = Journal::open(&root).unwrap();
-    assert!(journal.read().unwrap().is_empty());
+    let state = State::open(&root).unwrap();
+    assert!(state.read().unwrap().is_empty());
     std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
-fn fold_keeps_highest_generation_per_address() {
-    let records = vec![
-        record("demo", "1.0.0", 1),
-        record("demo", "1.0.0", 2),
-        record("other", "2.0.0", 1),
-        record("demo", "1.0.0", 3),
-    ];
-    let folded = fold(&records);
-    assert_eq!(folded.len(), 2);
-    assert_eq!(folded[0].name, "demo");
-    assert_eq!(folded[0].generation, 3);
-    assert_eq!(folded[1].name, "other");
-    assert_eq!(folded[1].generation, 1);
+fn commit_supersedes_one_address_and_keeps_others() {
+    let root = temp_root("supersede");
+    let state = State::open(&root).unwrap();
+    state.commit("demo", "1.0.0", Phase::Installed).unwrap();
+    state.commit("other", "2.0.0", Phase::Installed).unwrap();
+    state.commit("demo", "1.0.0", Phase::Deactivated).unwrap();
+    let records = state.read().unwrap();
+    assert_eq!(records.len(), 2);
+    let demo = records.iter().find(|record| record.name == "demo").unwrap();
+    assert_eq!(demo.generation, 2);
+    assert_eq!(demo.phase, Phase::Deactivated);
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
-fn older_generation_does_not_replace_newer() {
-    let records = vec![record("demo", "1.0.0", 5), record("demo", "1.0.0", 3)];
-    let folded = fold(&records);
-    assert_eq!(folded[0].generation, 5);
-}
-
-#[test]
-fn a_corrupt_line_is_an_error_not_silent_drop() {
+fn corrupt_snapshot_is_an_error_not_silent_drop() {
     let root = temp_root("corrupt");
-    let mut journal = Journal::open(&root).unwrap();
-    journal.append(&record("demo", "1.0.0", 1)).unwrap();
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(root.join(".pulith-state/journal.jsonl"))
-        .unwrap()
-        .write_all(b"not-json\n")
-        .unwrap();
-    let error = journal.read().unwrap_err();
-    assert!(matches!(error, StateError::Decode { line: 2, .. }));
+    let state = State::open(&root).unwrap();
+    state.commit("demo", "1.0.0", Phase::Installed).unwrap();
+    std::fs::write(root.join(".vtool/state/snapshot.json"), b"not-json").unwrap();
+    assert!(matches!(state.read(), Err(StateError::Decode { .. })));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn legacy_state_is_an_explicit_conflict() {
+    let root = temp_root("legacy");
+    std::fs::create_dir(root.join(".pulith-state")).unwrap();
+    assert!(matches!(State::open(&root), Err(StateError::Legacy { .. })));
     std::fs::remove_dir_all(&root).unwrap();
 }

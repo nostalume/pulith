@@ -18,11 +18,15 @@ use crate::{Acquire, Inspect, Reconcile};
 mod apply;
 #[cfg(any(feature = "zip", feature = "tar"))]
 mod materialize;
+mod record;
 mod view;
 
 pub use apply::{ApplyEvidence, RemoveEvidence};
 #[cfg(any(feature = "zip", feature = "tar"))]
 pub use materialize::{MaterializeError, PreparationEvidence};
+pub use record::{
+    RecordChange, RecordError, RecordEvidence, RecordLimit, RecordObservation, RecordStore,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkChange {

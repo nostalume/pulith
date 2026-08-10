@@ -1,6 +1,4 @@
-//! Crash/restart evidence for the vtool durable journal (s2-12 crash law): a child process is
-//! aborted at the journal-append (before fsync) and journal-fsync (after fsync) markers, and a
-//! restart observes the truthful recovery — before-fsync loses the record, after-fsync keeps it.
+//! Restart evidence for vtool's atomic state snapshot.
 
 #![cfg(all(
     feature = "local",
@@ -16,70 +14,41 @@ fn vtool() -> Command {
     Command::new(super::example("vtool"))
 }
 
-/// A throwaway layout root with a local-source manifest for `demo-tool` 1.2.0.
 struct Fixture {
     root: PathBuf,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("pulith-vtool-crash-{label}"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("vtool-{label}-"))
+            .tempdir()
+            .unwrap();
+        let root = temporary.keep();
         let source = root.join("source");
         std::fs::create_dir_all(source.join("bin")).unwrap();
-        std::fs::write(source.join("bin/tool"), b"crash-test bytes").unwrap();
-        let manifest = root.join("manifest.toml");
+        std::fs::write(source.join("bin/tool"), b"restart-test bytes").unwrap();
         let digest = {
             use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(source.join("bin/tool")).unwrap();
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let hex: String = hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            hex
+            hex::encode(Sha256::digest(b"restart-test bytes"))
         };
-        std::fs::write(
-            &manifest,
-            format!(
-                r#"
-name = "demo-tool"
-version = "1.2.0"
-expose = "bin"
-link_at = "{view}"
-
-[windows.source]
-kind = "local"
-path = "{source}"
-
-[windows.hash]
-kind = "sha2"
-hex = "{digest}"
-
-[linux.source]
-kind = "local"
-path = "{source}"
-
-[linux.hash]
-kind = "sha2"
-hex = "{digest}"
-"#,
-                view = root
-                    .join("views/demo-tool")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-                source = source.to_string_lossy().replace('\\', "/"),
-            ),
-        )
-        .unwrap();
+        std::fs::write(root.join("manifest.toml"), format!(
+            "name = \"demo-tool\"\nversion = \"1.2.0\"\n\n[windows.source]\nkind = \"local\"\npath = \"{source}\"\n\n[windows.hash]\nkind = \"sha2\"\nhex = \"{digest}\"\n\n[linux.source]\nkind = \"local\"\npath = \"{source}\"\n\n[linux.hash]\nkind = \"sha2\"\nhex = \"{digest}\"\n",
+            source = source.to_string_lossy().replace('\\', "/"),
+        )).unwrap();
         Self { root }
     }
 
-    fn journal(&self) -> PathBuf {
-        self.root.join(".pulith-state/journal.jsonl")
+    fn install(&self) -> std::process::ExitStatus {
+        vtool()
+            .args([
+                "install",
+                "--root",
+                self.root.to_str().unwrap(),
+                self.root.join("manifest.toml").to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
     }
 }
 
@@ -90,57 +59,24 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn crash_before_fsync_aborts_before_the_record_is_durable() {
-    let fixture = Fixture::new("before-fsync");
-    let status = vtool()
-        .args([
-            "install",
-            "--root",
-            fixture.root.to_str().unwrap(),
-            fixture.root.join("manifest.toml").to_str().unwrap(),
-        ])
-        .env("PULITH_VT_CRASH_AFTER", "journal-append")
-        .status()
-        .unwrap();
-    assert!(!status.success(), "the crash hook must abort the child");
-
-    // The effect ran before the crash: the target tree was published.
-    assert!(
-        fixture
-            .root
-            .join("artifacts/demo-tool/1.2.0/bin/tool")
-            .exists()
-    );
-    // A process-level abort keeps the OS page cache, so the line may still be visible; the
-    // durability boundary is the fsync, not the process exit — a power loss before fsync
-    // loses the record, which is exactly what recovery must not trust. The observable
-    // contract here is: the crash point is BEFORE the fsync (the after-fsync test below
-    // proves the record becomes durable once fsync runs).
+fn restart_reads_the_committed_snapshot() {
+    let fixture = Fixture::new("restart");
+    assert!(fixture.install().success());
+    let snapshot =
+        std::fs::read_to_string(fixture.root.join(".vtool/state/snapshot.json")).unwrap();
+    assert!(snapshot.contains("demo-tool"));
+    assert!(snapshot.contains("Installed"));
 }
 
 #[test]
-fn crash_after_fsync_keeps_the_record_as_truth() {
-    let fixture = Fixture::new("after-fsync");
-    let status = vtool()
-        .args([
-            "install",
-            "--root",
-            fixture.root.to_str().unwrap(),
-            fixture.root.join("manifest.toml").to_str().unwrap(),
-        ])
-        .env("PULITH_VT_CRASH_AFTER", "journal-fsync")
-        .status()
-        .unwrap();
-    assert!(!status.success(), "the crash hook must abort the child");
-
-    // The record is durable: the journal holds the committed Installed intent.
-    let journal = std::fs::read_to_string(fixture.journal()).unwrap();
-    assert!(
-        journal.contains("demo-tool"),
-        "committed record names the address"
-    );
-    assert!(
-        journal.contains("Installed"),
-        "committed phase is Installed"
-    );
+fn restart_reclaims_a_bounded_precommit_residue() {
+    let fixture = Fixture::new("residue");
+    let stage = fixture.root.join(".vtool/state/stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("snapshot.json"), b"interrupted").unwrap();
+    assert!(fixture.install().success());
+    assert!(!stage.join("snapshot.json").exists());
+    let snapshot =
+        std::fs::read_to_string(fixture.root.join(".vtool/state/snapshot.json")).unwrap();
+    assert!(snapshot.contains("demo-tool"));
 }
