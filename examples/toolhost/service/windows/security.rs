@@ -185,7 +185,10 @@ fn account_sid(account: &str) -> Result<Vec<u8>, ServiceError> {
             ) == 0
         }
     {
-        Err(ServiceError::invalid("resolve service SID"))
+        Err(ServiceError::os(
+            "resolve service SID",
+            std::io::Error::last_os_error(),
+        ))
     } else {
         Ok(sid)
     }
@@ -219,7 +222,7 @@ const LEAF_MUTATION: u32 = INPUT_MUTATION | FILE_DELETE_CHILD;
 
 fn inspect(path: &Path, forbidden: u32, require_directory: bool) -> Result<(), ServiceError> {
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| ServiceError::invalid(format!("inspect privileged root: {error}")))?;
+        .map_err(|error| ServiceError::operation("inspect privileged root", error))?;
     if (require_directory && !metadata.file_type().is_dir())
         || (!require_directory && !metadata.file_type().is_dir() && !metadata.file_type().is_file())
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -308,10 +311,13 @@ fn known(owner: PSID, kind: i32) -> bool {
     }
 }
 
-fn security(result: u32, action: &str) -> Result<(), ServiceError> {
+fn security(result: u32, action: &'static str) -> Result<(), ServiceError> {
     if result == 0 {
         Ok(())
     } else {
-        Err(ServiceError::invalid(format!("{action}: {result}")))
+        Err(ServiceError::os(
+            action,
+            std::io::Error::from_raw_os_error(result as i32),
+        ))
     }
 }

@@ -15,26 +15,100 @@ pub use lifecycle::{Boot, Change, Definition, Observation, Registration, Runtime
 #[path = "service/windows.rs"]
 mod platform;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptedEffect {
+    BindingChangeRequested,
+    DeletionRequested,
+}
+
 #[derive(Debug)]
-pub struct ServiceError(String);
+pub(crate) enum Failure {
+    Invalid,
+    Conflict(Observation),
+    Authority,
+    Operation,
+    Partial(AcceptedEffect, Observation),
+}
+
+#[derive(Debug)]
+pub struct ServiceError(Failure, std::io::Error);
 
 impl ServiceError {
     fn invalid(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self(Failure::Invalid, std::io::Error::other(message.into()))
     }
 
     fn effect<T, E: Display>(result: Result<T, E>) -> Result<T, Self> {
-        result.map_err(|error| Self::invalid(error.to_string()))
+        result.map_err(|error| Self::operation("", error))
+    }
+
+    fn conflict(subject: &'static str, observation: Observation) -> Self {
+        Self(
+            Failure::Conflict(observation),
+            Self::cause(subject, observation),
+        )
+    }
+
+    fn operation(action: &'static str, source: impl Display) -> Self {
+        Self(Failure::Operation, Self::cause(action, source))
+    }
+
+    fn os(action: &'static str, source: std::io::Error) -> Self {
+        let denied = source.kind() == std::io::ErrorKind::PermissionDenied
+            || source.raw_os_error() == Some(5);
+        let source = Self::cause(action, source);
+        if denied {
+            Self(Failure::Authority, source)
+        } else {
+            Self(Failure::Operation, source)
+        }
+    }
+
+    fn partial(
+        accepted: AcceptedEffect,
+        observation: Observation,
+        action: &'static str,
+        source: impl Display,
+    ) -> Self {
+        Self(
+            Failure::Partial(accepted, observation),
+            Self::cause(
+                action,
+                format_args!("{source}; accepted={accepted} {observation}"),
+            ),
+        )
+    }
+
+    fn cause(action: &'static str, source: impl Display) -> std::io::Error {
+        let message = if action.is_empty() {
+            source.to_string()
+        } else {
+            format!("{action}: {source}")
+        };
+        std::io::Error::other(message)
     }
 }
 
 impl Display for ServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        Display::fmt(&self.1, formatter)
     }
 }
 
-impl std::error::Error for ServiceError {}
+impl Display for AcceptedEffect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BindingChangeRequested => "binding-change-requested",
+            Self::DeletionRequested => "deletion-requested",
+        })
+    }
+}
+
+impl std::error::Error for ServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.1)
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

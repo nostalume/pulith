@@ -91,6 +91,46 @@ fn observations_have_one_stable_cross_platform_rendering() {
 }
 
 #[test]
+fn service_errors_preserve_conflict_and_accepted_progress() {
+    let observation = Observation {
+        definition: Definition::Exact,
+        registration: Registration::Removing,
+        boot: Boot::Conflict,
+        runtime: Runtime::Stopping,
+    };
+    let conflict = ServiceError::conflict("registration changed", observation);
+    assert!(matches!(
+        conflict.0,
+        Failure::Conflict(observed) if observed == observation
+    ));
+
+    let partial = ServiceError::partial(
+        AcceptedEffect::DeletionRequested,
+        observation,
+        "await service deletion",
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline exceeded"),
+    );
+    assert!(matches!(
+        partial.0,
+        Failure::Partial(AcceptedEffect::DeletionRequested, observed)
+            if observed == observation
+    ));
+
+    assert!(matches!(
+        ServiceError::os("open service manager", std::io::Error::from_raw_os_error(5),).0,
+        Failure::Authority
+    ));
+    assert!(matches!(
+        ServiceError::operation("read service declaration", "missing").0,
+        Failure::Operation
+    ));
+    assert_eq!(
+        AcceptedEffect::BindingChangeRequested.to_string(),
+        "binding-change-requested"
+    );
+}
+
+#[test]
 fn manager_definition_pins_one_immutable_release() {
     let temporary = tempfile::tempdir().unwrap();
     let root = ServiceRoot(temporary.path().canonicalize().unwrap());
@@ -123,18 +163,46 @@ fn manager_definition_pins_one_immutable_release() {
 #[test]
 fn scm_install_policy_is_least_privilege() {
     assert_eq!(platform::ACCOUNT, "NT AUTHORITY\\LocalService");
-    assert_eq!(platform::SID_TYPE, 3);
-    assert!(platform::REQUIRED_PRIVILEGES.is_empty());
+    assert_eq!(platform::scm::SID_TYPE, 3);
+    assert!(platform::scm::REQUIRED_PRIVILEGES.is_empty());
     assert_eq!(
-        platform::CREATED_ACCESS,
+        platform::scm::CREATED_ACCESS,
         windows_sys::Win32::System::Services::SERVICE_CHANGE_CONFIG
             | windows_sys::Win32::System::Services::SERVICE_QUERY_CONFIG
             | windows_sys::Win32::System::Services::SERVICE_QUERY_STATUS
     );
     assert_ne!(
-        platform::CREATED_ACCESS,
+        platform::scm::CREATED_ACCESS,
         windows_sys::Win32::System::Services::SERVICE_ALL_ACCESS
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn scm_operation_rights_are_exact() {
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+    use windows_sys::Win32::System::Services::*;
+
+    assert_eq!(
+        platform::scm::OBSERVE_ACCESS,
+        SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS
+    );
+    assert_eq!(platform::scm::BINDING_ACCESS, SERVICE_QUERY_CONFIG);
+    assert_eq!(
+        platform::scm::REPAIR_ACCESS,
+        SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS
+    );
+    assert_eq!(platform::scm::CONFIGURE_ACCESS, SERVICE_CHANGE_CONFIG);
+    assert_eq!(platform::scm::REBIND_ACCESS, SERVICE_CHANGE_CONFIG);
+    assert_eq!(
+        platform::scm::START_ACCESS,
+        SERVICE_START | SERVICE_QUERY_STATUS
+    );
+    assert_eq!(
+        platform::scm::STOP_ACCESS,
+        SERVICE_STOP | SERVICE_QUERY_STATUS
+    );
+    assert_eq!(platform::scm::REMOVE_ACCESS, DELETE | SERVICE_QUERY_CONFIG);
 }
 
 #[cfg(windows)]

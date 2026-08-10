@@ -21,9 +21,9 @@ impl Service {
             return Ok(Change::unchanged(before));
         }
         if before.definition == Definition::Exact && before.registration == Registration::Broken {
-            let binding = platform::binding(&self.root, &self.declaration)?;
+            let binding = self.platform().binding()?;
             self.root.admit_exposure(&binding, &self.declaration)?;
-            platform::repair(&self.root, &self.declaration)?;
+            self.platform().repair()?;
             return self.changed();
         }
         if !matches!(before.definition, Definition::Missing | Definition::Exact)
@@ -37,7 +37,7 @@ impl Service {
             self.root.publish(&self.declaration)?;
         }
         self.root.admit_exposure(&binding, &self.declaration)?;
-        platform::install(&self.root, &self.declaration, &binding)?;
+        self.platform().install(&binding)?;
         self.changed()
     }
 
@@ -49,9 +49,9 @@ impl Service {
         if before.boot != Boot::Disabled {
             return Err(ServiceError::invalid("boot state conflicts"));
         }
-        let binding = platform::binding(&self.root, &self.declaration)?;
+        let binding = self.platform().binding()?;
         self.root.admit_exposure(&binding, &self.declaration)?;
-        platform::enable(&self.root, &self.declaration)?;
+        self.platform().enable()?;
         self.changed()
     }
 
@@ -62,7 +62,7 @@ impl Service {
         }
         let binding = self.root.active_binding(&self.declaration)?;
         self.root.admit_exposure(&binding, &self.declaration)?;
-        platform::rebind(&self.root, &self.declaration, &binding)?;
+        self.platform().rebind(&binding)?;
         self.changed()
     }
 
@@ -74,7 +74,7 @@ impl Service {
         if before.runtime != Runtime::Stopped {
             return Err(ServiceError::invalid("stop service before disabling"));
         }
-        platform::disable(&self.root, &self.declaration)?;
+        self.platform().disable()?;
         self.changed()
     }
 
@@ -86,9 +86,9 @@ impl Service {
         if before.runtime != Runtime::Stopped {
             return Err(ServiceError::invalid("runtime is not stopped"));
         }
-        let binding = platform::binding(&self.root, &self.declaration)?;
+        let binding = self.platform().binding()?;
         self.root.admit_exposure(&binding, &self.declaration)?;
-        platform::start(&self.root, &self.declaration)?;
+        self.platform().start()?;
         self.changed()
     }
 
@@ -102,16 +102,16 @@ impl Service {
                 "runtime transition already in progress",
             ));
         }
-        platform::stop(&self.root, &self.declaration)?;
+        self.platform().stop()?;
         self.changed()
     }
 
     pub fn restart(self) -> Result<Change, ServiceError> {
         let before = self.exact()?;
-        let binding = platform::binding(&self.root, &self.declaration)?;
+        let binding = self.platform().binding()?;
         self.root.admit_exposure(&binding, &self.declaration)?;
         match before.runtime {
-            Runtime::Running | Runtime::Failed => platform::stop(&self.root, &self.declaration)?,
+            Runtime::Running | Runtime::Failed => self.platform().stop()?,
             Runtime::Stopped => {}
             _ => {
                 return Err(ServiceError::invalid(
@@ -119,7 +119,7 @@ impl Service {
                 ));
             }
         }
-        platform::start(&self.root, &self.declaration)?;
+        self.platform().start()?;
         self.changed()
     }
 
@@ -133,7 +133,7 @@ impl Service {
                 "remove requires stopped and disabled",
             ));
         }
-        platform::remove(&self.root, &self.declaration)?;
+        self.platform().remove()?;
         self.root.recheck()?;
         let target = ServiceError::effect(pulith::local::LocalTarget::new(
             self.root.directory(&self.declaration),
@@ -153,7 +153,7 @@ impl Service {
 
     fn observe(&self) -> Result<Observation, ServiceError> {
         let definition = self.root.observe(&self.declaration)?;
-        let manager = platform::observe(&self.root, &self.declaration)?;
+        let manager = self.platform().observe()?;
         Ok(Observation {
             definition,
             registration: manager.registration,
@@ -167,6 +167,10 @@ impl Service {
             changed: true,
             observation: self.observe()?,
         })
+    }
+
+    fn platform(&self) -> platform::PlatformService<'_> {
+        platform::PlatformService::new(&self.root, &self.declaration)
     }
 }
 

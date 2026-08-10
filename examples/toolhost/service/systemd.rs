@@ -6,6 +6,17 @@ use pulith::Remove;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+pub(super) struct PlatformService<'a> {
+    root: &'a ServiceRoot,
+    declaration: &'a NormalizedDecl,
+}
+
+impl<'a> PlatformService<'a> {
+    pub(super) fn new(root: &'a ServiceRoot, declaration: &'a NormalizedDecl) -> Self {
+        Self { root, declaration }
+    }
+}
+
 pub fn secure_leaf(path: &Path) -> Result<(), ServiceError> {
     secure(path, "root", |metadata| {
         metadata.file_type().is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
@@ -45,49 +56,48 @@ fn secure(
     }
 }
 
-pub fn observe(
-    root: &ServiceRoot,
-    declaration: &NormalizedDecl,
-) -> Result<ManagerObservation, ServiceError> {
-    let unit = unit_path(root, declaration);
-    let registration = match std::fs::read_to_string(&unit) {
-        Ok(text) => binding_from_unit(root, declaration, &text)
-            .map(|binding| text == render_definition(root, declaration, &binding))
-            .is_ok_and(|exact| exact)
-            .then_some(Registration::Exact)
-            .unwrap_or(Registration::Conflict),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registration::Missing,
-        Err(error) => return Err(ServiceError::invalid(format!("read systemd unit: {error}"))),
-    };
-    if registration != Registration::Exact {
-        return Ok(ManagerObservation {
-            registration,
-            boot: Boot::Disabled,
-            runtime: Runtime::Stopped,
-        });
+impl PlatformService<'_> {
+    pub(super) fn observe(&self) -> Result<ManagerObservation, ServiceError> {
+        let unit = unit_path(self.root, self.declaration);
+        let registration = match std::fs::read_to_string(&unit) {
+            Ok(text) => binding_from_unit(self.root, self.declaration, &text)
+                .map(|binding| text == render_definition(self.root, self.declaration, &binding))
+                .is_ok_and(|exact| exact)
+                .then_some(Registration::Exact)
+                .unwrap_or(Registration::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registration::Missing,
+            Err(error) => return Err(ServiceError::invalid(format!("read systemd unit: {error}"))),
+        };
+        if registration != Registration::Exact {
+            return Ok(ManagerObservation {
+                registration,
+                boot: Boot::Disabled,
+                runtime: Runtime::Stopped,
+            });
+        }
+        let output = systemctl(
+            self.root,
+            [
+                "show",
+                self.declaration.id.as_str(),
+                "--property=LoadState",
+                "--property=UnitFileState",
+                "--property=ActiveState",
+            ],
+        )?;
+        let text = String::from_utf8(output)
+            .map_err(|_| ServiceError::invalid("systemctl output is not UTF-8"))?;
+        Ok(parse_observation(&text))
     }
-    let output = systemctl(
-        root,
-        [
-            "show",
-            declaration.id.as_str(),
-            "--property=LoadState",
-            "--property=UnitFileState",
-            "--property=ActiveState",
-        ],
-    )?;
-    let text = String::from_utf8(output)
-        .map_err(|_| ServiceError::invalid("systemctl output is not UTF-8"))?;
-    Ok(parse_observation(&text))
-}
 
-pub fn binding(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<Binding, ServiceError> {
-    let text = std::fs::read_to_string(unit_path(root, declaration))
-        .map_err(|error| ServiceError::invalid(format!("read systemd unit: {error}")))?;
-    let binding = binding_from_unit(root, declaration, &text)?;
-    (text == render_definition(root, declaration, &binding))
-        .then_some(binding)
-        .ok_or_else(|| ServiceError::invalid("systemd unit conflicts"))
+    pub(super) fn binding(&self) -> Result<Binding, ServiceError> {
+        let text = std::fs::read_to_string(unit_path(self.root, self.declaration))
+            .map_err(|error| ServiceError::invalid(format!("read systemd unit: {error}")))?;
+        let binding = binding_from_unit(self.root, self.declaration, &text)?;
+        (text == render_definition(self.root, self.declaration, &binding))
+            .then_some(binding)
+            .ok_or_else(|| ServiceError::invalid("systemd unit conflicts"))
+    }
 }
 
 pub(super) fn parse_observation(text: &str) -> ManagerObservation {
@@ -116,58 +126,52 @@ pub(super) fn parse_observation(text: &str) -> ManagerObservation {
     }
 }
 
-pub fn install(
-    root: &ServiceRoot,
-    declaration: &NormalizedDecl,
-    binding: &Binding,
-) -> Result<(), ServiceError> {
-    let path = unit_path(root, declaration);
-    if path.exists() {
-        return Err(ServiceError::invalid("systemd unit already exists"));
+impl PlatformService<'_> {
+    pub(super) fn install(&self, binding: &Binding) -> Result<(), ServiceError> {
+        let path = unit_path(self.root, self.declaration);
+        if path.exists() {
+            return Err(ServiceError::invalid("systemd unit already exists"));
+        }
+        self.root.write_unit(self.declaration, binding)?;
+        link(self.root, self.declaration)?;
+        Ok(())
     }
-    root.write_unit(declaration, binding)?;
-    link(root, declaration)?;
-    Ok(())
-}
 
-pub fn repair(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    link(root, declaration)?;
-    systemctl(root, ["daemon-reload"]).map(drop)
-}
+    pub(super) fn repair(&self) -> Result<(), ServiceError> {
+        link(self.root, self.declaration)?;
+        systemctl(self.root, ["daemon-reload"]).map(drop)
+    }
 
-pub fn enable(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    systemctl(root, ["enable", declaration.id.as_str()]).map(drop)
-}
-pub fn disable(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    systemctl(root, ["disable", declaration.id.as_str()])?;
-    link(root, declaration)?;
-    Ok(())
-}
+    pub(super) fn enable(&self) -> Result<(), ServiceError> {
+        systemctl(self.root, ["enable", self.declaration.id.as_str()]).map(drop)
+    }
+    pub(super) fn disable(&self) -> Result<(), ServiceError> {
+        systemctl(self.root, ["disable", self.declaration.id.as_str()])?;
+        link(self.root, self.declaration)?;
+        Ok(())
+    }
 
-pub fn rebind(
-    root: &ServiceRoot,
-    declaration: &NormalizedDecl,
-    binding: &Binding,
-) -> Result<(), ServiceError> {
-    let path = unit_path(root, declaration);
-    let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
-    ServiceError::effect(target.remove())?;
-    root.write_unit(declaration, binding)?;
-    systemctl(root, ["daemon-reload"]).map(drop)
-}
-pub fn start(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    systemctl(root, ["start", declaration.id.as_str()]).map(drop)
-}
-pub fn stop(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    systemctl(root, ["stop", declaration.id.as_str()]).map(drop)
-}
+    pub(super) fn rebind(&self, binding: &Binding) -> Result<(), ServiceError> {
+        let path = unit_path(self.root, self.declaration);
+        let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
+        ServiceError::effect(target.remove())?;
+        self.root.write_unit(self.declaration, binding)?;
+        systemctl(self.root, ["daemon-reload"]).map(drop)
+    }
+    pub(super) fn start(&self) -> Result<(), ServiceError> {
+        systemctl(self.root, ["start", self.declaration.id.as_str()]).map(drop)
+    }
+    pub(super) fn stop(&self) -> Result<(), ServiceError> {
+        systemctl(self.root, ["stop", self.declaration.id.as_str()]).map(drop)
+    }
 
-pub fn remove(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
-    systemctl(root, ["disable", declaration.id.as_str()])?;
-    let path = unit_path(root, declaration);
-    let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
-    ServiceError::effect(target.remove())?;
-    Ok(())
+    pub(super) fn remove(&self) -> Result<(), ServiceError> {
+        systemctl(self.root, ["disable", self.declaration.id.as_str()])?;
+        let path = unit_path(self.root, self.declaration);
+        let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
+        ServiceError::effect(target.remove())?;
+        Ok(())
+    }
 }
 
 fn link(root: &ServiceRoot, declaration: &NormalizedDecl) -> Result<(), ServiceError> {
