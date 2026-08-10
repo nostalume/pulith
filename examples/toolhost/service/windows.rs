@@ -36,19 +36,13 @@ impl<'a> WindowsService<'a> {
             scm::OpenedService::Present(service) => service,
         };
         let config = service.config()?;
-        let binding = self.binding_from_command(&config.command).ok();
-        let exact = binding.as_ref().is_some_and(|binding| {
-            config.command == render_definition(self.root, self.declaration, binding)
-                && config.account.eq_ignore_ascii_case(ACCOUNT)
-        });
-        let registration = if !exact {
-            Registration::Conflict
-        } else if service.security_is_exact()?
-            && self.state().is_exact(binding.as_ref().unwrap())?
-        {
-            Registration::Exact
-        } else {
-            Registration::Broken
+        let binding = self.admit_binding(&config).ok();
+        let registration = match binding {
+            None => Registration::Conflict,
+            Some(binding) if service.security_is_exact()? && self.state().is_exact(&binding)? => {
+                Registration::Exact
+            }
+            Some(_) => Registration::Broken,
         };
         Ok(ManagerObservation {
             registration,
@@ -63,12 +57,7 @@ impl<'a> WindowsService<'a> {
 
     pub(super) fn binding(&self) -> Result<Binding, ServiceError> {
         let config = scm::binding(self.declaration)?.config()?;
-        let binding = self.binding_from_command(&config.command)?;
-        if config.command == render_definition(self.root, self.declaration, &binding) {
-            Ok(binding)
-        } else {
-            Err(ServiceError::invalid("service binding conflicts"))
-        }
+        self.admit_binding(&config)
     }
 
     pub(super) fn install(&self, binding: &Binding) -> Result<(), ServiceError> {
@@ -100,22 +89,19 @@ impl<'a> WindowsService<'a> {
     }
 
     pub(super) fn rebind(&self, binding: &Binding) -> Result<(), ServiceError> {
-        let observed = self.binding()?;
+        let service = scm::rebind(self.declaration)?;
+        let config = service.config()?;
+        let observed = self.admit_rebind(&config, service.security_is_exact()?)?;
         let transition = self.state().begin_rebind(&observed, binding)?;
         transition.ensure_target()?;
-        if transition.needs_switch(&observed)? {
-            let service = scm::rebind(self.declaration)?;
-            let config = service.config()?;
-            let current = self.binding_from_command(&config.command)?;
-            if !transition.needs_switch(&current)? {
-                return Err(ServiceError::invalid(
-                    "manager binding changed during rebind",
-                ));
-            }
+        let config = service.config()?;
+        let current = self.admit_rebind(&config, service.security_is_exact()?)?;
+        if transition.needs_switch(&current)? {
             let command = render_definition(self.root, self.declaration, binding);
             service.set_binding(&command)?;
         }
-        let observed = self.binding()?;
+        let config = service.config()?;
+        let observed = self.admit_rebind(&config, service.security_is_exact()?)?;
         transition.finish(&observed)
     }
 
@@ -176,6 +162,28 @@ impl<'a> WindowsService<'a> {
             .and_then(|command| command.strip_suffix(&suffix))
             .ok_or_else(|| ServiceError::invalid("service command shape conflicts"))?;
         Binding::from_host(self.root, Path::new(host), self.declaration)
+    }
+
+    fn admit_binding(&self, config: &scm::ServiceConfig) -> Result<Binding, ServiceError> {
+        let binding = self.binding_from_command(&config.command)?;
+        if config.command == render_definition(self.root, self.declaration, &binding)
+            && config.account.eq_ignore_ascii_case(ACCOUNT)
+        {
+            Ok(binding)
+        } else {
+            Err(ServiceError::invalid("service registration conflicts"))
+        }
+    }
+
+    pub(super) fn admit_rebind(
+        &self,
+        config: &scm::ServiceConfig,
+        security_exact: bool,
+    ) -> Result<Binding, ServiceError> {
+        let binding = self.admit_binding(config)?;
+        security_exact
+            .then_some(binding)
+            .ok_or_else(|| ServiceError::invalid("service security conflicts"))
     }
 }
 

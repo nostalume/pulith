@@ -95,10 +95,7 @@ impl<'a> AccessState<'a> {
         if !self.matches(&receipt, binding)? {
             return Ok(false);
         }
-        let account = self.account();
-        self.plan(binding).iter().try_fold(true, |exact, grant| {
-            Ok(exact && security::has_access(grant, &account)?)
-        })
+        self.grants_are_exact(binding)
     }
 
     pub(super) fn begin_rebind(
@@ -246,7 +243,16 @@ impl<'a> AccessState<'a> {
         for (grant, fact) in self.plan(&binding).iter().zip(&receipt.grants) {
             security::apply(grant, &account, fact.ownership == Ownership::Created)?;
         }
-        Ok(())
+        self.grants_are_exact(&binding)?
+            .then_some(())
+            .ok_or_else(|| ServiceError::invalid("service access remains inexact"))
+    }
+
+    fn grants_are_exact(&self, binding: &Binding) -> Result<bool, ServiceError> {
+        let account = self.account();
+        self.plan(binding).iter().try_fold(true, |exact, grant| {
+            Ok(exact && security::has_access(grant, &account)?)
+        })
     }
 
     fn parse_receipt(&self, bytes: &[u8]) -> Result<AccessReceipt, ServiceError> {

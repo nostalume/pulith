@@ -261,7 +261,10 @@ fn scm_operation_rights_are_exact() {
         SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS
     );
     assert_eq!(platform::scm::CONFIGURE_ACCESS, SERVICE_CHANGE_CONFIG);
-    assert_eq!(platform::scm::REBIND_ACCESS, SERVICE_CHANGE_CONFIG);
+    assert_eq!(
+        platform::scm::REBIND_ACCESS,
+        SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG
+    );
     assert_eq!(
         platform::scm::START_ACCESS,
         SERVICE_START | SERVICE_QUERY_STATUS
@@ -271,6 +274,42 @@ fn scm_operation_rights_are_exact() {
         SERVICE_STOP | SERVICE_QUERY_STATUS
     );
     assert_eq!(platform::scm::REMOVE_ACCESS, DELETE | SERVICE_QUERY_CONFIG);
+}
+
+#[cfg(windows)]
+#[test]
+fn scm_rebind_admits_only_exact_owned_registration() {
+    let (temporary, root, declaration, binding) = windows_binding();
+    let service = platform::WindowsService::new(&root, &declaration);
+    let mut config = platform::scm::ServiceConfig {
+        command: platform::render_definition(&root, &declaration, &binding),
+        start_type: windows_sys::Win32::System::Services::SERVICE_DEMAND_START,
+        account: platform::ACCOUNT.to_owned(),
+    };
+    assert!(service.admit_rebind(&config, true).is_ok());
+    config.command.push(' ');
+    assert!(service.admit_rebind(&config, true).is_err());
+    config.command.pop();
+    config.account = "LocalSystem".to_owned();
+    assert!(service.admit_rebind(&config, true).is_err());
+    config.account = platform::ACCOUNT.to_owned();
+    assert!(service.admit_rebind(&config, false).is_err());
+    drop(temporary);
+}
+
+#[cfg(windows)]
+fn windows_binding() -> (tempfile::TempDir, ServiceRoot, NormalizedDecl, Binding) {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = ServiceRoot(temporary.path().canonicalize().unwrap());
+    let release = root.0.join("installs/tool/1");
+    std::fs::create_dir_all(release.join("service")).unwrap();
+    std::fs::create_dir_all(release.join("bin")).unwrap();
+    let declaration = ServiceDecl::parse(VALID).unwrap().normalize().unwrap();
+    let executable = format!("indexer{}", std::env::consts::EXE_SUFFIX);
+    std::fs::write(release.join("service").join(&executable), b"host").unwrap();
+    std::fs::write(release.join("bin").join(executable), b"payload").unwrap();
+    let binding = Binding::admit(&root, release, &declaration).unwrap();
+    (temporary, root, declaration, binding)
 }
 
 #[cfg(windows)]

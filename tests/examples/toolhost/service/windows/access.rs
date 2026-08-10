@@ -60,3 +60,68 @@ fn records_reject_unknown_fields() {
     let text = "schema = 1\nrelease = 'installs/indexer/1'\nunknown = true\ngrants = []\n";
     assert!(toml::from_str::<AccessReceipt>(text).is_err());
 }
+
+#[test]
+fn rebind_intent_admits_source_and_target_retries_only() {
+    let (temporary, root, declaration, bindings) = bindings();
+    let state = AccessState {
+        root: &root,
+        declaration: &declaration,
+    };
+    let stable = receipt(&state, &bindings[0]);
+    let intent = RebindIntent {
+        schema: 1,
+        from: receipt(&state, &bindings[0]),
+        to: receipt(&state, &bindings[1]),
+    };
+    state
+        .validate_intent(&intent, &stable, &bindings[0], &bindings[1])
+        .unwrap();
+    state
+        .validate_intent(&intent, &stable, &bindings[1], &bindings[1])
+        .unwrap();
+    assert!(
+        state
+            .validate_intent(&intent, &stable, &bindings[2], &bindings[1])
+            .is_err()
+    );
+    drop(temporary);
+}
+
+fn bindings() -> (
+    tempfile::TempDir,
+    ServiceRoot,
+    crate::service::NormalizedDecl,
+    [Binding; 3],
+) {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = ServiceRoot(temporary.path().canonicalize().unwrap());
+    let declaration = ServiceDecl::parse(DECLARATION)
+        .unwrap()
+        .normalize()
+        .unwrap();
+    let releases = ["1", "2", "3"].map(|version| {
+        let release = root.0.join("installs/indexer").join(version);
+        std::fs::create_dir_all(release.join("service")).unwrap();
+        std::fs::create_dir_all(release.join("bin")).unwrap();
+        let executable = format!("indexer{}", std::env::consts::EXE_SUFFIX);
+        std::fs::write(release.join("service").join(&executable), b"host").unwrap();
+        std::fs::write(release.join("bin").join(executable), b"payload").unwrap();
+        Binding::admit(&root, release, &declaration).unwrap()
+    });
+    (temporary, root, declaration, releases)
+}
+
+fn receipt(state: &AccessState<'_>, binding: &Binding) -> AccessReceipt {
+    let plan = state.plan(binding);
+    AccessReceipt {
+        schema: 1,
+        release: relative(state.root, &binding.release).unwrap(),
+        grants: [0, 1].map(|index| GrantReceipt {
+            path: relative(state.root, &plan[index].path).unwrap(),
+            mask: plan[index].mask,
+            inheritance: plan[index].inheritance,
+            ownership: Ownership::Created,
+        }),
+    }
+}

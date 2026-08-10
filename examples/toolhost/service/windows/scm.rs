@@ -8,7 +8,7 @@ pub(crate) const BINDING_ACCESS: u32 = SERVICE_QUERY_CONFIG;
 pub(crate) const REPAIR_ACCESS: u32 =
     SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS;
 pub(crate) const CONFIGURE_ACCESS: u32 = SERVICE_CHANGE_CONFIG;
-pub(crate) const REBIND_ACCESS: u32 = SERVICE_CHANGE_CONFIG;
+pub(crate) const REBIND_ACCESS: u32 = SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG;
 pub(crate) const START_ACCESS: u32 = SERVICE_START | SERVICE_QUERY_STATUS;
 pub(crate) const STOP_ACCESS: u32 = SERVICE_STOP | SERVICE_QUERY_STATUS;
 pub(crate) const REMOVE_ACCESS: u32 = DELETE | SERVICE_QUERY_CONFIG;
@@ -26,7 +26,7 @@ pub(super) enum OpenedService {
     Present(ServiceHandle),
 }
 
-pub(super) struct ServiceConfig {
+pub(crate) struct ServiceConfig {
     pub command: String,
     pub start_type: u32,
     pub account: String,
