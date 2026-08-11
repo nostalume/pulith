@@ -119,16 +119,28 @@ pub fn absolute_program() -> PathBuf {
 
 #[cfg(all(feature = "process", windows))]
 pub fn windows_shell_environment() -> Vec<(OsString, OsString)> {
-    ["SystemRoot", "TEMP", "TMP"]
-        .into_iter()
-        .map(|key| {
-            (
-                OsString::from(key),
-                std::env::var_os(key)
-                    .unwrap_or_else(|| panic!("{key} is required by the Windows process fixture")),
-            )
-        })
-        .collect()
+    // Windows PowerShell derives its runtime, profile, and module locations from these entries.
+    // Admitting them explicitly keeps fixture startup deterministic without inheriting unrelated
+    // caller variables (the contract exercised by `worktree_env_vars_do_not_inherit_caller_entries`).
+    [
+        "SystemRoot",
+        "WINDIR",
+        "ComSpec",
+        "PATHEXT",
+        "Path",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramData",
+        "PSModulePath",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value)))
+    .collect()
 }
 
 /// Builds the `MARKER` (+ `LOOP_SCRIPT` on windows) environment for a descendant-loop fixture.
