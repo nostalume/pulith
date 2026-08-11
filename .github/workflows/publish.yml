@@ -1,49 +1,45 @@
 name: Publish crate
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Version already present in Cargo.toml
-        required: true
-        type: string
-      revision:
-        description: Full audited commit SHA on main
-        required: true
-        type: string
-      confirm:
-        description: Type publish to admit the irreversible registry write
-        required: true
-        type: string
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    if: github.ref == 'refs/heads/main' && inputs.confirm == 'publish'
+  verify:
+    name: Verify release tag
     runs-on: ubuntu-latest
-    environment: publish
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      sha256: ${{ steps.artifact.outputs.sha256 }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-10
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
-      - name: Admit revision and version
+      - name: Admit tag, revision, and version
+        id: release
         shell: bash
-        env:
-          EXPECTED_REVISION: ${{ inputs.revision }}
-          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
           set -eu
-          test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
-          actual="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          test "$actual" = "$EXPECTED_VERSION"
+          git rev-parse --verify refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$(git rev-parse HEAD)"
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "pulith"))')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -52,13 +48,53 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings -D missing-docs
         run: cargo doc --locked --all-features --no-deps
-      - run: cargo package --locked
-      - run: sha256sum target/package/pulith-${{ inputs.version }}.crate
+
+      - name: Package and identify artifact
+        id: artifact
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+          cargo package --locked
+          cargo package --list
+          archive="target/package/pulith-$VERSION.crate"
+          sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "$sha256  $archive"
+
+  publish:
+    name: Publish verified crate
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-10
+
+      - name: Reproduce admitted artifact
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.verify.outputs.sha256 }}
+        run: |
+          set -eu
+          actual="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "pulith"))')"
+          test "$actual" = "$EXPECTED_VERSION"
+          test "$GITHUB_REF_NAME" = "v$actual"
+          cargo package --locked --no-verify
+          archive="target/package/pulith-$actual.crate"
+          test "$(sha256sum "$archive" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256"
 
       - name: Acquire short-lived crates.io token
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-      - name: Publish admitted revision
-        run: cargo publish --locked
+
+      - name: Publish verified artifact
+        run: cargo publish --locked --no-verify --registry crates-io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
