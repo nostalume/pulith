@@ -214,9 +214,21 @@ fn async_drop_cancellation_stops_the_admitted_tree() {
             let mut context = std::task::Context::from_waker(&waker);
             // First poll starts the spawn and reaches the awaited wait loop.
             let _ = future.as_mut().poll(&mut context);
-            // Let the admitted tree start writing; the pinned future value then drops at the
-            // end of this scope, running the Drop guard that stops the tree.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Wait for the descendant's observable ready signal instead of assuming a fixed shell
+            // startup time. The pinned future then drops at the end of this scope, running the
+            // Drop guard that stops the tree.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while std::fs::metadata(&marker)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+                == 0
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "descendant did not become ready before cancellation"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     });
 
