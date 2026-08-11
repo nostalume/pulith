@@ -22,23 +22,36 @@ use std::path::{Path, PathBuf};
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum HashError {
+    /// The digest mismatch outcome.
     DigestMismatch {
+        /// The expected value.
         expected: String,
+        /// The observed value.
         observed: String,
     },
+    /// The artifact size mismatch outcome.
     ArtifactSizeMismatch {
+        /// The expected value.
         expected: u64,
+        /// The observed value.
         observed: u64,
     },
+    /// The unsupported digest material outcome.
     UnsupportedDigestMaterial(PathBuf),
     /// Local artifact inspection failed before hashing could begin.
     LocalArtifact {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: Box<crate::local::LocalError>,
     },
+    /// The io outcome.
     Io {
+        /// The action value.
         action: &'static str,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
@@ -101,6 +114,7 @@ impl std::error::Error for HashError {
 /// file (`file`) whose path is `path` and return the hex digest string together with the byte
 /// count hashed.
 pub trait DigestAlgorithm {
+    /// Digests an already opened regular file and returns both digest and observed size.
     fn digest_opened_file_with_size(
         file: &mut File,
         path: &Path,
@@ -109,10 +123,12 @@ pub trait DigestAlgorithm {
 
 #[cfg(feature = "blake3")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Compile-time selector for BLAKE3 digest computation.
 pub struct Blake3;
 
 #[cfg(feature = "sha2")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Compile-time selector for SHA-256 digest computation.
 pub struct Sha256;
 
 /// The declared digest algorithm, as data.
@@ -122,7 +138,9 @@ pub struct Sha256;
 /// data-driven entries (e.g. materialization) dispatch on it once in core.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DigestAlgorithmKind {
+    /// The blake3 outcome.
     Blake3,
+    /// The sha256 outcome.
     Sha256,
 }
 
@@ -148,10 +166,12 @@ impl DigestValue {
         }
     }
 
+    /// Returns the algorithm carried by this digest value.
     pub fn algorithm(&self) -> DigestAlgorithmKind {
         self.algorithm
     }
 
+    /// Returns the normalized lowercase hexadecimal digest.
     pub fn as_str(&self) -> &str {
         &self.value
     }
@@ -207,9 +227,13 @@ impl<'de> serde::Deserialize<'de> for DigestValue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Expected and observed digest values from successful byte verification.
 pub struct DigestEvidence {
+    /// The algorithm value.
     pub algorithm: DigestAlgorithmKind,
+    /// The expected value.
     pub expected: DigestValue,
+    /// The observed value.
     pub observed: DigestValue,
 }
 
@@ -219,11 +243,14 @@ pub struct DigestEvidence {
 /// expectation's publisher or provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactDescriptor {
+    /// The digest value.
     pub digest: DigestValue,
+    /// The size value.
     pub size: u64,
 }
 
 impl ArtifactDescriptor {
+    /// Constructs an exact artifact descriptor from digest algorithm, value, and byte size.
     pub fn new(algorithm: DigestAlgorithmKind, digest: impl Into<String>, size: u64) -> Self {
         Self {
             digest: DigestValue::new(algorithm, digest).expect("valid descriptor digest"),
@@ -233,9 +260,13 @@ impl ArtifactDescriptor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Expected and observed size-plus-digest descriptors from exact verification.
 pub struct DescriptorEvidence {
+    /// The algorithm value.
     pub algorithm: DigestAlgorithmKind,
+    /// The expected value.
     pub expected: ArtifactDescriptor,
+    /// The observed value.
     pub observed: ArtifactDescriptor,
 }
 
@@ -243,6 +274,7 @@ pub struct DescriptorEvidence {
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactInspectEvidence {
+    /// The algorithm value.
     pub algorithm: DigestAlgorithmKind,
 }
 
@@ -250,17 +282,27 @@ pub struct ArtifactInspectEvidence {
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactReconciliation {
+    /// The matches outcome.
     Matches,
+    /// The missing outcome.
     Missing,
+    /// The wrong kind outcome.
     WrongKind {
+        /// The observed value.
         observed: crate::local::LocalEntryKind,
     },
+    /// The size mismatch outcome.
     SizeMismatch {
+        /// The expected value.
         expected: u64,
+        /// The observed value.
         observed: u64,
     },
+    /// The digest mismatch outcome.
     DigestMismatch {
+        /// The expected value.
         expected: DigestValue,
+        /// The observed value.
         observed: DigestValue,
     },
 }
@@ -269,7 +311,9 @@ pub enum ArtifactReconciliation {
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactReconcileEvidence {
+    /// The expected value.
     pub expected: ArtifactDescriptor,
+    /// The observed value.
     pub observed: LocalArtifactObservation<ArtifactDescriptor>,
 }
 

@@ -11,15 +11,22 @@ use std::path::{Path, PathBuf};
 use super::{LocalError, LocalSource, LocalTarget, StagePlacement, StagedTree};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Materialized file, directory, and byte totals published with one staged tree.
 pub struct ApplyEvidence {
+    /// The files value.
     pub files: usize,
+    /// The directories value.
     pub directories: usize,
+    /// The bytes value.
     pub bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether direct target removal changed the filesystem.
 pub enum RemoveEvidence {
+    /// The removed outcome.
     Removed,
+    /// The unchanged outcome.
     Unchanged,
 }
 
@@ -61,6 +68,7 @@ impl StagedTree {
         Ok(self)
     }
 
+    /// Copies one admitted regular file into a contained path in this private stage.
     pub fn copy_file(
         self,
         source: LocalSource,
@@ -82,6 +90,7 @@ impl StagedTree {
         Ok(self)
     }
 
+    /// Recursively copies one admitted directory tree into a contained stage path.
     pub fn copy_tree(
         self,
         source: LocalSource,

@@ -10,9 +10,11 @@ use native::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Positive maximum byte length admitted for one durable record.
 pub struct RecordLimit(u64);
 
 impl RecordLimit {
+    /// Admits a positive maximum record size.
     pub fn new(bytes: u64) -> Result<Self, RecordError> {
         if bytes == 0 {
             Err(RecordError::InvalidLimit)
@@ -23,48 +25,78 @@ impl RecordLimit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Read-only state of one bounded record entry.
 pub enum RecordObservation {
+    /// The missing outcome.
     Missing,
+    /// The present outcome.
     Present(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Path and byte length committed for a record write.
 pub struct RecordEvidence {
+    /// The path value.
     pub path: PathBuf,
+    /// The bytes value.
     pub bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether a record edit created, replaced, removed, or preserved an entry.
 pub enum RecordChange {
+    /// The created outcome.
     Created,
+    /// The replaced outcome.
     Replaced,
+    /// The removed outcome.
     Removed,
+    /// The unchanged outcome.
     Unchanged,
 }
 
 #[derive(Debug)]
+/// Admission, locking, size, state-transition, or I/O failure for bounded records.
 pub enum RecordError {
+    /// The invalid store outcome.
     InvalidStore(PathBuf),
+    /// The invalid name outcome.
     InvalidName(PathBuf),
+    /// The invalid limit outcome.
     InvalidLimit,
+    /// The busy outcome.
     Busy {
+        /// The path value.
         path: PathBuf,
     },
+    /// The too large outcome.
     TooLarge {
+        /// The path value.
         path: PathBuf,
+        /// The limit value.
         limit: u64,
     },
+    /// The conflict outcome.
     Conflict {
+        /// The path value.
         path: PathBuf,
     },
+    /// The before commit outcome.
     BeforeCommit {
+        /// The action value.
         action: &'static str,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The committed outcome.
     Committed {
+        /// The change value.
         change: RecordChange,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
@@ -121,11 +153,13 @@ impl std::error::Error for RecordError {
     }
 }
 
+/// Root-scoped owner of bounded record inspection and serialized edit admission.
 pub struct RecordStore {
     root: PathBuf,
 }
 
 impl RecordStore {
+    /// Admits a non-empty root for bounded record storage.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, RecordError> {
         let root = root.into();
         let valid = root.is_absolute()
@@ -138,6 +172,7 @@ impl RecordStore {
         Ok(Self { root })
     }
 
+    /// Observes one record without acquiring an edit lock.
     pub fn inspect(
         &self,
         name: impl AsRef<Path>,
@@ -146,6 +181,7 @@ impl RecordStore {
         inspect(&self.path(name)?, limit)
     }
 
+    /// Acquires an exclusive edit session for this record store.
     pub fn edit(self) -> Result<RecordEdit, RecordError> {
         let path = self.root.join("lock");
         if matches!(classify(&path)?, Entry::Other) {
@@ -171,12 +207,14 @@ impl RecordStore {
 }
 
 #[derive(Debug)]
+/// Exclusive edit session holding the store lock across a related record transition.
 pub struct RecordEdit {
     root: PathBuf,
     _lock: File,
 }
 
 impl RecordEdit {
+    /// Observes one record while retaining the exclusive edit session.
     pub fn inspect(
         &self,
         name: impl AsRef<Path>,
@@ -185,6 +223,7 @@ impl RecordEdit {
         inspect(&record_path(&self.root, name.as_ref())?, limit)
     }
 
+    /// Streams a new record from `source`, rejecting an existing entry or size-limit violation.
     pub fn create_from(
         &mut self,
         name: impl AsRef<Path>,
@@ -194,6 +233,7 @@ impl RecordEdit {
         self.write(name.as_ref(), limit, source, false)
     }
 
+    /// Streams a replacement record from `source`, requiring the entry to exist.
     pub fn replace_from(
         &mut self,
         name: impl AsRef<Path>,
@@ -203,6 +243,7 @@ impl RecordEdit {
         self.write(name.as_ref(), limit, source, true)
     }
 
+    /// Removes one existing record or reports an unchanged missing entry.
     pub fn remove(&mut self, name: impl AsRef<Path>) -> Result<RecordChange, RecordError> {
         let path = record_path(&self.root, name.as_ref())?;
         match classify(&path)? {

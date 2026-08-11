@@ -40,9 +40,18 @@ use crate::{Acquire, Inspect};
 use crate::{AsyncAcquire, AsyncInspect};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Failure to admit an absolute HTTP or HTTPS URL.
 pub enum RemoteUrlError {
-    Invalid { input: String },
-    UnsupportedScheme { scheme: String },
+    /// The invalid outcome.
+    Invalid {
+        /// Original input that could not be parsed as a URL.
+        input: String,
+    },
+    /// The unsupported scheme outcome.
+    UnsupportedScheme {
+        /// Parsed scheme rejected because it is not HTTP or HTTPS.
+        scheme: String,
+    },
 }
 
 impl fmt::Display for RemoteUrlError {
@@ -59,56 +68,95 @@ impl fmt::Display for RemoteUrlError {
 impl std::error::Error for RemoteUrlError {}
 
 #[derive(Debug)]
+/// Failure to acquire remote material, retaining available attempt and resume evidence.
 pub enum AcquireError {
+    /// The remote url outcome.
     RemoteUrl(RemoteUrlError),
+    /// The http status outcome.
     HttpStatus {
+        /// The url value.
         url: url::Url,
+        /// The status value.
         status: u16,
+        /// The retryable value.
         retryable: bool,
+        /// The attempts value.
         attempts: Vec<AttemptEvidence>,
+        /// The resume value.
         resume: Option<ResumeEvidence>,
     },
+    /// The transport outcome.
     Transport {
+        /// The url value.
         url: url::Url,
+        /// The phase value.
         phase: TransportPhase,
+        /// The message value.
         message: String,
+        /// The attempts value.
         attempts: Vec<AttemptEvidence>,
+        /// The resume value.
         resume: Option<ResumeEvidence>,
     },
+    /// The protocol outcome.
     Protocol {
+        /// The url value.
         url: url::Url,
+        /// The kind value.
         kind: ProtocolError,
+        /// The attempts value.
         attempts: Vec<AttemptEvidence>,
+        /// The resume value.
         resume: Option<ResumeEvidence>,
     },
+    /// The limit exceeded outcome.
     LimitExceeded {
+        /// The url value.
         url: url::Url,
+        /// The max value.
         max: u64,
+        /// The actual value.
         actual: u64,
+        /// The attempts value.
         attempts: Vec<AttemptEvidence>,
+        /// The resume value.
         resume: Option<ResumeEvidence>,
     },
 
+    /// The local outcome.
     Local {
+        /// The url value.
         url: Option<url::Url>,
+        /// The action value.
         action: &'static str,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// HTTP transport phase in which an adapter error occurred.
 pub enum TransportPhase {
+    /// The send request outcome.
     SendRequest,
+    /// The read body outcome.
     ReadBody,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Violation of the HTTP range, length, or validator contract.
 pub enum ProtocolError {
+    /// The unexpected partial response outcome.
     UnexpectedPartialResponse,
+    /// The resume validator mismatch outcome.
     ResumeValidatorMismatch,
+    /// The invalid content range outcome.
     InvalidContentRange {
+        /// The expected start value.
         expected_start: u64,
+        /// The header value.
         header: Option<String>,
     },
 }
@@ -204,6 +252,7 @@ impl AcquireError {
 }
 
 #[derive(Clone)]
+/// Admitted absolute HTTP or HTTPS URL with optional inspection adapter resources.
 pub struct RemoteUrl {
     url: url::Url,
     policy: HttpInspectPolicy,
@@ -214,6 +263,7 @@ pub struct RemoteUrl {
 }
 
 impl RemoteUrl {
+    /// Parses and admits an absolute HTTP or HTTPS URL.
     pub fn parse(input: &str) -> Result<Self, RemoteUrlError> {
         let url = url::Url::parse(input).map_err(|_| RemoteUrlError::Invalid {
             input: input.to_string(),
@@ -253,6 +303,7 @@ impl RemoteUrl {
         self
     }
 
+    /// Returns the admitted URL as a string.
     pub fn as_str(&self) -> &str {
         self.url.as_str()
     }
@@ -262,10 +313,12 @@ impl RemoteUrl {
         AcquireError::local(Some(self), action, path, source)
     }
 
+    /// Borrows the parsed URL value.
     pub fn as_url(&self) -> &url::Url {
         &self.url
     }
 
+    /// Consumes this wrapper and returns the parsed URL value.
     pub fn into_url(self) -> url::Url {
         self.url
     }
@@ -324,35 +377,46 @@ impl From<RemoteUrlError> for AcquireError {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Caller-selected timeout, size, header, retry, and resume policy for acquisition.
 pub struct AcquirePolicy {
+    /// The timeout value.
     pub timeout: Option<Duration>,
+    /// The max bytes value.
     pub max_bytes: Option<u64>,
+    /// The headers value.
     pub headers: Vec<(String, String)>,
+    /// The retry value.
     pub retry: RetryPolicy,
+    /// The resume value.
     pub resume: ResumePolicy,
 }
 
 impl AcquirePolicy {
+    /// Sets the timeout applied to each acquisition attempt.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Sets the maximum accepted artifact size.
     pub fn max_bytes(mut self, max_bytes: u64) -> Self {
         self.max_bytes = Some(max_bytes);
         self
     }
 
+    /// Adds one caller-selected request header.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 
+    /// Replaces the acquisition retry policy.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
     }
 
+    /// Replaces the acquisition resume policy.
     pub fn resume(mut self, resume: ResumePolicy) -> Self {
         self.resume = resume;
         self
@@ -371,6 +435,7 @@ pub struct AttemptRate {
 }
 
 impl AttemptRate {
+    /// The pub outcome.
     pub const fn new(attempts_per_second: NonZeroU32, burst_attempts: NonZeroU32) -> Self {
         Self {
             attempts_per_second,
@@ -378,10 +443,12 @@ impl AttemptRate {
         }
     }
 
+    /// The pub outcome.
     pub const fn attempts_per_second(self) -> NonZeroU32 {
         self.attempts_per_second
     }
 
+    /// The pub outcome.
     pub const fn burst_attempts(self) -> NonZeroU32 {
         self.burst_attempts
     }
@@ -402,6 +469,7 @@ pub struct RateAdmission {
 }
 
 impl RateAdmission {
+    /// Constructs a shared attempt admission gate for `rate`.
     pub fn new(rate: AttemptRate) -> Self {
         #[cfg(any(feature = "http-reqwest", feature = "http-ureq"))]
         let quota = governor::Quota::per_second(rate.attempts_per_second())
@@ -413,6 +481,7 @@ impl RateAdmission {
         }
     }
 
+    /// The pub outcome.
     pub const fn rate(&self) -> AttemptRate {
         self.rate
     }
@@ -472,6 +541,7 @@ pub struct ByteRate {
 }
 
 impl ByteRate {
+    /// The pub outcome.
     pub const fn new(bytes_per_second: NonZeroU32, burst_bytes: NonZeroU32) -> Self {
         Self {
             bytes_per_second,
@@ -479,10 +549,12 @@ impl ByteRate {
         }
     }
 
+    /// The pub outcome.
     pub const fn bytes_per_second(self) -> NonZeroU32 {
         self.bytes_per_second
     }
 
+    /// The pub outcome.
     pub const fn burst_bytes(self) -> NonZeroU32 {
         self.burst_bytes
     }
@@ -505,6 +577,7 @@ pub struct ByteRatePacer {
 }
 
 impl ByteRatePacer {
+    /// Constructs a shared decoded-byte pacer for `rate`.
     pub fn new(rate: ByteRate) -> Self {
         #[cfg(any(feature = "http-reqwest", feature = "http-ureq"))]
         let quota =
@@ -516,6 +589,7 @@ impl ByteRatePacer {
         }
     }
 
+    /// The pub outcome.
     pub const fn rate(&self) -> ByteRate {
         self.rate
     }
@@ -572,10 +646,15 @@ impl fmt::Debug for ByteRatePacer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Bounded exponential retry policy with optional delay cap and `Retry-After` support.
 pub struct RetryPolicy {
+    /// The max retries value.
     pub max_retries: u32,
+    /// The base delay value.
     pub base_delay: Duration,
+    /// The max delay value.
     pub max_delay: Option<Duration>,
+    /// The respect retry after value.
     pub respect_retry_after: bool,
 }
 
@@ -586,6 +665,7 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Constructs a policy that performs no retries.
     pub fn disabled() -> Self {
         Self {
             max_retries: 0,
@@ -595,6 +675,7 @@ impl RetryPolicy {
         }
     }
 
+    /// Constructs bounded exponential retry delays.
     pub fn exponential(max_retries: u32, base_delay: Duration) -> Self {
         Self {
             max_retries,
@@ -604,11 +685,13 @@ impl RetryPolicy {
         }
     }
 
+    /// Caps the computed retry delay.
     pub fn max_delay(mut self, max_delay: Duration) -> Self {
         self.max_delay = Some(max_delay);
         self
     }
 
+    /// Selects whether valid `Retry-After` response values influence retry delay.
     pub fn respect_retry_after(mut self, respect: bool) -> Self {
         self.respect_retry_after = respect;
         self
@@ -618,16 +701,20 @@ impl RetryPolicy {
 /// Caller-selected execution policy for HTTP HEAD inspection.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HttpInspectPolicy {
+    /// The timeout value.
     pub timeout: Option<Duration>,
+    /// The retry value.
     pub retry: RetryPolicy,
 }
 
 impl HttpInspectPolicy {
+    /// Sets the timeout applied to each inspection attempt.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Replaces the inspection retry policy.
     pub fn retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
@@ -637,16 +724,22 @@ impl HttpInspectPolicy {
 /// HTTP-specific facts reported by a HEAD response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteObservation {
+    /// The status value.
     pub status: u16,
+    /// The declared content length value.
     pub declared_content_length: Option<u64>,
 }
 
 /// Evidence for one HTTP inspection or admission attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpInspectAttemptEvidence {
+    /// The attempt value.
     pub attempt: u32,
+    /// The status value.
     pub status: Option<u16>,
+    /// The admission wait value.
     pub admission_wait: Option<Duration>,
+    /// The planned delay value.
     pub planned_delay: Option<Duration>,
 }
 
@@ -670,23 +763,34 @@ impl HttpInspectAttemptEvidence {
 /// Evidence for a completed HTTP inspection, including redirect authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteInspectEvidence {
+    /// The requested url value.
     pub requested_url: url::Url,
+    /// The final url value.
     pub final_url: url::Url,
+    /// The attempts value.
     pub attempts: Vec<HttpInspectAttemptEvidence>,
 }
 
 /// Failures that prevented HTTP inspection from receiving a final response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HttpInspectError {
+    /// The transport outcome.
     Transport {
+        /// The url value.
         url: url::Url,
+        /// The message value.
         message: String,
+        /// The attempts value.
         attempts: Vec<HttpInspectAttemptEvidence>,
     },
 
+    /// The protocol outcome.
     Protocol {
+        /// The url value.
         url: url::Url,
+        /// The message value.
         message: String,
+        /// The attempts value.
         attempts: Vec<HttpInspectAttemptEvidence>,
     },
 }
@@ -717,9 +821,13 @@ impl std::error::Error for HttpInspectError {}
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResumePolicy {
+    /// The restart only outcome.
     RestartOnly,
+    /// The if range outcome.
     IfRange {
+        /// The partial path value.
         partial_path: PathBuf,
+        /// The validator value.
         validator: Validator,
     },
 }
@@ -731,10 +839,12 @@ impl Default for ResumePolicy {
 }
 
 impl ResumePolicy {
+    /// Selects acquisition that always starts from an empty stage.
     pub fn restart_only() -> Self {
         Self::RestartOnly
     }
 
+    /// Selects validated range continuation from a caller-owned partial file.
     pub fn if_range(partial_path: impl Into<PathBuf>, validator: Validator) -> Self {
         Self::IfRange {
             partial_path: partial_path.into(),
@@ -744,6 +854,7 @@ impl ResumePolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Strong HTTP validator admitted for safe range continuation.
 pub struct Validator {
     kind: ValidatorKind,
 }
@@ -808,6 +919,7 @@ pub struct RemoteSource {
 }
 
 #[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+/// Remote acquisition whose resume input has been observed and frozen before transport.
 pub struct PreparedRemote {
     source: RemoteSource,
     stage: tempfile::NamedTempFile,
@@ -823,6 +935,7 @@ impl PartialEq for RemoteSource {
 impl Eq for RemoteSource {}
 
 impl RemoteSource {
+    /// Constructs a remote source with default acquisition policy and adapter resources.
     pub fn new(url: RemoteUrl) -> Self {
         Self {
             url,
@@ -839,6 +952,7 @@ impl RemoteSource {
         Ok(Self::new(RemoteUrl::parse(url)?))
     }
 
+    /// Replaces the acquisition policy.
     pub fn policy(mut self, policy: AcquirePolicy) -> Self {
         self.policy = policy;
         self
@@ -858,11 +972,13 @@ impl RemoteSource {
         self
     }
 
+    /// Borrows the admitted remote URL.
     pub fn url(&self) -> &RemoteUrl {
         &self.url
     }
 
     #[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+    /// Freezes resume metadata before any HTTP attempt begins.
     pub fn prepare(mut self) -> Result<PreparedRemote, AcquireError> {
         let mut stage = tempfile::NamedTempFile::new().map_err(|error| {
             self.url
@@ -907,40 +1023,66 @@ impl RemoteSource {
 /// Observed HTTP acquisition facts, excluding the ephemeral stage owned by the output artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteAcquireEvidence {
+    /// The url value.
     pub url: url::Url,
+    /// The status value.
     pub status: u16,
+    /// The bytes value.
     pub bytes: u64,
+    /// The content length value.
     pub content_length: Option<u64>,
+    /// The attempts value.
     pub attempts: Vec<AttemptEvidence>,
+    /// The resume value.
     pub resume: Option<ResumeEvidence>,
+    /// The validator value.
     pub validator: Option<Validator>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Partial-file identity and outcome observed during one resumed acquisition.
 pub struct ResumeEvidence {
+    /// The outcome value.
     pub outcome: ResumeOutcome,
+    /// The partial path value.
     pub partial_path: PathBuf,
+    /// The partial bytes value.
     pub partial_bytes: u64,
+    /// The validator value.
     pub validator: Validator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// How an HTTP response used or discarded the prepared partial input.
 pub enum ResumeOutcome {
+    /// The partial appended outcome.
     PartialAppended,
+    /// The range ignored restarted outcome.
     RangeIgnoredRestarted,
+    /// The range unsatisfiable restarted outcome.
     RangeUnsatisfiableRestarted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Transport, admission, pacing, and byte facts for one acquisition attempt.
 pub struct AttemptEvidence {
+    /// The attempt value.
     pub attempt: u32,
+    /// The status value.
     pub status: Option<u16>,
+    /// The bytes value.
     pub bytes: u64,
+    /// The content length value.
     pub content_length: Option<u64>,
+    /// The retry after value.
     pub retry_after: Option<Duration>,
+    /// The planned delay value.
     pub planned_delay: Option<Duration>,
+    /// The admission wait value.
     pub admission_wait: Option<Duration>,
+    /// The pacing wait value.
     pub pacing_wait: Duration,
+    /// The outcome value.
     pub outcome: AttemptOutcome,
 }
 
@@ -1024,13 +1166,21 @@ impl AttemptEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Terminal classification of one acquisition attempt.
 pub enum AttemptOutcome {
+    /// The success outcome.
     Success,
+    /// The retryable status outcome.
     RetryableStatus,
+    /// The retryable network error outcome.
     RetryableNetworkError,
+    /// The non retryable status outcome.
     NonRetryableStatus,
+    /// The non retryable network error outcome.
     NonRetryableNetworkError,
+    /// The local failure outcome.
     LocalFailure,
+    /// The limit exceeded outcome.
     LimitExceeded,
 }
 
@@ -1045,6 +1195,7 @@ type AsyncSleep = Arc<dyn Fn(Duration) -> AsyncSleepFuture + Send + Sync>;
 
 #[cfg(feature = "http-ureq")]
 #[derive(Clone)]
+/// Shareable synchronous HTTP agent, admission gate, and decoded-byte pacer.
 pub struct UreqResources {
     agent: ureq::Agent,
     delay: SyncSleep,
@@ -1066,6 +1217,7 @@ impl Default for UreqResources {
 
 #[cfg(feature = "http-ureq")]
 impl UreqResources {
+    /// Constructs synchronous adapter resources around an existing ureq agent.
     pub fn from_agent(agent: ureq::Agent) -> Self {
         Self {
             agent,
@@ -1079,11 +1231,13 @@ impl UreqResources {
         self
     }
 
+    /// Attaches a shared attempt admission gate.
     pub fn with_admission(mut self, admission: Arc<RateAdmission>) -> Self {
         self.admission = Some(admission);
         self
     }
 
+    /// Attaches a shared decoded-byte pacer.
     pub fn with_byte_pacer(mut self, byte_pacer: Arc<ByteRatePacer>) -> Self {
         self.byte_pacer = Some(byte_pacer);
         self
@@ -1429,6 +1583,7 @@ impl Acquire for PreparedRemote {
 
 #[cfg(feature = "http-reqwest")]
 #[derive(Clone)]
+/// Shareable asynchronous HTTP client, admission gate, and decoded-byte pacer.
 pub struct ReqwestResources {
     client: reqwest::Client,
     delay: AsyncSleep,
@@ -1450,6 +1605,7 @@ impl Default for ReqwestResources {
 
 #[cfg(feature = "http-reqwest")]
 impl ReqwestResources {
+    /// Constructs asynchronous adapter resources around an existing reqwest client.
     pub fn from_client(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -1463,11 +1619,13 @@ impl ReqwestResources {
         self
     }
 
+    /// Attaches a shared attempt admission gate.
     pub fn with_admission(mut self, admission: Arc<RateAdmission>) -> Self {
         self.admission = Some(admission);
         self
     }
 
+    /// Attaches a shared decoded-byte pacer.
     pub fn with_byte_pacer(mut self, byte_pacer: Arc<ByteRatePacer>) -> Self {
         self.byte_pacer = Some(byte_pacer);
         self

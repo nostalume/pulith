@@ -1,10 +1,10 @@
-//! Local adapter facade: acquire, staged apply, activation, inspection, and pure reconciliation.
+//! Local adapter facade: acquire, stage, publish, link, inspect, record, and reconcile.
 //!
 //! This module owns the local filesystem semantics: entry-kind classification without following
-//! links, private staged-tree custody, single-target publication, create-only activation, and the
-//! explicit active-view switch. It never claims package ownership, durable manager state, or
-//! automatic repair. Concrete publication lives in `local/apply.rs` and activation in
-//! `local/view.rs`; this facade re-exports their public vocabulary. The whole module is
+//! links, private staged-tree custody, single-target publication, and explicit consumer views. It
+//! never claims package ownership, application state, or automatic repair. Concrete publication
+//! lives in `local/apply.rs`, views in `local/view.rs`, and bounded records in `local/record.rs`;
+//! this facade re-exports their public vocabulary. The whole module is
 //! feature-gated on `local`.
 use std::fmt;
 use std::fs;
@@ -30,37 +30,59 @@ pub use record::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether linking created a new consumer view or replaced an existing valid view.
 pub enum LinkChange {
+    /// The created outcome.
     Created,
+    /// The replaced outcome.
     Replaced,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Paths and outcome observed after linking a published tree into a consumer view.
 pub struct LinkEvidence {
+    /// The source value.
     pub source: PathBuf,
+    /// The view value.
     pub view: PathBuf,
+    /// The change value.
     pub change: LinkChange,
 }
 
 #[derive(Debug)]
+/// Failure to validate or commit one consumer-view link operation.
 pub enum LinkError {
+    /// The before link outcome.
     BeforeLink {
+        /// The view value.
         view: PathBuf,
+        /// The cause value.
         cause: LocalError,
     },
+    /// The invalid expose outcome.
     InvalidExpose {
+        /// The expose value.
         expose: PathBuf,
     },
+    /// The expose not directory outcome.
     ExposeNotDirectory {
+        /// The path value.
         path: PathBuf,
+        /// The observed value.
         observed: LocalObservation,
     },
+    /// The view conflict outcome.
     ViewConflict {
+        /// The view value.
         view: PathBuf,
+        /// The observed value.
         observed: LocalObservation,
     },
+    /// The capability unavailable outcome.
     CapabilityUnavailable {
+        /// The view value.
         view: PathBuf,
+        /// The cause value.
         cause: LocalError,
     },
 }
@@ -104,17 +126,27 @@ impl std::error::Error for LinkError {
 }
 
 #[derive(Debug)]
+/// Failure to observe or remove one consumer view.
 pub enum UnlinkError {
+    /// The observe outcome.
     Observe {
+        /// The view value.
         view: PathBuf,
+        /// The cause value.
         cause: LocalError,
     },
+    /// The not active view outcome.
     NotActiveView {
+        /// The view value.
         view: PathBuf,
+        /// The observed value.
         observed: LocalObservation,
     },
+    /// The remove outcome.
     Remove {
+        /// The view value.
         view: PathBuf,
+        /// The cause value.
         cause: LocalError,
     },
 }
@@ -147,14 +179,20 @@ impl std::error::Error for UnlinkError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether unlinking removed an active view or found it already absent.
 pub enum UnlinkChange {
+    /// The removed outcome.
     Removed,
+    /// The unchanged outcome.
     Unchanged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Consumer view and outcome observed after unlinking.
 pub struct UnlinkEvidence {
+    /// The view value.
     pub view: PathBuf,
+    /// The change value.
     pub change: UnlinkChange,
 }
 
@@ -162,23 +200,34 @@ pub struct UnlinkEvidence {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum LocalError {
+    /// The missing source outcome.
     MissingSource(PathBuf),
     /// Immutable publication found an existing predecessor and did not commit the target.
     AlreadyPublished(PathBuf),
+    /// The unsupported local entry outcome.
     UnsupportedLocalEntry(PathBuf),
+    /// The invalid stage path outcome.
     InvalidStagePath(PathBuf),
+    /// The publish unavailable outcome.
     PublishUnavailable {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The invalid preparation outcome.
     InvalidPreparation(String),
     /// The source law: the empty path is not a valid source reference.
     InvalidSource(PathBuf),
     /// The target law: the empty path is not a valid target reference.
     InvalidTarget(PathBuf),
+    /// The io outcome.
     Io {
+        /// The action value.
         action: &'static str,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
@@ -387,7 +436,9 @@ fn classify_windows_file_type(file_type: u32, last_error: u32) -> io::Result<boo
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Filesystem identity observed during local acquisition.
 pub struct LocalAcquireEvidence {
+    /// The path value.
     pub path: PathBuf,
 }
 
@@ -406,6 +457,7 @@ impl LocalSource {
         Ok(Self(path))
     }
 
+    /// Returns the admitted source path.
     pub fn as_path(&self) -> &Path {
         &self.0
     }
@@ -433,6 +485,7 @@ impl Acquire for LocalSource {
 pub struct LocalTarget(PathBuf);
 
 impl LocalTarget {
+    /// Admits a non-empty local target path.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, LocalError> {
         let path = path.into();
         if path.as_os_str().is_empty() {
@@ -441,6 +494,7 @@ impl LocalTarget {
         Ok(Self(path))
     }
 
+    /// Returns the admitted target path.
     pub fn as_path(&self) -> &Path {
         &self.0
     }
@@ -458,11 +512,23 @@ impl LocalTarget {
 #[derive(Debug)]
 pub enum LocalMaterial {
     /// A caller-owned regular-file path. Dropping the value does not remove the file.
-    File { path: PathBuf },
+    /// The file outcome.
+    File {
+        /// Caller-owned path to the regular file.
+        path: PathBuf,
+    },
     /// A caller-owned directory path. Dropping the value does not remove the tree.
-    Directory { path: PathBuf },
+    /// The directory outcome.
+    Directory {
+        /// Caller-owned path to the directory.
+        path: PathBuf,
+    },
     /// An adapter-owned temporary file. Dropping the value removes the stage.
-    StagedFile { path: tempfile::TempPath },
+    /// The staged file outcome.
+    StagedFile {
+        /// Adapter-owned temporary file custody.
+        path: tempfile::TempPath,
+    },
 }
 
 impl PartialEq for LocalMaterial {
@@ -542,11 +608,17 @@ impl StagedTree {
 /// No-follow local filesystem entry classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalEntryKind {
+    /// The missing outcome.
     Missing,
+    /// The file outcome.
     File,
+    /// The directory outcome.
     Directory,
+    /// The symlink outcome.
     Symlink,
+    /// The reparse outcome.
     Reparse,
+    /// The other outcome.
     Other,
 }
 
@@ -555,15 +627,25 @@ pub enum LocalEntryKind {
 /// The exact-inspection behavior supplies `T` only after it has admitted and read a regular file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalArtifactObservation<T> {
+    /// The missing outcome.
     Missing,
-    File { attestation: T },
+    /// The file outcome.
+    File {
+        /// Exact attestation produced while reading the regular file.
+        attestation: T,
+    },
+    /// The directory outcome.
     Directory,
+    /// The symlink outcome.
     Symlink,
+    /// The reparse outcome.
     Reparse,
+    /// The other outcome.
     Other,
 }
 
 impl<T> LocalArtifactObservation<T> {
+    /// Returns the no-follow entry kind represented by this exact observation.
     pub fn kind(&self) -> LocalEntryKind {
         match self {
             Self::Missing => LocalEntryKind::Missing,
@@ -584,21 +666,32 @@ impl<T> LocalArtifactObservation<T> {
 /// link-target classification — callers never read links themselves.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalObservation {
+    /// The missing outcome.
     Missing,
-    File { bytes: u64 },
+    /// The file outcome.
+    File {
+        /// Observed file length in bytes.
+        bytes: u64,
+    },
+    /// The directory outcome.
     Directory,
+    /// The symlink to directory outcome.
     SymlinkToDirectory,
+    /// The symlink to file outcome.
     SymlinkToFile,
+    /// The other outcome.
     Other,
 }
 
 /// The observation law's receipt: the observed path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalInspectEvidence {
+    /// The path value.
     pub path: PathBuf,
 }
 
 impl LocalObservation {
+    /// Returns the entry kind represented by this observation.
     pub fn kind(&self) -> LocalEntryKind {
         match self {
             Self::Missing => LocalEntryKind::Missing,
@@ -613,15 +706,22 @@ impl LocalObservation {
 /// Caller-owned expected state compared by the [`Reconcile`] trait.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalExpectation {
+    /// The missing outcome.
     Missing,
+    /// The file outcome.
     File,
+    /// The file size outcome.
     FileSize(u64),
+    /// The directory outcome.
     Directory,
+    /// The symlink outcome.
     Symlink,
+    /// The other outcome.
     Other,
 }
 
 impl LocalExpectation {
+    /// Returns the entry kind required by this expectation.
     pub fn kind(&self) -> LocalEntryKind {
         match self {
             Self::Missing => LocalEntryKind::Missing,
@@ -636,22 +736,34 @@ impl LocalExpectation {
 /// Difference between caller-owned local expectation and observed state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalReconciliation {
+    /// The matches outcome.
     Matches,
+    /// The missing outcome.
     Missing,
+    /// The unexpected outcome.
     Unexpected,
+    /// The wrong kind outcome.
     WrongKind {
+        /// The expected value.
         expected: LocalEntryKind,
+        /// The observed value.
         observed: LocalEntryKind,
     },
+    /// The modified outcome.
     Modified {
+        /// The expected bytes value.
         expected_bytes: u64,
+        /// The observed bytes value.
         observed_bytes: u64,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Expected and observed values used for one pure local reconciliation.
 pub struct LocalReconcileEvidence {
+    /// The expected value.
     pub expected: LocalExpectation,
+    /// The observed value.
     pub observed: LocalObservation,
 }
 

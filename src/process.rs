@@ -83,18 +83,25 @@ pub struct ProcessSession {
 /// One non-consuming observation of a managed process.
 #[derive(Debug)]
 pub enum ProcessObservation {
+    /// The running outcome.
     Running,
+    /// The exited outcome.
     Exited(ExitStatus),
 }
 
 /// The terminal fact produced by waiting for or explicitly stopping a managed process.
 #[derive(Debug)]
 pub enum ProcessEnd {
+    /// The exited outcome.
     Exited {
+        /// The status value.
         status: ExitStatus,
+        /// The elapsed value.
         elapsed: Duration,
     },
+    /// The stopped outcome.
     Stopped {
+        /// The elapsed value.
         elapsed: Duration,
     },
 }
@@ -102,21 +109,33 @@ pub enum ProcessEnd {
 /// A managed process could not be started, observed, or stopped within its caller deadline.
 #[derive(Debug)]
 pub enum SessionError {
+    /// The spawn outcome.
     Spawn {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The wait outcome.
     Wait {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The stop timed out outcome.
     StopTimedOut {
+        /// The program value.
         program: PathBuf,
+        /// The deadline value.
         deadline: Duration,
     },
     #[cfg(windows)]
+    /// The capability unavailable outcome.
     CapabilityUnavailable {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
@@ -372,9 +391,13 @@ impl OutputPath {
 /// One argument passed to the selected program without shell interpolation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Arg {
+    /// The literal outcome.
     Literal(OsString),
+    /// The workspace root outcome.
     WorkspaceRoot,
+    /// The output root outcome.
     OutputRoot,
+    /// The output path outcome.
     OutputPath(OutputPath),
 }
 
@@ -426,15 +449,25 @@ fn environment_keys_equal(left: &OsStr, right: &OsStr) -> bool {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ConfigError {
+    /// The invalid output path outcome.
     InvalidOutputPath(PathBuf),
+    /// The invalid input name outcome.
     InvalidInputName(OsString),
+    /// The non absolute input outcome.
     NonAbsoluteInput(PathBuf),
+    /// The empty program outcome.
     EmptyProgram,
+    /// The non absolute program outcome.
     NonAbsoluteProgram(PathBuf),
+    /// The non absolute worktree outcome.
     NonAbsoluteWorktree(PathBuf),
+    /// The zero timeout outcome.
     ZeroTimeout,
+    /// The invalid environment key outcome.
     InvalidEnvironmentKey(OsString),
+    /// The reserved environment key outcome.
     ReservedEnvironmentKey(OsString),
+    /// The duplicate environment key outcome.
     DuplicateEnvironmentKey(OsString),
 }
 
@@ -543,15 +576,20 @@ impl WorktreeProcess {
 /// Safe facts from a successful caller-worktree execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeEvidence {
+    /// The program value.
     pub program: PathBuf,
+    /// The working dir value.
     pub working_dir: PathBuf,
+    /// The elapsed value.
     pub elapsed: Duration,
 }
 
 /// Named result of a successful bounded caller-worktree execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeResult {
+    /// The evidence value.
     pub evidence: WorktreeEvidence,
+    /// The diagnostics value.
     pub diagnostics: Diagnostics,
 }
 
@@ -723,15 +761,20 @@ impl OutputProcess {
 /// Safe facts from a successful cooperative process realization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputEvidence {
+    /// The output value.
     pub output: OutputPath,
+    /// The elapsed value.
     pub elapsed: Duration,
 }
 
 /// Named material and evidence returned by private-output realization.
 #[derive(Debug)]
 pub struct OutputResult {
+    /// The tree value.
     pub tree: StagedTree,
+    /// The evidence value.
     pub evidence: OutputEvidence,
+    /// The diagnostics value.
     pub diagnostics: Diagnostics,
 }
 
@@ -806,78 +849,133 @@ impl CancelToken {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum RunError {
+    /// The workspace outcome.
     Workspace {
+        /// The source value.
         source: io::Error,
     },
+    /// The worktree missing outcome.
     WorktreeMissing {
+        /// The path value.
         path: PathBuf,
     },
+    /// The worktree wrong kind outcome.
     WorktreeWrongKind {
+        /// The path value.
         path: PathBuf,
     },
+    /// The worktree inspect outcome.
     WorktreeInspect {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The input missing outcome.
     InputMissing {
+        /// The path value.
         path: PathBuf,
     },
+    /// The input collision outcome.
     InputCollision {
+        /// The name value.
         name: OsString,
     },
+    /// The input wrong kind outcome.
     InputWrongKind {
+        /// The path value.
         path: PathBuf,
     },
+    /// The input staging outcome.
     InputStaging {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
+    /// The spawn outcome.
     Spawn {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The wait outcome.
     Wait {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The timed out outcome.
     TimedOut {
+        /// The program value.
         program: PathBuf,
+        /// The timeout value.
         timeout: Duration,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The cancelled outcome.
     Cancelled {
+        /// The program value.
         program: PathBuf,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The exited non zero outcome.
     ExitedNonZero {
+        /// The program value.
         program: PathBuf,
+        /// The status value.
         status: ExitStatus,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The output missing outcome.
     OutputMissing {
+        /// The path value.
         path: PathBuf,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The output wrong kind outcome.
     OutputWrongKind {
+        /// The path value.
         path: PathBuf,
+        /// The observed value.
         observed: LocalObservation,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The output inspect outcome.
     OutputInspect {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: crate::local::LocalError,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
     #[cfg(windows)]
+    /// The capability unavailable outcome.
     CapabilityUnavailable {
+        /// The program value.
         program: PathBuf,
+        /// The source value.
         source: io::Error,
+        /// The diagnostics value.
         diagnostics: Box<Diagnostics>,
     },
+    /// The workspace cleanup outcome.
     WorkspaceCleanup {
+        /// The primary value.
         primary: Box<RunError>,
+        /// The cleanup value.
         cleanup: io::Error,
     },
 }

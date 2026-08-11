@@ -15,33 +15,53 @@ use std::path::{Component, Path, PathBuf};
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ArchiveError {
+    /// The archive requires file outcome.
     ArchiveRequiresFile(PathBuf),
+    /// The archive invalid path outcome.
     ArchiveInvalidPath(String),
+    /// The archive limit exceeded outcome.
     ArchiveLimitExceeded {
+        /// The limit value.
         limit: &'static str,
+        /// The actual value.
         actual: u64,
+        /// The max value.
         max: u64,
     },
+    /// The archive size mismatch outcome.
     ArchiveSizeMismatch {
+        /// The path value.
         path: PathBuf,
+        /// The declared value.
         declared: u64,
+        /// The observed value.
         observed: u64,
     },
+    /// The archive path conflict outcome.
     ArchivePathConflict(PathBuf),
     /// Extraction failed and resetting the exclusive workspace also failed.
     ///
     /// `extraction` is the primary source. `cleanup` remains available for callers that need to
     /// detect a contaminated workspace.
     ArchiveCleanupFailed {
+        /// The workspace value.
         workspace: PathBuf,
+        /// The extraction value.
         extraction: Box<ArchiveError>,
+        /// The cleanup value.
         cleanup: Box<ArchiveError>,
     },
+    /// The unsupported archive entry outcome.
     UnsupportedArchiveEntry(PathBuf),
+    /// The invalid preparation outcome.
     InvalidPreparation(String),
+    /// The io outcome.
     Io {
+        /// The action value.
         action: &'static str,
+        /// The path value.
         path: PathBuf,
+        /// The source value.
         source: io::Error,
     },
 }
@@ -247,38 +267,49 @@ impl<R: Read> Read for DecodedLimitReader<R> {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchivePolicy {
+    /// The strip components value.
     pub strip_components: usize,
+    /// The max entries value.
     pub max_entries: Option<u64>,
+    /// The max entry bytes value.
     pub max_entry_bytes: Option<u64>,
+    /// The max total bytes value.
     pub max_total_bytes: Option<u64>,
+    /// The max decoded bytes value.
     pub max_decoded_bytes: Option<u64>,
 }
 
 impl ArchivePolicy {
+    /// Constructs the default restrictive extraction policy without optional limits.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the number of leading path components removed from each archive entry.
     pub fn strip_components(mut self, strip_components: usize) -> Self {
         self.strip_components = strip_components;
         self
     }
 
+    /// Sets the maximum number of materialized entries.
     pub fn max_entries(mut self, max_entries: u64) -> Self {
         self.max_entries = Some(max_entries);
         self
     }
 
+    /// Sets the maximum materialized size of one regular-file entry.
     pub fn max_entry_bytes(mut self, max_entry_bytes: u64) -> Self {
         self.max_entry_bytes = Some(max_entry_bytes);
         self
     }
 
+    /// Sets the maximum total materialized regular-file bytes.
     pub fn max_total_bytes(mut self, max_total_bytes: u64) -> Self {
         self.max_total_bytes = Some(max_total_bytes);
         self
     }
 
+    /// Sets the maximum decoded container bytes consumed while preparing the archive.
     pub fn max_decoded_bytes(mut self, max_decoded_bytes: u64) -> Self {
         self.max_decoded_bytes = Some(max_decoded_bytes);
         self
@@ -307,14 +338,19 @@ pub enum ArchiveKind {
     /// No extraction: the tree was copied as-is (plain file or directory material).
     Plain,
     #[cfg(feature = "zip")]
+    /// The zip outcome.
     Zip,
     #[cfg(feature = "tar")]
+    /// The tar outcome.
     Tar,
     #[cfg(feature = "gzip")]
+    /// The tar gz outcome.
     TarGz,
     #[cfg(feature = "xz")]
+    /// The tar xz outcome.
     TarXz,
     #[cfg(feature = "zstd")]
+    /// The tar zstd outcome.
     TarZstd,
 }
 
@@ -328,13 +364,21 @@ pub enum ArchiveKind {
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEvidence {
+    /// The root value.
     pub root: PathBuf,
+    /// The entries value.
     pub entries: u64,
+    /// The total bytes value.
     pub total_bytes: u64,
+    /// The decoded bytes value.
     pub decoded_bytes: u64,
+    /// The files value.
     pub files: u64,
+    /// The directories value.
     pub directories: u64,
+    /// The symlinks value.
     pub symlinks: u64,
+    /// The format value.
     pub format: ArchiveKind,
 }
 

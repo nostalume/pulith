@@ -10,16 +10,22 @@ use crate::archive::{ArchiveError, ArchiveEvidence, ArchiveKind, ArchivePolicy};
 use crate::local::{LocalError, LocalMaterial, LocalSource, StagedTree};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Evidence distinguishing a copied tree from a decoded archive tree.
 pub enum PreparationEvidence {
+    /// The copied outcome.
     Copied,
+    /// The extracted outcome.
     Extracted(ArchiveEvidence),
 }
 
 /// Errors produced while verifying or preparing one local material.
 #[derive(Debug)]
 pub enum MaterializeError {
+    /// The sniff outcome.
     Sniff(std::io::Error),
+    /// The prepare outcome.
     Prepare(ArchiveError),
+    /// The copy outcome.
     Copy(LocalError),
 }
 
@@ -44,6 +50,7 @@ impl std::error::Error for MaterializeError {
 }
 
 impl LocalMaterial {
+    /// Copies or decodes this local material into caller-selected staged-tree custody.
     pub fn prepare(
         self,
         stage: StagedTree,

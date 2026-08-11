@@ -7,17 +7,24 @@ license = "Apache-2.0"
 description = "Composable typed behaviors for external-resource management"
 repository = "https://github.com/nostalume/pulith"
 homepage = "https://github.com/nostalume/pulith"
+documentation = "https://docs.rs/pulith"
 readme = "README.md"
+keywords = ["artifacts", "resources", "deployment", "filesystem", "process"]
+categories = ["filesystem", "development-tools"]
 include = [
     "/src/**",
     "/tests/**",
     "/examples/**",
-    "/AGENTS.md",
+    "/docs/**",
+    "/CONTRIBUTING.md",
     "/Cargo.toml",
-    "/Cargo.lock",
     "/LICENSE",
     "/README.md",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["archive"]
