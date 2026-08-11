@@ -328,7 +328,7 @@ fn resolve_command(recipe_dir: &Path, command: &str) -> Result<PathBuf, crate::B
         )
         .collect::<Vec<_>>();
     #[cfg(not(windows))]
-    let suffixes = vec![String::new()];
+    let suffixes = [String::new()];
     let found = std::env::split_paths(&path)
         .flat_map(|directory| {
             suffixes

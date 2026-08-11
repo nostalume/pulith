@@ -1086,7 +1086,7 @@ pub struct AttemptEvidence {
     pub outcome: AttemptOutcome,
 }
 
-#[cfg(any(test, feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
 impl AttemptEvidence {
     fn new(attempt: u32, outcome: AttemptOutcome) -> Self {
         Self {

@@ -1,10 +1,9 @@
 #![cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 
 use pulith::hash::{ArtifactDescriptor, ArtifactReconciliation, DigestAlgorithmKind, DigestValue};
-use pulith::local::{
-    LocalArtifactObservation, LocalEntryKind, LocalExpectation, LocalObservation, LocalSource,
-    LocalTarget,
-};
+#[cfg(feature = "blake3")]
+use pulith::local::{LocalArtifactObservation, LocalEntryKind};
+use pulith::local::{LocalExpectation, LocalObservation, LocalSource, LocalTarget};
 use pulith::{Acquire, Inspect, Reconcile, Verify};
 
 #[cfg(feature = "blake3")]

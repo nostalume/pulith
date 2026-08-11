@@ -1688,6 +1688,7 @@ mod tar_tests {
         encoder.finish().unwrap();
     }
 
+    #[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
     fn assert_raw_compressed_stream_rejected(
         name: &str,
         extension: &str,
@@ -2392,20 +2393,23 @@ mod tar_tests {
             Some(ArchiveKind::Tar)
         );
 
-        let gz_path = root.join("tool.tar.gz");
-        write_tar_gzip(&gz_path, |builder| {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(3);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, "tool", b"bin".as_slice())
-                .unwrap();
-        });
-        assert_eq!(
-            ArchiveKind::sniff(&gz_path).unwrap(),
-            Some(ArchiveKind::TarGz)
-        );
+        #[cfg(feature = "gzip")]
+        {
+            let gz_path = root.join("tool.tar.gz");
+            write_tar_gzip(&gz_path, |builder| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(3);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "tool", b"bin".as_slice())
+                    .unwrap();
+            });
+            assert_eq!(
+                ArchiveKind::sniff(&gz_path).unwrap(),
+                Some(ArchiveKind::TarGz)
+            );
+        }
 
         #[cfg(feature = "xz")]
         {

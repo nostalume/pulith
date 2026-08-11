@@ -10,7 +10,9 @@
 use std::ffi::OsString;
 #[cfg(any(feature = "zip", feature = "tar"))]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "process", feature = "zip", feature = "tar"))]
+use std::path::PathBuf;
 #[cfg(feature = "process")]
 use std::time::Duration;
 

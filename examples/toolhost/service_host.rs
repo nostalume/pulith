@@ -16,9 +16,27 @@ mod platform_host;
 #[cfg(windows)]
 #[path = "service_host/windows.rs"]
 mod platform_host;
+#[cfg(not(any(target_os = "linux", windows)))]
+mod platform_host {
+    pub(super) struct Control;
+
+    impl Control {
+        pub(super) fn arm() -> Result<Self, String> {
+            Err("the platform has no supported service manager".into())
+        }
+
+        pub(super) fn ready(&self) -> Result<(), String> {
+            Err("the platform has no supported service manager".into())
+        }
+
+        pub(super) fn stop_requested(&self) -> bool {
+            false
+        }
+    }
+}
 use platform_host::Control;
 
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 fn main() -> ExitCode {
     run_from_args()
 }

@@ -60,11 +60,15 @@ impl PlatformService<'_> {
     pub(super) fn observe(&self) -> Result<ManagerObservation, ServiceError> {
         let unit = unit_path(self.root, self.declaration);
         let registration = match std::fs::read_to_string(&unit) {
-            Ok(text) => binding_from_unit(self.root, self.declaration, &text)
-                .map(|binding| text == render_definition(self.root, self.declaration, &binding))
-                .is_ok_and(|exact| exact)
-                .then_some(Registration::Exact)
-                .unwrap_or(Registration::Conflict),
+            Ok(text) => {
+                if binding_from_unit(self.root, self.declaration, &text).is_ok_and(|binding| {
+                    text == render_definition(self.root, self.declaration, &binding)
+                }) {
+                    Registration::Exact
+                } else {
+                    Registration::Conflict
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registration::Missing,
             Err(error) => return Err(ServiceError::invalid(format!("read systemd unit: {error}"))),
         };
@@ -108,9 +112,11 @@ pub(super) fn parse_observation(text: &str) -> ManagerObservation {
             .unwrap_or("")
     };
     ManagerObservation {
-        registration: (value("LoadState") == "loaded")
-            .then_some(Registration::Exact)
-            .unwrap_or(Registration::Broken),
+        registration: if value("LoadState") == "loaded" {
+            Registration::Exact
+        } else {
+            Registration::Broken
+        },
         boot: match value("UnitFileState") {
             "enabled" => Boot::Enabled,
             "linked" | "disabled" => Boot::Disabled,
