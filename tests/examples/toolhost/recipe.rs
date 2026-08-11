@@ -195,6 +195,8 @@ fn loaded_runtime_witness_requires_staged_identity_and_origin() {
     std::fs::create_dir_all(&runtime).unwrap();
     let expected = runtime.join(if cfg!(windows) {
         "expected.dll"
+    } else if cfg!(target_os = "macos") {
+        "libexpected.dylib"
     } else {
         "libexpected.so"
     });
@@ -231,8 +233,10 @@ fn loaded_runtime_witness_requires_staged_identity_and_origin() {
         "-o".as_ref(),
         binary.as_os_str(),
     ]);
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     command.args(["-C", "link-arg=-Wl,-rpath,$ORIGIN/../private-runtime"]);
+    #[cfg(target_os = "macos")]
+    command.args(["-C", "link-arg=-Wl,-rpath,@loader_path/../private-runtime"]);
     assert!(command.status().unwrap().success());
     let path = expected.file_name().unwrap().into();
     Verification::LoadedRuntime {

@@ -110,6 +110,8 @@ impl Host {
         environment.push(("PATH".into(), runtime.into_os_string()));
         #[cfg(target_os = "linux")]
         environment.push(("LD_LIBRARY_PATH".into(), runtime.into_os_string()));
+        #[cfg(target_os = "macos")]
+        environment.push(("DYLD_LIBRARY_PATH".into(), runtime.into_os_string()));
         let control = Control::arm()?;
         let process = text(ManagedProcess::new(
             self.release

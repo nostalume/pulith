@@ -17,7 +17,11 @@ unsafe extern "C" {
 
 fn main() {
     unsafe {
-        let handle = dlopen(c"libexpected.so".as_ptr(), 2);
+        #[cfg(target_os = "macos")]
+        let name = c"libexpected.dylib";
+        #[cfg(not(target_os = "macos"))]
+        let name = c"libexpected.so";
+        let handle = dlopen(name.as_ptr(), 2);
         assert!(!handle.is_null());
         let function = dlsym(handle, c"runtime_identity".as_ptr());
         assert!(!function.is_null());

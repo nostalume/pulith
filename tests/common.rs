@@ -117,6 +117,20 @@ pub fn absolute_program() -> PathBuf {
     }
 }
 
+#[cfg(all(feature = "process", windows))]
+pub fn windows_shell_environment() -> Vec<(OsString, OsString)> {
+    ["SystemRoot", "TEMP", "TMP"]
+        .into_iter()
+        .map(|key| {
+            (
+                OsString::from(key),
+                std::env::var_os(key)
+                    .unwrap_or_else(|| panic!("{key} is required by the Windows process fixture")),
+            )
+        })
+        .collect()
+}
+
 /// Builds the `MARKER` (+ `LOOP_SCRIPT` on windows) environment for a descendant-loop fixture.
 #[cfg(feature = "process")]
 pub fn marker_environment(marker: &Path) -> EnvVars {
@@ -132,18 +146,13 @@ pub fn marker_environment(marker: &Path) -> EnvVars {
             "while($true){[IO.File]::AppendAllText($env:MARKER,'x'); Start-Sleep -Milliseconds 50}",
         )
         .unwrap();
-        EnvVars::new([
-            (
-                OsString::from("SystemRoot"),
-                std::env::var_os("SystemRoot").unwrap(),
-            ),
-            (OsString::from("MARKER"), marker.as_os_str().to_os_string()),
-            (
-                OsString::from("LOOP_SCRIPT"),
-                loop_script.as_os_str().to_os_string(),
-            ),
-        ])
-        .unwrap()
+        let mut environment = windows_shell_environment();
+        environment.push((OsString::from("MARKER"), marker.as_os_str().to_os_string()));
+        environment.push((
+            OsString::from("LOOP_SCRIPT"),
+            loop_script.as_os_str().to_os_string(),
+        ));
+        EnvVars::new(environment).unwrap()
     }
 }
 
@@ -236,13 +245,7 @@ pub fn fixture_process(fixture: Fixture, output: &str, timeout: Duration) -> Out
     .unwrap()
     .with_arguments(arguments);
     #[cfg(windows)]
-    let action = action.with_environment(
-        EnvVars::new([(
-            OsString::from("SystemRoot"),
-            std::env::var_os("SystemRoot").unwrap(),
-        )])
-        .unwrap(),
-    );
+    let action = action.with_environment(EnvVars::new(windows_shell_environment()).unwrap());
     action
 }
 

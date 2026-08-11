@@ -259,14 +259,13 @@ fn worktree_env_vars_do_not_inherit_caller_entries() {
     let root = common::temp_dir();
     let key = "PULITH_WORKTREE_AMBIENT_FIXTURE";
     unsafe { std::env::set_var(key, "ambient") };
-    let entries = vec![(OsString::from("ADMITTED"), OsString::from("yes"))];
+    let admitted = [(OsString::from("ADMITTED"), OsString::from("yes"))];
+    #[cfg(unix)]
+    let entries = admitted;
     #[cfg(windows)]
     let entries = {
-        let mut entries = entries;
-        entries.push((
-            OsString::from("SystemRoot"),
-            std::env::var_os("SystemRoot").unwrap(),
-        ));
+        let mut entries = common::windows_shell_environment();
+        entries.extend(admitted);
         entries
     };
     let environment = EnvVars::new(entries).unwrap();

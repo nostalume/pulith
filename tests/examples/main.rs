@@ -219,6 +219,8 @@ fn toolhost_packaged_vertical_builds_verifies_publishes_and_dispatches() {
         .join("tests/examples/toolhost/fixtures/runtime_library.rs");
     let library_name = if cfg!(windows) {
         "expected.dll"
+    } else if cfg!(target_os = "macos") {
+        "libexpected.dylib"
     } else {
         "libexpected.so"
     };
@@ -255,12 +257,20 @@ fn toolhost_packaged_vertical_builds_verifies_publishes_and_dispatches() {
         "-o".to_string(),
         binary.clone(),
     ];
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let arguments = arguments
         .into_iter()
         .chain([
             "-C".into(),
             "link-arg=-Wl,-rpath,$ORIGIN/../private-runtime".into(),
+        ])
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    let arguments = arguments
+        .into_iter()
+        .chain([
+            "-C".into(),
+            "link-arg=-Wl,-rpath,@loader_path/../private-runtime".into(),
         ])
         .collect::<Vec<_>>();
     let args = arguments
