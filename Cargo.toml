@@ -7,29 +7,38 @@ license = "Apache-2.0"
 description = "Composable typed behaviors for external-resource management"
 repository = "https://github.com/nostalume/pulith"
 homepage = "https://github.com/nostalume/pulith"
+documentation = "https://docs.rs/pulith"
 readme = "README.md"
+keywords = ["artifacts", "resources", "deployment", "filesystem", "process"]
+categories = ["filesystem", "development-tools"]
 include = [
     "/src/**",
     "/tests/**",
-    "/AGENTS.md",
+    "/examples/**",
+    "/docs/**",
+    "/CONTRIBUTING.md",
     "/Cargo.toml",
-    "/Cargo.lock",
     "/LICENSE",
     "/README.md",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
-default = ["local"]
+default = ["archive"]
 local = ["dep:rustix", "dep:same-file", "dep:tempfile", "dep:walkdir", "dep:windows-sys"]
 process = ["local"]
 net = ["dep:url", "dep:httpdate", "dep:governor"]
-http-sync = ["net", "local", "dep:ureq"]
-http-async = ["net", "local", "dep:tokio", "dep:reqwest"]
-process-async = ["process", "dep:tokio"]
+http-ureq = ["net", "local", "dep:ureq"]
+http-reqwest = ["net", "local", "dep:tokio", "dep:reqwest"]
+process-tokio = ["process", "dep:tokio"]
 hash = []
 serde = ["dep:serde"]
-blake3 = ["hash", "dep:blake3", "dep:hex"]
-sha2 = ["hash", "dep:sha2", "dep:hex"]
+blake3 = ["hash", "local", "dep:blake3", "dep:hex"]
+sha2 = ["hash", "local", "dep:sha2", "dep:hex"]
+archive = ["zip", "gzip", "xz", "zstd"]
 zip = ["local", "dep:zip"]
 tar = ["local", "dep:tar"]
 gzip = ["tar", "dep:flate2"]
@@ -48,7 +57,7 @@ same-file = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 tar = { version = "0.4.45", optional = true }
 tempfile = { version = "3", optional = true }
-tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "time"], optional = true }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "time"], optional = true }
 ureq = { version = "3.3", default-features = false, features = ["rustls"], optional = true }
 url = { version = "2.5", features = ["serde"], optional = true }
 walkdir = { version = "2.5", optional = true }
@@ -60,7 +69,7 @@ zstd = { version = "0.13.3", optional = true }
 rustix = { version = "1", features = ["fs", "process"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"], optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Services"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -68,6 +77,29 @@ serde_json = "1"
 tempfile = "3"
 toml = "0.9"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+signal-hook = "0.4"
+sd-notify = "0.5"
+
 [[example]]
 name = "vtool"
-required-features = ["local", "http-sync", "zip", "tar", "gzip", "blake3", "sha2", "serde"]
+required-features = ["local", "http-ureq", "zip", "tar", "gzip", "blake3", "sha2", "serde"]
+
+[[example]]
+name = "toolhost"
+path = "examples/toolhost/main.rs"
+required-features = ["serde", "process"]
+
+[[example]]
+name = "toolhost-shim"
+path = "examples/toolhost/shim.rs"
+
+[[example]]
+name = "toolhost-service"
+path = "examples/toolhost/service_host.rs"
+required-features = ["serde", "process"]
+
+[[test]]
+name = "examples"
+path = "tests/examples/main.rs"
+required-features = ["local", "http-ureq", "archive", "blake3", "sha2", "serde", "process"]

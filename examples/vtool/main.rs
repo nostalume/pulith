@@ -1,118 +1,136 @@
 mod manifest;
 mod realize;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "plan".to_string());
-    match command.as_str() {
-        "plan" => plan(&mut args),
-        "install" => install(&mut args),
-        "deactivate" => deactivate(&mut args),
-        "repair" => repair(&mut args),
-        other => panic!(
-            "unknown command {other:?}: expected `plan`, `install`, `deactivate`, or `repair`"
-        ),
-    }
-}
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-fn install(args: &mut impl Iterator<Item = String>) {
-    let manifest_path = args
-        .next()
-        .expect("usage: vtool install <manifest.toml> <layout-root>");
-    let root = args
-        .next()
-        .expect("usage: vtool install <manifest.toml> <layout-root>");
-    let text = std::fs::read_to_string(&manifest_path).expect("read manifest");
-    let manifest = manifest::Manifest::parse(&text).expect("parse manifest");
-    let resolved = manifest.resolve(Path::new(&root)).expect("resolve");
-    let outcome = resolved.install(Path::new(&root)).expect("install");
-    println!("outcome: {outcome:?}");
-}
-
-fn deactivate(args: &mut impl Iterator<Item = String>) {
-    let manifest_path = args
-        .next()
-        .expect("usage: vtool deactivate <manifest.toml> <layout-root>");
-    let root = args
-        .next()
-        .expect("usage: vtool deactivate <manifest.toml> <layout-root>");
-    let text = std::fs::read_to_string(&manifest_path).expect("read manifest");
-    let manifest = manifest::Manifest::parse(&text).expect("parse manifest");
-    let resolved = manifest.resolve(Path::new(&root)).expect("resolve");
-    resolved.deactivate(Path::new(&root)).expect("deactivate");
-    println!("deactivated");
-}
-
-fn repair(args: &mut impl Iterator<Item = String>) {
-    let manifest_path = args
-        .next()
-        .expect("usage: vtool repair <manifest.toml> <layout-root> [--attempts N]");
-    let root = args
-        .next()
-        .expect("usage: vtool repair <manifest.toml> <layout-root> [--attempts N]");
-    let mut attempts = 3;
-    while let Some(flag) = args.next() {
-        if flag == "--attempts" {
-            attempts = args
-                .next()
-                .and_then(|value| value.parse().ok())
-                .expect("--attempts needs a positive number");
+fn main() -> ExitCode {
+    match Command::parse(std::env::args_os().skip(1)).and_then(Command::execute) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(CliError::Usage(message)) => {
+            eprintln!("vtool: {message}");
+            ExitCode::from(2)
+        }
+        Err(CliError::Operation(error)) => {
+            eprintln!("vtool: {error}");
+            ExitCode::FAILURE
         }
     }
-    let text = std::fs::read_to_string(&manifest_path).expect("read manifest");
-    let manifest = manifest::Manifest::parse(&text).expect("parse manifest");
-    let resolved = manifest.resolve(Path::new(&root)).expect("resolve");
-    let report = realize::repair(
-        &resolved,
-        Path::new(&root),
-        attempts,
-        std::time::Duration::from_millis(100),
-    )
-    .expect("repair");
-    println!("{report}");
 }
 
-fn plan(args: &mut impl Iterator<Item = String>) {
-    let manifest_path = args
-        .next()
-        .expect("usage: vtool plan <manifest.toml> <layout-root>");
-    let root = args
-        .next()
-        .expect("usage: vtool plan <manifest.toml> <layout-root>");
-    let text = std::fs::read_to_string(&manifest_path).expect("read manifest");
-    let manifest = manifest::Manifest::parse(&text).expect("parse manifest");
-    let resolved = manifest.resolve(Path::new(&root)).expect("resolve");
+enum Command {
+    Plan(PathBuf, PathBuf),
+    Install(PathBuf, PathBuf),
+    Activate(PathBuf, PathBuf),
+    Deactivate(PathBuf, PathBuf),
+    Repair(PathBuf, PathBuf, usize),
+}
 
-    println!(
-        "plan: {}@{}\n",
-        resolved.manifest.name.as_str(),
-        resolved.manifest.version.as_str()
-    );
-    println!("  source:   {}", describe_source(&resolved.manifest));
-    println!("  target:   {}", resolved.target.display());
-    match &resolved.manifest.expose {
-        Some(expose) => println!("  expose:   {}", expose.display()),
-        None => println!("  expose:   (tree root)"),
+enum CliError {
+    Usage(String),
+    Operation(BoxError),
+}
+
+impl Command {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, CliError> {
+        let mut args = args.into_iter();
+        let verb = args
+            .next()
+            .ok_or_else(|| CliError::Usage("missing verb".into()))?;
+        let verb = verb
+            .to_str()
+            .ok_or_else(|| CliError::Usage("verb is not Unicode".into()))?;
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--root")) {
+            return Err(CliError::Usage(
+                "expected --root <absolute-root> after verb".into(),
+            ));
+        }
+        let root = PathBuf::from(
+            args.next()
+                .ok_or_else(|| CliError::Usage("--root requires a path".into()))?,
+        );
+        if !root.is_absolute() {
+            return Err(CliError::Usage("--root must be absolute".into()));
+        }
+        let manifest = PathBuf::from(
+            args.next()
+                .ok_or_else(|| CliError::Usage(format!("{verb} requires a manifest")))?,
+        );
+        match verb {
+            "plan" => return Ok(Self::Plan(root, manifest)),
+            "install" => return Ok(Self::Install(root, manifest)),
+            "activate" => return Ok(Self::Activate(root, manifest)),
+            "deactivate" => return Ok(Self::Deactivate(root, manifest)),
+            "repair" => {}
+            _ => return Err(CliError::Usage(format!("unknown verb: {verb}"))),
+        }
+        let attempts = match (args.next(), args.next()) {
+            (None, None) => 3,
+            (Some(flag), Some(value)) if flag == "--attempts" => value
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| CliError::Usage("--attempts needs a positive number".into()))?,
+            _ => return Err(CliError::Usage("repair accepts only --attempts N".into())),
+        };
+        Ok(Self::Repair(root, manifest, attempts))
     }
-    match &resolved.view {
-        Some(view) => println!("  link_at:  {}", view.display()),
-        None => println!("  link_at:  (no view)"),
+
+    fn execute(self) -> Result<(), CliError> {
+        let result = (|| -> Result<(), BoxError> {
+            let (root, manifest) = match &self {
+                Self::Plan(root, manifest)
+                | Self::Install(root, manifest)
+                | Self::Activate(root, manifest)
+                | Self::Deactivate(root, manifest)
+                | Self::Repair(root, manifest, _) => (root, manifest),
+            };
+            let resolved = manifest::Manifest::load(manifest)?.resolve(root)?;
+            match self {
+                Self::Plan(..) => {
+                    println!(
+                        "plan: {}@{}",
+                        resolved.manifest.name.as_str(),
+                        resolved.manifest.version.as_str()
+                    );
+                    println!("source={}", describe_source(&resolved.source));
+                    println!("target={}", resolved.target.display());
+                }
+                Self::Install(..) => {
+                    resolved.install(root)?;
+                    println!("installed");
+                }
+                Self::Activate(..) => println!("outcome={:?}", resolved.activate(root)?),
+                Self::Deactivate(..) => {
+                    resolved.deactivate(root)?;
+                    println!("deactivated");
+                }
+                Self::Repair(_, _, attempts) => println!(
+                    "{:?}",
+                    realize::repair(
+                        &resolved,
+                        root,
+                        attempts,
+                        std::time::Duration::from_millis(100),
+                    )?
+                ),
+            }
+            Ok(())
+        })();
+        result.map_err(CliError::Operation)
     }
 }
 
-fn describe_source(manifest: &manifest::Manifest) -> String {
-    let spec = if cfg!(windows) {
-        manifest.windows.as_ref()
-    } else {
-        manifest.linux.as_ref()
-    };
-    match spec.map(|spec| match &spec.source {
+fn describe_source(source: &manifest::Source) -> String {
+    match source {
         manifest::Source::Url { url } => url.as_str().to_string(),
         manifest::Source::Local { path } => path.display().to_string(),
-    }) {
-        Some(described) => described,
-        None => "(no source for this platform)".to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/examples/vtool/main.rs"]
+mod tests;

@@ -1,12 +1,11 @@
-#![cfg(feature = "process-async")]
+#![cfg(feature = "process-tokio")]
 
 use std::time::Duration;
 
 mod common;
-use common::{Fixture, captured_contains, fixture_action, marker_environment};
-use pulith::local::LocalApply;
-use pulith::process::{CancellationToken, Cooperative, InputSpec, ProcessAcquire, ProcessError};
-use pulith::{AsyncAcquire, Materialize, MaterializeMode};
+use common::{Fixture, captured_contains, fixture_process, marker_environment};
+use pulith::AsyncAcquire;
+use pulith::process::{CancelToken, OutputResult, RunError, StagedInput};
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -16,30 +15,34 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+type AcquireOutput = OutputResult;
+
 #[test]
 fn async_success_stages_tree_before_local_apply_and_preserves_evidence_order() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("published");
-    let acquired = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            fixture_action(Fixture::Success, "tree", Duration::from_secs(2)),
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
+    let prepared = fixture_process(Fixture::Success, "tree", Duration::from_secs(10))
+        .prepare()
+        .unwrap();
+    fn assert_send(_: impl Send) {}
+    assert_send(AsyncAcquire::acquire(prepared));
+    let acquired: AcquireOutput = block_on(AsyncAcquire::acquire(
+        fixture_process(Fixture::Success, "tree", Duration::from_secs(10))
+            .prepare()
+            .unwrap(),
     ))
     .unwrap();
 
     assert!(!target.exists());
     assert_eq!(
-        std::fs::read(acquired.material.root().join("bin/tool")).unwrap(),
+        std::fs::read(acquired.tree.root().join("bin/tool")).unwrap(),
         b"pulith"
     );
-    let pulith::EvidenceChain { previous, current } = &acquired.evidence;
+    let previous = &acquired.evidence;
+    let current = &acquired.diagnostics;
     assert_eq!(
         previous.output,
-        pulith::process::WorkspaceRelativePath::new("tree").unwrap()
+        pulith::process::OutputPath::new("tree").unwrap()
     );
     let stdout = current.stdout.as_deref().expect("captured stdout");
     let stderr = current.stderr.as_deref().expect("captured stderr");
@@ -55,8 +58,10 @@ fn async_success_stages_tree_before_local_apply_and_preserves_evidence_order() {
     );
     assert!(!current.stdout_truncated && !current.stderr_truncated);
 
-    let applied = LocalApply.apply(acquired).unwrap();
-    assert_eq!(applied.input.item, "process-fixture");
+    acquired
+        .tree
+        .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
+        .unwrap();
     assert_eq!(std::fs::read(target.join("bin/tool")).unwrap(), b"pulith");
 }
 
@@ -67,19 +72,15 @@ fn async_staged_input_is_reachable_with_exact_bytes_via_input_root() {
     std::fs::write(&source, b"async-closure-bytes").unwrap();
     let target = root.path().join("published");
 
-    let acquired = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            fixture_action(Fixture::CopiesInputEnv, "tree", Duration::from_secs(30))
-                .with_inputs([InputSpec::new(&source, "input.txt")]),
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
-    ))
-    .unwrap();
+    let action = fixture_process(Fixture::CopiesInputEnv, "tree", Duration::from_secs(30))
+        .with_inputs([StagedInput::new(&source, "input.txt").unwrap()]);
 
-    LocalApply.apply(acquired).unwrap();
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
+    acquired
+        .tree
+        .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
+        .unwrap();
     assert_eq!(
         std::fs::read(target.join("file.txt")).unwrap(),
         b"async-closure-bytes"
@@ -94,21 +95,13 @@ fn async_timeout_stops_descendant_and_carries_captured_diagnostics() {
 
     let environment = marker_environment(&marker);
 
-    let action = fixture_action(Fixture::SpawnsDescendant, "tree", Duration::from_secs(2))
+    let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(10))
         .with_environment(environment);
 
-    let result = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            action,
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
-    ));
+    let result = block_on(AsyncAcquire::acquire(action.prepare().unwrap()));
 
     match result {
-        Err(ProcessError::TimedOut { diagnostics, .. }) => {
+        Err(RunError::TimedOut { diagnostics, .. }) => {
             let stdout = diagnostics.stdout.as_deref().expect("captured stdout");
             assert!(
                 stdout.windows(7).any(|window| window == b"spawned"),
@@ -136,21 +129,13 @@ fn async_timeout_stops_descendant_and_carries_captured_diagnostics() {
 #[test]
 fn async_capture_truncates_streams_at_the_cap() {
     let root = tempfile::tempdir().unwrap();
-    let target = root.path().join("published");
+    let _target = root.path().join("published");
     let action =
-        fixture_action(Fixture::Success, "tree", Duration::from_secs(2)).with_capture_cap(16);
-    let acquired = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            action,
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
-    ))
-    .unwrap();
+        fixture_process(Fixture::Success, "tree", Duration::from_secs(10)).with_capture_cap(16);
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
 
-    let pulith::EvidenceChain { current, .. } = &acquired.evidence;
+    let current = &acquired.diagnostics;
     assert_eq!(current.cap, 16);
     let stdout = current.stdout.as_deref().expect("captured stdout");
     assert!(stdout.len() <= 16, "stdout exceeded cap: {}", stdout.len());
@@ -160,21 +145,13 @@ fn async_capture_truncates_streams_at_the_cap() {
 #[test]
 fn async_capture_cap_zero_disables_capture() {
     let root = tempfile::tempdir().unwrap();
-    let target = root.path().join("published");
+    let _target = root.path().join("published");
     let action =
-        fixture_action(Fixture::Success, "tree", Duration::from_secs(2)).with_capture_cap(0);
-    let acquired = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            action,
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
-    ))
-    .unwrap();
+        fixture_process(Fixture::Success, "tree", Duration::from_secs(10)).with_capture_cap(0);
+    let acquired: AcquireOutput =
+        block_on(AsyncAcquire::acquire(action.prepare().unwrap())).unwrap();
 
-    let pulith::EvidenceChain { current, .. } = &acquired.evidence;
+    let current = &acquired.diagnostics;
     assert_eq!(current.cap, 0);
     assert!(current.stdout.is_none() && current.stderr.is_none());
     assert!(!current.stdout_truncated && !current.stderr_truncated);
@@ -182,10 +159,10 @@ fn async_capture_cap_zero_disables_capture() {
 
 #[test]
 fn async_nonzero_exit_carries_captured_diagnostics() {
-    assert_failure(Fixture::Nonzero, Duration::from_secs(2), |error| {
+    assert_failure(Fixture::Nonzero, Duration::from_secs(10), |error| {
         matches!(
             error,
-            ProcessError::ExitedNonZero { diagnostics, .. }
+            RunError::ExitedNonZero { diagnostics, .. }
                 if captured_contains(diagnostics, b"dying-message")
         )
     });
@@ -193,32 +170,26 @@ fn async_nonzero_exit_carries_captured_diagnostics() {
 
 #[test]
 fn async_wrong_kind_output_carries_captured_diagnostics() {
-    assert_failure(Fixture::FileOutput, Duration::from_secs(2), |error| {
+    assert_failure(Fixture::FileOutput, Duration::from_secs(10), |error| {
         matches!(
             error,
-            ProcessError::OutputWrongKind { diagnostics, .. }
+            RunError::OutputWrongKind { diagnostics, .. }
                 if captured_contains(diagnostics, b"warn")
         )
     });
 }
 
-fn assert_failure(fixture: Fixture, timeout: Duration, check: impl Fn(&ProcessError) -> bool) {
+fn assert_failure(fixture: Fixture, timeout: Duration, check: impl Fn(&RunError) -> bool) {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("published");
     let result = block_on(AsyncAcquire::acquire(
-        &ProcessAcquire::<Cooperative>::new(),
-        Materialize::new(
-            "process-fixture",
-            fixture_action(fixture, "tree", timeout),
-            target.clone(),
-            MaterializeMode::CreateNew,
-        ),
+        fixture_process(fixture, "tree", timeout).prepare().unwrap(),
     ));
     let error = match result {
         Err(error) => error,
         Ok(output) => panic!(
             "expected failure, got success with {:?}",
-            output.material.root()
+            output.tree.root()
         ),
     };
     assert!(check(&error), "unexpected error: {error:?}");
@@ -233,21 +204,12 @@ fn async_drop_cancellation_stops_the_admitted_tree() {
 
     let environment = marker_environment(&marker);
 
-    let action = fixture_action(Fixture::SpawnsDescendant, "tree", Duration::from_secs(30))
+    let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(30))
         .with_environment(environment);
 
     block_on(async {
-        let adapter = ProcessAcquire::<Cooperative>::new();
         {
-            let mut future = std::pin::pin!(AsyncAcquire::acquire(
-                &adapter,
-                Materialize::new(
-                    "process-fixture",
-                    action,
-                    target.clone(),
-                    MaterializeMode::CreateNew,
-                )
-            ));
+            let mut future = std::pin::pin!(AsyncAcquire::acquire(action.prepare().unwrap()));
             let waker = noop_waker();
             let mut context = std::task::Context::from_waker(&waker);
             // First poll starts the spawn and reaches the awaited wait loop.
@@ -285,21 +247,13 @@ fn async_token_cancel_stops_tree_while_future_stays_alive() {
 
     let environment = marker_environment(&marker);
 
-    let action = fixture_action(Fixture::SpawnsDescendant, "tree", Duration::from_secs(30))
+    let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(30))
         .with_environment(environment);
-    let token = CancellationToken::new();
+    let token = CancelToken::new();
 
     let result = block_on(async {
-        let adapter = ProcessAcquire::<Cooperative>::new();
-        let mut future = std::pin::pin!(adapter.acquire_with_token(
-            Materialize::new(
-                "process-fixture",
-                action,
-                target.clone(),
-                MaterializeMode::CreateNew,
-            ),
-            &token,
-        ));
+        let mut future =
+            std::pin::pin!(action.prepare().unwrap().acquire_async_cancellable(&token));
         let waker = noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         // First poll starts the spawn and reaches the awaited wait loop.
@@ -324,7 +278,7 @@ fn async_token_cancel_stops_tree_while_future_stays_alive() {
     });
 
     match result {
-        Err(ProcessError::Cancelled { diagnostics, .. }) => {
+        Err(RunError::Cancelled { diagnostics, .. }) => {
             let stdout = diagnostics.stdout.as_deref().expect("captured stdout");
             assert!(
                 stdout.windows(7).any(|window| window == b"spawned"),

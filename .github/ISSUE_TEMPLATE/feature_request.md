@@ -18,7 +18,7 @@ Explain use case this feature would address.
 
 Describe the solution you'd like to see. Pulith admits behaviors by law, not by name: a proposal
 should name the concrete resource input, the owning adapter, the effect/evidence boundary, and the
-failure law (see the stage-2 admission card in `docs/AGENTS.md`). Configuration interpretation,
+failure law (see `docs/architecture.md`). Configuration interpretation,
 durable aggregates, and repair/controller loops are caller-owned today; proposals that need one of
 those axes must name the concrete caller scenario.
 

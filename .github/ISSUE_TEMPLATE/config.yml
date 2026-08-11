@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: 🤚 GitHub Discussions
-    url: https://github.com/lvyuemeng/pulith/discussions
-    about: If your issue is not a feature or bug, go to the discussion panel and retrieve if your issue already exists before submitting it.
+    url: https://github.com/nostalume/pulith/discussions
+    about: Ask usage and design questions, and search existing discussions before opening a new one.

@@ -8,8 +8,10 @@ assignees: ''
 
 ## Environment
 
-- OS: [e.g., Windows, macOS, Linux]
-- Feature set: [e.g., `local`, `process`, `process-async`, `net,http-sync`, `hash,blake3`, `archive,zip`]
+- OS: [e.g. Windows, macOS, Linux]
+- Pulith version or revision:
+- Rust version:
+- Feature set: [e.g. `local`, `process-tokio`, `http-ureq`, `sha2`, `zip`]
 
 ### Description
 
@@ -23,8 +25,8 @@ A series of operations cause the problem.
 
 If the bug involves a behavior adapter (`local`, `net/http`, `hash`, `archive`, `process`), include
 the failing contract case or a minimal reproduction, the exact feature flags used, and whether it
-reproduces on both Windows and Linux. Captured process diagnostics and evidence chains are not
-secret; include them verbatim.
+reproduces on both Windows and Linux. Include relevant diagnostics and evidence after removing
+credentials, tokens, private URLs, and personal paths.
 
 ### Screenshots
 
