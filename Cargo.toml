@@ -75,7 +75,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-toml = "0.9"
+toml = "1.1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 signal-hook = "0.4"
