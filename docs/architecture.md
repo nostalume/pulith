@@ -1,80 +1,157 @@
 # Architecture
 
-Pulith separates an external-resource workflow into independently composable behavior contracts.
-The caller chooses which contracts form a workflow and retains the resulting evidence.
+Pulith is a library of composable contracts for external-resource work. It owns narrow operations,
+resource-specific safety laws, and evidence. The application owns the workflow and its policy.
 
-## Layers
+This separation allows an installer, tool manager, updater, or deployment utility to reuse safe
+mechanisms without inheriting a universal package model.
 
-| Layer | Owner | Responsibility |
+## Contract model
+
+Every Pulith operation belongs to one of four layers:
+
+| Layer | Defines | Owns |
 | --- | --- | --- |
-| behavior | crate root traits | name one operation and its error/output contract |
-| resource semantics | `local`, `net`, `archive`, `hash`, `process` | validate inputs and define resource-specific laws |
-| adapter | feature-selected implementation | perform filesystem, HTTP, process, codec, or platform I/O |
-| application | caller | desired state, identity, orchestration, trust, rollback, and retention |
+| Behavior | one operation and its result shape | crate-root traits such as `Acquire`, `Inspect`, and `Reconcile` |
+| Resource | valid inputs and resource-specific laws | `local`, `net`, `archive`, `hash`, and `process` types |
+| Adapter | the concrete effect mechanism | filesystem, HTTP, codec, process, or platform implementation |
+| Application | why and when operations compose | identity, desired state, trust, orchestration, retention, and recovery |
 
-No global object coordinates these layers. Behavior methods consume the restricted value that owns
-the relevant input law.
+A restricted resource value is useful only when it adds a law: for example, an admitted URL,
+target path, worktree, or exact environment. Pulith avoids wrappers that merely rename an existing
+type, global registries, and context objects whose authority is difficult to see.
 
-## Dataflow
+## Behavioral laws
 
-One common artifact flow is:
+Four rules govern the API:
+
+1. **Admit before effect.** Inputs are parsed and restricted before the operation can mutate or
+   execute.
+2. **One method, one declared effect.** Inspection does not repair; reconciliation does not mutate;
+   acquisition does not publish.
+3. **Return evidence at the observation point.** The adapter that observed or changed a resource
+   reports the corresponding typed evidence.
+4. **Preserve custody until commit.** Temporary material remains privately owned until an explicit
+   publication method consumes it.
+
+Evidence is audit data. It records an observation or effect, but is not proof of authorization,
+provenance, or an unforgeable capability.
+
+## Artifact lifecycle
+
+A typical application may compose this flow:
 
 ```text
-source -> acquire -> optional verify -> optional archive preparation
-       -> private staged tree -> publish -> inspect -> reconcile
-                                      `-> optional link into a consumer view
+admit source
+    -> acquire private material
+    -> verify an explicit expectation
+    -> prepare into a private tree
+    -> publish the completed tree
+    -> inspect current state
+    -> reconcile with caller-owned intent
+    -> optionally link a consumer-visible view
 ```
 
-Each arrow is a real method or trait operation. The shape is descriptive, not a mandatory pipeline:
-removal, inspection, reconciliation, linking, and process execution remain independently callable.
+This is not a built-in pipeline. Every step is independently callable, and the application may
+omit, reorder, or branch between operations where their contracts permit it.
 
-## Custody and publication
+### Acquisition
 
-`LocalSource` and `LocalTarget` admit non-empty filesystem identities. Caller-owned local files and
-directories survive value drop. Adapter-owned staged files and `StagedTree` values retain cleanup
-custody until consumed or dropped.
+`Acquire` obtains material from an admitted source. Local and HTTP adapters differ in transport but
+return staged material under the same custody rule. Neither receives authority to select or
+publish the final application destination.
 
-A destination-oriented stage is created beside its target. `StagedTree::publish` is the commit
-boundary: it publishes a new tree without exposing a partially assembled destination. Process
-scratch stages are separate custody and cannot be published as destination-oriented stages.
+### Verification and preparation
 
-The library assumes trusted parent directories. Its final-component checks and staging laws are not
-a capability sandbox against hostile concurrent mutation of ancestors.
+`Verify` proves one explicit expectation, such as an exact digest. Digest algorithms are separate
+features because selecting BLAKE3 is not equivalent to selecting SHA-256.
 
-## Observation and evidence
+Archive formats prepare into caller-selected private workspace. Preparation applies decoded-size,
+entry-count, path, link, collision, and file-kind rules to the material actually encountered. ZIP,
+TAR, and compressed TAR support share a safety contract while retaining format-specific decoding.
 
-Inspection reports facts and does not mutate. Reconciliation compares those facts with an explicit
-expectation and also does not mutate. Repair is application composition of observation plus selected
-effects, never an implicit branch inside reconciliation.
+### Staging and publication
 
-Evidence records what a concrete operation observed or changed. It is useful audit data, not proof
-of authorization, provenance, or an unforgeable capability.
+A destination-oriented `StagedTree` is created beside its target. Its methods assemble a complete
+tree while that tree is private. `publish` consumes the stage and is the commit boundary: readers
+must not observe a partially assembled destination.
 
-## Feature ownership
+Process scratch output uses separate custody. A scratch worktree cannot accidentally acquire the
+authority of a destination-oriented stage.
 
-- `local` owns filesystem admission, staging, publication, views, records, and metadata inspection.
-- `hash` owns digest vocabulary; `blake3` and `sha2` add concrete local verification.
-- `archive` formats prepare into a caller-provided extraction workspace under explicit limits.
-- `net` owns URL, retry, admission, pacing, and evidence vocabulary; HTTP adapters own transport.
-- `process` owns admitted worktrees, exact environments, bounded diagnostics, managed sessions, and
-  staged outputs. Tokio adapters preserve the same result semantics.
+### Observation and reconciliation
 
-Parent features do not hide unrelated algorithms. A consumer can select one HTTP adapter, digest,
-or archive format without enabling every implementation.
+`Inspect` reports current facts and does not mutate. `Reconcile` compares an observation with an
+explicit caller-owned expectation and also does not mutate. Repair is application code that selects
+subsequent effects based on that difference.
 
-## Failure domains
+Views are similarly explicit: `Link` exposes a published tree and `Unlink` withdraws the selected
+view. Platform mechanisms may differ, but the declared effect may not.
 
-- Admission errors occur before the associated effect.
-- Acquisition never grants authority to publish a caller's final target.
-- Archive limits are checked against observed decoded/materialized data.
-- Publication does not report failure merely because later best-effort cleanup failed.
-- Process cancellation and timeout retain their own explicit methods and evidence.
-- Record edits use bounded streaming custody and atomic replacement rather than loading arbitrary
-  state into one unbounded buffer.
+## Process lifecycle
 
-## Platform semantics
+Process resources separate four concerns:
 
-Linux and Windows adapters must implement equal declared meaning even when mechanisms differ.
-macOS currently receives best-effort build and test observation. Service-manager adapters are kept
-in the `toolhost` example because systemd and Windows SCM are ecosystem policy, not universal Pulith
-behavior.
+| Concern | Contract |
+| --- | --- |
+| Command and worktree admission | resolve executable identity and restrict working-directory scope |
+| Environment construction | build an exact environment rather than inheriting ambient state implicitly |
+| Execution | run to completion with explicit time and diagnostic bounds |
+| Managed lifetime | acquire a running session, then wait, cancel, or terminate through separate methods |
+
+Configuration choices that change behavior use separate constructors or methods rather than an
+`Option<T>` switch. Synchronous and asynchronous adapters preserve the same outcomes, limits, and
+evidence; only waiting and I/O modality change.
+
+## Ownership by module
+
+| Module or feature | Responsibility |
+| --- | --- |
+| `local` | path admission, staging, publication, views, records, metadata inspection |
+| `hash` | digest vocabulary |
+| `blake3`, `sha2` | concrete exact-digest verification |
+| archive format features | safe preparation through a selected decoder |
+| `net` | URL admission, retry, pacing, limits, and transport-neutral evidence |
+| `http-ureq`, `http-reqwest` | synchronous and asynchronous HTTP transport |
+| `process` | admitted worktrees, exact environments, bounded execution, managed sessions |
+| `process-tokio` | asynchronous process execution with the same process contract |
+
+Parent features do not silently choose unrelated algorithms or runtimes. Consumers select only the
+adapter, codec, digest, or runtime they need.
+
+## Failure and recovery
+
+- Admission failures occur before the associated external effect.
+- Failure evidence preserves bounded diagnostics rather than collecting unbounded process output.
+- Network retry obeys admitted policy and pacing; it is not hidden in the application workflow.
+- Archive limits apply during preparation, before publication.
+- Publication success is not rewritten as failure because later best-effort cleanup failed.
+- Durable records use bounded streaming custody and atomic replacement rather than loading an
+  arbitrary journal into one buffer.
+- Recovery and rollback remain explicit application decisions based on retained material and
+  evidence.
+
+## Platform contract
+
+Linux and Windows are required semantic peers. Each may use its native filesystem, process, or
+service-manager mechanism, but both must implement the same declared operation. macOS remains
+best-effort until equivalent runtime evidence is continuously available.
+
+Systemd and Windows SCM integration stays in the `toolhost` example. Their service ecosystems,
+privilege models, and lifecycle policy are application adapters, not universal Pulith behavior.
+The example uses Pulith for the reusable pieces: admitted paths and environments, process
+execution, staged publication, inspection, and evidence.
+
+## Extension test
+
+A proposed abstraction belongs in Pulith only when all of these are true:
+
+- more than one application can use the same resource law;
+- the contract has a narrow, nameable effect;
+- the library can return meaningful typed evidence;
+- authority and cleanup custody remain visible;
+- platform adapters can provide equal semantics;
+- the abstraction does not force application identity or orchestration policy into the crate.
+
+Otherwise, keep the behavior in the application or example until repeated use reveals a smaller
+general contract.

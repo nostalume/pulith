@@ -6,7 +6,9 @@ technical stack, and [`docs/architecture.md`](docs/architecture.md) for current 
 
 ## Development setup
 
-Install Rust 1.88 or newer with rustfmt and Clippy. Clone the canonical repository:
+The crate supports Rust 1.88 and newer. The repository selects Rust 1.98 with rustfmt and Clippy
+through `rust-toolchain.toml`; rustup installs that development toolchain on first use. Clone the
+canonical repository:
 
 ```text
 git clone https://github.com/nostalume/pulith.git

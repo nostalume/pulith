@@ -33,7 +33,9 @@ system, service ecosystem, or global workflow engine.
 
 | Role | Technology |
 | --- | --- |
-| Language and MSRV | Rust 2024, Rust 1.88 |
+| Language | Rust 2024 |
+| Development toolchain | Rust 1.98 |
+| MSRV | Rust 1.88 |
 | Synchronous HTTP | ureq with rustls |
 | Asynchronous HTTP | reqwest with rustls on Tokio |
 | Admission and pacing | governor |
