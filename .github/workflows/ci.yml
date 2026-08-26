@@ -89,7 +89,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo package --locked
       - run: cargo package --list
 
