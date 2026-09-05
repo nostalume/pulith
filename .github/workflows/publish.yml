@@ -52,7 +52,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: softprops/action-gh-release@v3.0.2
+      - uses: softprops/action-gh-release@v3.0.3
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
