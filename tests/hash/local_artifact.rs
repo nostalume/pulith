@@ -55,7 +55,8 @@ fn exact_inspection_and_reconciliation_use_the_digest_need() {
         DigestAlgorithmKind::Blake3,
         blake3::hash(b"pulith").to_hex().to_string(),
         6,
-    );
+    )
+    .unwrap();
 
     let (observation, evidence) = LocalTarget::new(path)
         .unwrap()
@@ -79,11 +80,14 @@ fn exact_inspection_classifies_same_size_content_drift() {
         .inspect(DigestAlgorithmKind::Blake3)
         .unwrap();
     let (reconciliation, _) = observation
-        .reconcile(ArtifactDescriptor::new(
-            DigestAlgorithmKind::Blake3,
-            blake3::hash(b"pulith").to_hex().to_string(),
-            6,
-        ))
+        .reconcile(
+            ArtifactDescriptor::new(
+                DigestAlgorithmKind::Blake3,
+                blake3::hash(b"pulith").to_hex().to_string(),
+                6,
+            )
+            .unwrap(),
+        )
         .unwrap();
     assert!(matches!(
         reconciliation,
@@ -103,11 +107,14 @@ fn exact_inspection_reconciles_unequal_bytes_as_size_mismatch() {
         .inspect(DigestAlgorithmKind::Blake3)
         .unwrap();
     let (reconciliation, _) = observation
-        .reconcile(ArtifactDescriptor::new(
-            DigestAlgorithmKind::Blake3,
-            blake3::hash(b"short").to_hex().to_string(),
-            5,
-        ))
+        .reconcile(
+            ArtifactDescriptor::new(
+                DigestAlgorithmKind::Blake3,
+                blake3::hash(b"short").to_hex().to_string(),
+                5,
+            )
+            .unwrap(),
+        )
         .unwrap();
     assert_eq!(
         reconciliation,
@@ -126,7 +133,8 @@ fn exact_inspection_reports_missing_and_directory() {
         DigestAlgorithmKind::Blake3,
         blake3::hash(b"expected").to_hex().to_string(),
         8,
-    );
+    )
+    .unwrap();
 
     let (missing, _) = LocalTarget::new(root.path().join("missing"))
         .unwrap()
@@ -166,11 +174,14 @@ fn exact_inspection_does_not_follow_final_symlinks() {
     assert_eq!(observation, LocalArtifactObservation::Symlink);
     assert_eq!(
         observation
-            .reconcile(ArtifactDescriptor::new(
-                DigestAlgorithmKind::Blake3,
-                blake3::hash(b"secret").to_hex().to_string(),
-                6,
-            ))
+            .reconcile(
+                ArtifactDescriptor::new(
+                    DigestAlgorithmKind::Blake3,
+                    blake3::hash(b"secret").to_hex().to_string(),
+                    6,
+                )
+                .unwrap()
+            )
             .unwrap()
             .0,
         ArtifactReconciliation::WrongKind {
@@ -229,7 +240,8 @@ fn sha256_exact_inspection_uses_the_explicit_digest_need() {
         DigestAlgorithmKind::Sha256,
         sha256_digest(b"pulith").as_str(),
         6,
-    );
+    )
+    .unwrap();
 
     let (observation, evidence) = LocalTarget::new(path)
         .unwrap()
@@ -298,4 +310,11 @@ fn symlink_is_classified_by_resolved_target() {
         .inspect(())
         .unwrap();
     assert_eq!(observation, LocalObservation::SymlinkToDirectory);
+}
+
+#[test]
+fn artifact_descriptor_rejects_invalid_digest_without_panicking() {
+    let error = ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, "not-a-digest", 0)
+        .expect_err("invalid digest must be rejected");
+    assert!(error.contains("64 hex digits"));
 }

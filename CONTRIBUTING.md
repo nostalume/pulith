@@ -6,7 +6,7 @@ technical stack, and [`docs/architecture.md`](docs/architecture.md) for current 
 
 ## Development setup
 
-The crate supports Rust 1.88 and newer. The repository selects Rust 1.98 with rustfmt and Clippy
+The crate supports Rust 1.88 and newer. The repository selects Rust 1.99 with rustfmt and Clippy
 through `rust-toolchain.toml`; rustup installs that development toolchain on first use. Clone the
 canonical repository:
 
@@ -28,6 +28,13 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 cargo doc --locked --all-features --no-deps
 cargo deny check advisories bans sources
+```
+
+The process-tree tests share Windows job-object and child-process resources; run the full suite
+serially on Windows to avoid scheduler-dependent contention:
+
+```text
+cargo test --locked --all-features -- --test-threads=1
 ```
 
 Public APIs must also pass strict documentation linting:

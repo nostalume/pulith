@@ -2024,8 +2024,17 @@ fn assign_to_job(pid: u32) -> io::Result<JobHandle> {
                 if entry.th32OwnerProcessID == pid {
                     let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
                     if !thread.is_null() {
-                        ResumeThread(thread);
+                        let resume_result = ResumeThread(thread);
+                        let resume_error = if resume_result == u32::MAX {
+                            Some(io::Error::last_os_error())
+                        } else {
+                            None
+                        };
                         CloseHandle(thread);
+                        if let Some(error) = resume_error {
+                            CloseHandle(snapshot);
+                            return Err(error);
+                        }
                         resumed = true;
                         break;
                     }

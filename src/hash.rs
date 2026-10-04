@@ -251,11 +251,21 @@ pub struct ArtifactDescriptor {
 
 impl ArtifactDescriptor {
     /// Constructs an exact artifact descriptor from digest algorithm, value, and byte size.
-    pub fn new(algorithm: DigestAlgorithmKind, digest: impl Into<String>, size: u64) -> Self {
-        Self {
-            digest: DigestValue::new(algorithm, digest).expect("valid descriptor digest"),
+    ///
+    /// Invalid digest text is returned as an error instead of panicking.
+    pub fn new(
+        algorithm: DigestAlgorithmKind,
+        digest: impl Into<String>,
+        size: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            digest: DigestValue::new(algorithm, digest)?,
             size,
-        }
+        })
+    }
+
+    fn from_digest(digest: DigestValue, size: u64) -> Self {
+        Self { digest, size }
     }
 }
 
@@ -342,8 +352,10 @@ impl Inspect<DigestAlgorithmKind> for LocalTarget {
             OpenedLocalArtifact::Other => LocalArtifactObservation::Other,
             OpenedLocalArtifact::File(mut file) => {
                 let (digest, size) = digest_opened(algorithm, &mut file, &path)?;
+                let digest = DigestValue::new(algorithm, digest)
+                    .expect("digest implementations return 64 hexadecimal characters");
                 LocalArtifactObservation::File {
-                    attestation: ArtifactDescriptor::new(algorithm, digest, size),
+                    attestation: ArtifactDescriptor::from_digest(digest, size),
                 }
             }
         };
