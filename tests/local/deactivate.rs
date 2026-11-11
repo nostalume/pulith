@@ -6,7 +6,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pulith::archive::ArchivePolicy;
 use pulith::local::{
     LinkChange, LocalObservation, LocalSource, LocalTarget, UnlinkChange, UnlinkError,
 };
@@ -24,7 +23,7 @@ fn publish_tree(root: &Path, version: &'static str, contents: &'static [u8]) -> 
     let material = LocalSource::new(source).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     tree.publish(admitted).unwrap();
     target
 }

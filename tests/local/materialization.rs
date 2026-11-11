@@ -6,10 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "blake3", feature = "sha2"))]
 use pulith::Verify;
-use pulith::archive::ArchivePolicy;
 use pulith::local::{
-    LocalExpectation, LocalObservation, LocalReconciliation, LocalSource, LocalTarget,
-    RemoveEvidence,
+    Admission, LocalEntryKind, LocalExpectation, LocalObservation, LocalReconciliation,
+    LocalSource, LocalTarget, Occupancy, RemoveEvidence,
 };
 
 #[test]
@@ -53,7 +52,7 @@ fn materialize_local_file_without_synthetic_transitions() {
     let target_path = target;
     let target = LocalTarget::new(target_path.clone()).unwrap();
     let stage = target.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     let evidence = tree.publish(target).unwrap();
 
     assert_eq!(fs::read_to_string(&target_path).unwrap(), "pulith");
@@ -76,7 +75,7 @@ fn create_new_conflict_is_typed_and_non_mutating() {
     let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     let error = tree.publish(admitted).unwrap_err();
 
     assert!(matches!(
@@ -259,7 +258,7 @@ fn verify_then_apply_exact_local_artifact() {
 
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     tree.publish(admitted).unwrap();
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
@@ -322,7 +321,7 @@ fn post_inspect_preserves_apply_evidence_and_reconciles() {
     let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     let apply_evidence = tree.publish(admitted).unwrap();
 
     let (observation, _) = LocalTarget::new(target.clone())
@@ -351,7 +350,7 @@ fn post_inspect_reports_later_mutation_without_reapplying() {
     let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     tree.publish(admitted).unwrap();
     fs::write(&target, "changed!").unwrap();
 
@@ -389,5 +388,188 @@ fn post_inspect_forget_observes_missing_without_acquisition() {
         .unwrap();
     assert_eq!(observation, LocalObservation::Missing);
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn occupancy_reports_a_regular_file_and_refuses_a_directory() {
+    let root = temp_root("occupancy");
+    fs::create_dir_all(root.join("directory")).unwrap();
+    fs::write(root.join("file.txt"), b"four").unwrap();
+
+    assert_eq!(
+        LocalTarget::new(root.join("missing.txt"))
+            .unwrap()
+            .occupancy()
+            .unwrap(),
+        Occupancy::Absent
+    );
+    assert_eq!(
+        LocalTarget::new(root.join("file.txt"))
+            .unwrap()
+            .occupancy()
+            .unwrap(),
+        Occupancy::RegularFile { bytes: 4 }
+    );
+    assert!(matches!(
+        LocalTarget::new(root.join("directory"))
+            .unwrap()
+            .occupancy(),
+        Err(pulith::local::LocalError::OccupiedTarget {
+            kind: LocalEntryKind::Directory,
+            ..
+        })
+    ));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commit_replaces_a_regular_file_and_keeps_its_mode() {
+    let root = temp_root("commit-replace");
+    fs::create_dir_all(&root).unwrap();
+    let target_path = root.join("target.txt");
+    fs::write(&target_path, b"before").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+
+    let target = LocalTarget::new(&target_path).unwrap();
+    let evidence = target
+        .stage()
+        .unwrap()
+        .write_file(b"after", PathBuf::new())
+        .unwrap()
+        .commit(target.clone(), Admission::ReplaceRegularFile)
+        .unwrap();
+
+    assert_eq!(fs::read(&target_path).unwrap(), b"after");
+    assert_eq!(evidence.files, 1);
+    assert_eq!(evidence.bytes, 5);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&target_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commit_creates_the_target_when_the_replacing_admission_finds_it_absent() {
+    let root = temp_root("commit-create");
+    let target_path = root.join("created.txt");
+    let target = LocalTarget::new(&target_path).unwrap();
+
+    target
+        .stage()
+        .unwrap()
+        .write_file(b"created", PathBuf::new())
+        .unwrap()
+        .commit(target, Admission::ReplaceRegularFile)
+        .unwrap();
+
+    assert_eq!(fs::read(&target_path).unwrap(), b"created");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commit_refuses_a_directory_target_without_touching_it() {
+    let root = temp_root("commit-directory");
+    fs::create_dir_all(root.join("occupied/inner")).unwrap();
+    fs::write(root.join("occupied/inner/keep.txt"), b"keep").unwrap();
+    let target = LocalTarget::new(root.join("occupied")).unwrap();
+
+    let error = target
+        .stage()
+        .unwrap()
+        .write_file(b"replacement", PathBuf::new())
+        .unwrap()
+        .commit(target, Admission::ReplaceRegularFile)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pulith::local::LocalError::OccupiedTarget {
+            kind: LocalEntryKind::Directory,
+            ..
+        }
+    ));
+    assert_eq!(
+        fs::read(root.join("occupied/inner/keep.txt")).unwrap(),
+        b"keep"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commit_refuses_a_symlink_target_without_following_it() {
+    let root = temp_root("commit-symlink");
+    fs::create_dir_all(&root).unwrap();
+    let real = root.join("real.txt");
+    fs::write(&real, b"origin").unwrap();
+    let link = root.join("link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&real, &link) {
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    let target = LocalTarget::new(&link).unwrap();
+    let error = target
+        .stage()
+        .unwrap()
+        .write_file(b"replacement", PathBuf::new())
+        .unwrap()
+        .commit(target, Admission::ReplaceRegularFile)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pulith::local::LocalError::OccupiedTarget {
+            kind: LocalEntryKind::Symlink,
+            ..
+        }
+    ));
+    assert_eq!(fs::read(&real).unwrap(), b"origin");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn absent_admission_still_refuses_an_existing_regular_file() {
+    let root = temp_root("commit-absent-only");
+    fs::create_dir_all(&root).unwrap();
+    let target_path = root.join("target.txt");
+    fs::write(&target_path, b"before").unwrap();
+    let target = LocalTarget::new(&target_path).unwrap();
+
+    let error = target
+        .stage()
+        .unwrap()
+        .write_file(b"after", PathBuf::new())
+        .unwrap()
+        .commit(target, Admission::Absent)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pulith::local::LocalError::AlreadyPublished(path) if path == target_path
+    ));
+    assert_eq!(fs::read(&target_path).unwrap(), b"before");
     fs::remove_dir_all(root).unwrap();
 }

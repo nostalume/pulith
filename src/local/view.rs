@@ -134,7 +134,7 @@ fn active_view_is_busy(error_code: Option<i32>) -> bool {
     {
         matches!(error_code, Some(32 | 33))
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         let _ = error_code;
         false
@@ -146,7 +146,7 @@ fn active_view_capability_unavailable(error_code: Option<i32>) -> bool {
     {
         matches!(error_code, Some(1 | 50 | 87))
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         let _ = error_code;
         false

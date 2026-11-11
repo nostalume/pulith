@@ -1,107 +1,34 @@
-//! Local materialization behaviors: the material-kind law split into independent steps.
+//! Local materialization: the material-kind law, from material to guarded custody.
 //!
-//! A byte material (`File`/`StagedFile`) or directory tree is prepared into guarded custody. Digest
-//! verification is a separate behavior owned by `crate::hash`; callers compose either ordering
-//! explicitly. Preparation is feature-gated on `local` + archive codecs.
+//! A byte material (`File`/`StagedFile`) or a directory tree is copied into private custody.
+//! Digest verification is a separate behavior owned by `crate::hash`; archive extraction is a
+//! separate behavior owned by `crate::archive`, which takes a decoder stream the caller supplies.
+//! Neither is guessed here: the caller composes the ordering and the encoding it needs.
 
 use std::path::PathBuf;
 
-use crate::archive::{ArchiveError, ArchiveEvidence, ArchiveKind, ArchivePolicy};
 use crate::local::{LocalError, LocalMaterial, LocalSource, StagedTree};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Evidence distinguishing a copied tree from a decoded archive tree.
-pub enum PreparationEvidence {
-    /// The copied outcome.
-    Copied,
-    /// The extracted outcome.
-    Extracted(ArchiveEvidence),
-}
-
-/// Errors produced while verifying or preparing one local material.
-#[derive(Debug)]
-pub enum MaterializeError {
-    /// The sniff outcome.
-    Sniff(std::io::Error),
-    /// The prepare outcome.
-    Prepare(ArchiveError),
-    /// The copy outcome.
-    Copy(LocalError),
-}
-
-impl std::fmt::Display for MaterializeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sniff(cause) => write!(f, "material format detection failed: {cause}"),
-            Self::Prepare(cause) => write!(f, "material preparation failed: {cause}"),
-            Self::Copy(cause) => write!(f, "material custody copy failed: {cause}"),
-        }
-    }
-}
-
-impl std::error::Error for MaterializeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Sniff(cause) => Some(cause),
-            Self::Prepare(cause) => Some(cause),
-            Self::Copy(cause) => Some(cause),
-        }
-    }
-}
-
 impl LocalMaterial {
-    /// Copies or decodes this local material into caller-selected staged-tree custody.
-    pub fn prepare(
-        self,
-        stage: StagedTree,
-        policy: ArchivePolicy,
-    ) -> Result<(StagedTree, PreparationEvidence), MaterializeError> {
+    /// Copies this local material into caller-selected staged-tree custody.
+    pub fn prepare(self, stage: StagedTree) -> Result<StagedTree, LocalError> {
         match self {
-            Self::Directory { path } => stage
-                .copy_tree(
-                    LocalSource::new(path).map_err(MaterializeError::Copy)?,
-                    PathBuf::new(),
-                )
-                .map(|stage| (stage, PreparationEvidence::Copied))
-                .map_err(MaterializeError::Copy),
-            Self::File { path } => stage.prepare_file(path, policy),
-            Self::StagedFile { path } => stage.prepare_file(path.to_path_buf(), policy),
+            Self::Directory { path } => stage.copy_tree(LocalSource::new(path)?, PathBuf::new()),
+            Self::File { path } => stage.copy_file(LocalSource::new(path)?, PathBuf::new()),
+            Self::StagedFile { path } => {
+                stage.copy_file(LocalSource::new(path.to_path_buf())?, PathBuf::new())
+            }
         }
     }
 }
 
-impl StagedTree {
-    fn prepare_file(
-        self,
-        path: PathBuf,
-        policy: ArchivePolicy,
-    ) -> Result<(Self, PreparationEvidence), MaterializeError> {
-        match ArchiveKind::sniff(&path).map_err(MaterializeError::Sniff)? {
-            Some(kind) => kind
-                .prepare(&path, self.root(), policy)
-                .map(|evidence| (self, PreparationEvidence::Extracted(evidence)))
-                .map_err(MaterializeError::Prepare),
-            None => self
-                .copy_file(
-                    LocalSource::new(path).map_err(MaterializeError::Copy)?,
-                    PathBuf::new(),
-                )
-                .map(|stage| (stage, PreparationEvidence::Copied))
-                .map_err(MaterializeError::Copy),
-        }
-    }
-}
-
-#[cfg(all(test, feature = "zip", feature = "blake3"))]
+#[cfg(all(test, feature = "blake3"))]
 mod tests {
     use std::fs;
-    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::archive::ArchiveKind;
     use crate::hash::{DigestAlgorithmKind, DigestValue, HashError};
-    use crate::local::LocalSource;
     use crate::local::LocalTarget;
     use crate::{Acquire, Verify};
 
@@ -123,18 +50,6 @@ mod tests {
             .unwrap()
             .acquire()
             .unwrap()
-    }
-
-    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
-        let file = fs::File::create(path).unwrap();
-        let mut writer = zip::ZipWriter::new(file);
-        for (name, content) in entries {
-            writer
-                .start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(content).unwrap();
-        }
-        writer.finish().unwrap();
     }
 
     fn blake3_hex(bytes: &[u8]) -> String {
@@ -160,10 +75,7 @@ mod tests {
 
         let admitted = LocalTarget::new(target.clone()).unwrap();
         let stage = admitted.stage().unwrap();
-        let (prepared, evidence) = acquire(&source)
-            .prepare(stage, ArchivePolicy::default())
-            .unwrap();
-        assert_eq!(evidence, PreparationEvidence::Copied);
+        let prepared = acquire(&source).prepare(stage).unwrap();
         prepared.publish(admitted).unwrap();
 
         assert_eq!(fs::read(target.join("bin/tool")).unwrap(), b"dir payload");
@@ -192,8 +104,7 @@ mod tests {
 
         let admitted = LocalTarget::new(target.clone()).unwrap();
         let stage = admitted.stage().unwrap();
-        let (prepared, evidence) = material.prepare(stage, ArchivePolicy::default()).unwrap();
-        assert_eq!(evidence, PreparationEvidence::Copied);
+        let prepared = material.prepare(stage).unwrap();
         prepared.publish(admitted).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"plain payload");
         fs::remove_dir_all(&root).unwrap();
@@ -218,38 +129,6 @@ mod tests {
 
         assert!(matches!(error, HashError::DigestMismatch { .. }));
         assert!(!target.exists());
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn materialize_prepares_a_zip_archive_and_attests_it() {
-        let root = temp_root("zip-prepare");
-        let source = root.join("tool.zip");
-        write_zip(&source, &[("bin/tool", b"zip payload")]);
-        let target = root.join("target");
-
-        let material = acquire(&source);
-        let (material, digest_evidence) = material
-            .verify(
-                DigestValue::new(
-                    DigestAlgorithmKind::Blake3,
-                    blake3_hex(&fs::read(&source).unwrap()),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(digest_evidence.algorithm, DigestAlgorithmKind::Blake3);
-
-        let admitted = LocalTarget::new(target.clone()).unwrap();
-        let stage = admitted.stage().unwrap();
-        let (prepared, evidence) = material.prepare(stage, ArchivePolicy::default()).unwrap();
-        let PreparationEvidence::Extracted(archive_evidence) = evidence else {
-            panic!("expected extraction evidence")
-        };
-        assert_eq!(archive_evidence.format, ArchiveKind::Zip);
-        assert_eq!(archive_evidence.files, 1);
-        prepared.publish(admitted).unwrap();
-        assert_eq!(fs::read(target.join("bin/tool")).unwrap(), b"zip payload");
         fs::remove_dir_all(&root).unwrap();
     }
 }

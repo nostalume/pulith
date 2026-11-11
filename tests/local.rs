@@ -7,6 +7,8 @@ mod deactivate;
 mod link;
 #[path = "local/materialization.rs"]
 mod materialization;
+#[path = "local/observation.rs"]
+mod observation;
 #[path = "local/record.rs"]
 mod record;
 

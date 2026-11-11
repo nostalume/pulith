@@ -12,8 +12,6 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use std::future::Future;
-
 /// Acquires resource-specific material from a caller-supplied source. The source type is the
 /// impl caller: `LocalSource::acquire()`, `RemoteSource::acquire()`. Acquisition may perform
 /// source I/O but has no authority to publish a final target.
@@ -25,28 +23,6 @@ pub trait Acquire {
 
     /// Acquires material without publishing a final destination.
     fn acquire(self) -> Result<Self::Output, Self::Error>;
-}
-
-/// Asynchronously acquires resource-specific material without publishing a final destination.
-pub trait AsyncAcquire {
-    /// Error returned when acquisition cannot complete.
-    type Error;
-    /// Material or evidence-bearing value produced by acquisition.
-    type Output;
-
-    /// Acquires material asynchronously.
-    fn acquire(self) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
-}
-
-/// Asynchronously observes a resource without changing it.
-pub trait AsyncInspect {
-    /// Error returned when inspection cannot complete.
-    type Error;
-    /// Observation and its evidence.
-    type Output;
-
-    /// Inspects the resource asynchronously.
-    fn inspect(self) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 }
 
 /// Establishes one factual proof about the consumed material against a caller-supplied
@@ -80,8 +56,12 @@ pub trait Link {
     /// Evidence describing the link outcome.
     type Output;
 
-    /// Link a view to the `expose` subpath of the published tree (the expose law: a directory in
-    /// the tree; the view parent is created; an occupied view is switched per `policy`).
+    /// Link a view to the `expose` subpath of the published tree.
+    ///
+    /// The expose law requires a directory inside the tree, and the view parent is created. An
+    /// occupied view is classified by its observed entry kind: only an existing directory-symlink
+    /// view is switched, and any other kind is reported as a conflict. The concrete switch law is
+    /// documented on the local view adapter. The trait exposes no switch selector.
     fn link(
         self,
         view: &std::path::Path,

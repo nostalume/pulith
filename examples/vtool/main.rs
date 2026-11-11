@@ -126,8 +126,8 @@ impl Command {
 
 fn describe_source(source: &manifest::Source) -> String {
     match source {
-        manifest::Source::Url { url } => url.as_str().to_string(),
-        manifest::Source::Local { path } => path.display().to_string(),
+        manifest::Source::Url { url, .. } => url.as_str().to_string(),
+        manifest::Source::Local { path, .. } => path.display().to_string(),
     }
 }
 

@@ -24,13 +24,7 @@
 //! program's visible input world is exactly the declared copies, the explicit environment, and the
 //! workspace, but ambient host reads are not guaranteed blocked.
 //!
-//! With the `process-tokio` feature, [`PreparedProcess`] also implements [`AsyncAcquire`]: the same
-//! realization law with a tokio-awaited wait loop. Dropping or aborting the acquire future stops
-//! the admitted tree (the same tree-stop path as sync, plus a direct-child kill signal), so an
-//! abandoned build does not leak a running process tree. The async entry reuses the shared
-//! platform helpers; only the orchestration is duplicated.
-//!
-//! Both the sync and async entries accept a caller-owned [`CancelToken`]: once cancelled (sticky, `Send +
+//! The entry accepts a caller-owned [`CancelToken`]: once cancelled (sticky, `Send +
 //! Sync`), the wait loop stops the admitted tree via the same path and returns
 //! [`RunError::Cancelled`] — a caller stop request, never confused with a timeout. A token
 //! already cancelled at entry fails fast before the program spawns.
@@ -51,8 +45,6 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-#[cfg(feature = "process-tokio")]
-use crate::AsyncAcquire;
 use crate::local::{LocalObservation, LocalTarget, StagedTree};
 use crate::{Acquire, Inspect};
 
@@ -63,6 +55,18 @@ const DEFAULT_CAPTURE_CAP: usize = 1024 * 1024;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
 /// One long-lived child process whose complete admitted tree remains under session custody.
+///
+/// Headless law: `stdin`, `stdout`, and `stderr` are all null, and the child is placed in its own
+/// Unix process group or Windows Job Object so the admitted tree can be stopped as a unit. Bounds
+/// are explicit, not implicit: `start` attaches no timeout. A caller that needs a bound on reaping
+/// supplies a deadline to `ProcessSession::stop_within`; `ProcessSession::wait` waits for natural
+/// termination by explicit caller choice. Dropping an unresolved session stops the admitted tree
+/// and reaps the direct child.
+///
+/// Non-goals: interactive execution, inherited standard streams, and an implicit wait policy. The
+/// library never decides a wait bound for the caller; an unbounded wait exists only as the explicit
+/// `wait` call. This type does not sandbox the program, resolve dependencies, publish a target, or
+/// guarantee that a descendant which detaches from the group or job is stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedProcess {
     program: PathBuf,
@@ -439,7 +443,7 @@ fn environment_keys_equal(left: &OsStr, right: &OsStr) -> bool {
         left.to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         left == right
     }
@@ -835,13 +839,6 @@ impl CancelToken {
     /// Returns whether the token has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-    }
-
-    #[cfg(feature = "process-tokio")]
-    async fn cancelled(&self) {
-        while !self.is_cancelled() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
 }
 
@@ -1355,25 +1352,36 @@ impl ChildSession {
         })
     }
 
+    /// Bounded poll backoff: stay responsive to short children, then yield the CPU for long ones.
+    /// Deadlines, exit conditions, and `ProcessEnd` outcomes stay in the callers; only the wakeup
+    /// rate changes. This is platform-neutral, so Linux and Windows keep identical semantics.
+    fn next_poll_delay(current: Duration) -> Duration {
+        (current * 2).min(Duration::from_millis(50))
+    }
+
     fn wait(mut self) -> Result<ChildCompletion, RunError> {
+        let mut delay = Duration::from_millis(10);
         loop {
             match self.poll()? {
-                ChildPoll::Running => thread::sleep(Duration::from_millis(10)),
+                ChildPoll::Running => thread::sleep(delay),
                 ChildPoll::Completed(completion) => return Ok(completion),
             }
+            delay = Self::next_poll_delay(delay);
         }
     }
 
     fn wait_cancellable(mut self, cancel: &CancelToken) -> Result<ChildCompletion, RunError> {
+        let mut delay = Duration::from_millis(10);
         loop {
             if cancel.is_cancelled() {
                 self.stop();
                 return Err(self.cancelled());
             }
             match self.poll()? {
-                ChildPoll::Running => thread::sleep(Duration::from_millis(10)),
+                ChildPoll::Running => thread::sleep(delay),
                 ChildPoll::Completed(completion) => return Ok(completion),
             }
+            delay = Self::next_poll_delay(delay);
         }
     }
 
@@ -1631,7 +1639,7 @@ fn admit_staged_source(path: &Path) -> Result<(), RunError> {
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             != 0
     };
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     let reparse = false;
     if !metadata.file_type().is_file() || reparse {
         return Err(RunError::InputWrongKind {
@@ -1639,295 +1647,6 @@ fn admit_staged_source(path: &Path) -> Result<(), RunError> {
         });
     }
     Ok(())
-}
-
-#[cfg(feature = "process-tokio")]
-impl AsyncAcquire for PreparedProcess {
-    type Error = RunError;
-    type Output = ProcessAcquiredOutput;
-
-    async fn acquire(self) -> Result<Self::Output, Self::Error> {
-        self.acquire_async().await
-    }
-}
-
-#[cfg(feature = "process-tokio")]
-enum Awaited {
-    Exit(ExitStatus),
-    Wait(io::Error),
-    Timeout,
-    Cancelled,
-}
-
-#[cfg(feature = "process-tokio")]
-impl Awaited {
-    fn finish(
-        self,
-        program: &Path,
-        timeout: Duration,
-        diagnostics: Diagnostics,
-    ) -> Result<(ExitStatus, Diagnostics), RunError> {
-        let error = match self {
-            Self::Exit(status) => return Ok((status, diagnostics)),
-            Self::Wait(source) => RunError::Wait {
-                program: program.to_path_buf(),
-                source,
-                diagnostics: Box::new(diagnostics),
-            },
-            Self::Timeout => RunError::TimedOut {
-                program: program.to_path_buf(),
-                timeout,
-                diagnostics: Box::new(diagnostics),
-            },
-            Self::Cancelled => RunError::Cancelled {
-                program: program.to_path_buf(),
-                diagnostics: Box::new(diagnostics),
-            },
-        };
-        Err(error)
-    }
-}
-
-#[cfg(feature = "process-tokio")]
-impl PreparedProcess {
-    async fn acquire_async(self) -> Result<ProcessAcquiredOutput, RunError> {
-        let cancel = CancelToken::new();
-        self.acquire_async_cancellable_inner(&cancel).await
-    }
-
-    /// Awaitable token-cancellable entry, mirroring [`PreparedProcess::acquire_cancellable`] for
-    /// the async path: the wait loop polls the same token, so the caller can cancel while keeping
-    /// the future alive to await the outcome. Dropping the future still stops the tree.
-    pub async fn acquire_async_cancellable(
-        self,
-        cancel: &CancelToken,
-    ) -> Result<ProcessAcquiredOutput, RunError> {
-        self.acquire_async_cancellable_inner(cancel).await
-    }
-
-    async fn acquire_async_cancellable_inner(
-        self,
-        cancel: &CancelToken,
-    ) -> Result<ProcessAcquiredOutput, RunError> {
-        let PreparedProcess {
-            command,
-            workspace,
-            selected_output,
-            output,
-            program,
-            timeout,
-            capture_cap,
-        } = self;
-        if cancel.is_cancelled() {
-            return Err(RunError::Cancelled {
-                program,
-                diagnostics: Box::new(Diagnostics::disabled()),
-            });
-        }
-        let started = Instant::now();
-
-        let mut command = tokio::process::Command::from(command);
-        if capture_cap > 0 {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        } else {
-            command.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_SUSPENDED);
-
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(source) => {
-                return fail_cleanup(
-                    workspace,
-                    RunError::Spawn {
-                        program: program.clone(),
-                        source,
-                        diagnostics: Box::new(Diagnostics::disabled()),
-                    },
-                );
-            }
-        };
-
-        #[cfg(windows)]
-        let mut child = child;
-
-        #[cfg(windows)]
-        let job = match assign_to_job(
-            child
-                .id()
-                .expect("a freshly spawned child always has a process id"),
-        ) {
-            Ok(job) => job,
-            Err(source) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return fail_cleanup(
-                    workspace,
-                    RunError::CapabilityUnavailable {
-                        program: program.clone(),
-                        source,
-                        diagnostics: Box::new(Diagnostics::disabled()),
-                    },
-                );
-            }
-        };
-
-        let mut guard = AsyncTreeGuard::new(
-            child,
-            #[cfg(windows)]
-            job,
-        );
-        let stdout = guard.child.stdout.take();
-        let stderr = guard.child.stderr.take();
-
-        let wait = async {
-            let awaited = tokio::select! {
-                status = guard.child.wait() => status.map_or_else(Awaited::Wait, Awaited::Exit),
-                () = tokio::time::sleep(timeout) => Awaited::Timeout,
-                () = cancel.cancelled() => Awaited::Cancelled,
-            };
-            if !matches!(awaited, Awaited::Exit(_)) {
-                guard.stop();
-                let _ = guard.child.wait().await;
-            }
-            awaited
-        };
-        let (awaited, stdout, stderr) = tokio::join!(
-            wait,
-            capture_optional_pipe(stdout, capture_cap),
-            capture_optional_pipe(stderr, capture_cap),
-        );
-        let diagnostics = pipe_diagnostics(stdout, stderr, capture_cap);
-        let (status, diagnostics) = match awaited.finish(&program, timeout, diagnostics) {
-            Ok(completion) => completion,
-            Err(error) => return fail_cleanup(workspace, error),
-        };
-        guard.disarm();
-        drop(guard);
-        PrivateExecution::finish(
-            workspace,
-            selected_output,
-            output,
-            program,
-            ChildCompletion {
-                status,
-                diagnostics,
-                elapsed: started.elapsed(),
-            },
-        )
-    }
-}
-
-#[cfg(feature = "process-tokio")]
-async fn capture_pipe<R>(mut stream: R, cap: usize) -> (Option<Vec<u8>>, bool)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut retained = Vec::with_capacity(cap.min(8192));
-    let mut truncated = false;
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let read = match stream.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => return (None, false),
-        };
-        let available = cap.saturating_sub(retained.len());
-        let keep = read.min(available);
-        retained.extend_from_slice(&chunk[..keep]);
-        truncated |= keep < read;
-    }
-    (Some(retained), truncated)
-}
-
-#[cfg(feature = "process-tokio")]
-async fn capture_optional_pipe<R>(stream: Option<R>, cap: usize) -> (Option<Vec<u8>>, bool)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    match stream {
-        Some(stream) => capture_pipe(stream, cap).await,
-        None => (None, false),
-    }
-}
-
-#[cfg(feature = "process-tokio")]
-fn pipe_diagnostics(
-    stdout: (Option<Vec<u8>>, bool),
-    stderr: (Option<Vec<u8>>, bool),
-    cap: usize,
-) -> Diagnostics {
-    if cap == 0 {
-        return Diagnostics::disabled();
-    }
-    Diagnostics {
-        stdout: stdout.0,
-        stderr: stderr.0,
-        stdout_truncated: stdout.1,
-        stderr_truncated: stderr.1,
-        cap,
-    }
-}
-
-/// Stops the admitted tree when the async acquire future is dropped or aborted.
-///
-/// The guard is armed only while the wait loop is running. A future dropped or aborted then runs
-/// the frozen S2.7 tree-stop path (group kill / `TerminateJobObject` plus a direct-child kill
-/// signal) with tokio reaping the direct child; best-effort per the S2.7-D4 boundary, no
-/// zero-survivor claim. Once the child has produced an exit status the guard is disarmed, so
-/// normal completion leaves surviving descendants running exactly like the sync adapter.
-#[cfg(feature = "process-tokio")]
-struct AsyncTreeGuard {
-    child: tokio::process::Child,
-    #[cfg(unix)]
-    pid: u32,
-    armed: bool,
-    #[cfg(windows)]
-    job: JobHandle,
-}
-
-#[cfg(feature = "process-tokio")]
-impl AsyncTreeGuard {
-    fn new(child: tokio::process::Child, #[cfg(windows)] job: JobHandle) -> Self {
-        #[cfg(unix)]
-        let pid = child
-            .id()
-            .expect("a freshly spawned child always has a process id");
-        Self {
-            child,
-            #[cfg(unix)]
-            pid,
-            armed: true,
-            #[cfg(windows)]
-            job,
-        }
-    }
-
-    fn stop(&mut self) {
-        #[cfg(unix)]
-        stop_tree(self.pid as i32);
-        #[cfg(windows)]
-        stop_tree(&self.job);
-        let _ = self.child.start_kill();
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(feature = "process-tokio")]
-impl Drop for AsyncTreeGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.stop();
-        }
-    }
 }
 
 fn resolve_argument(argument: &Arg, workspace: &Path, output: &Path) -> OsString {
@@ -2087,8 +1806,31 @@ fn read_capped(path: &Path, cap: usize) -> (Option<Vec<u8>>, bool) {
     (Some(buffer), truncated)
 }
 
+/// Removes the workspace, retrying briefly before reporting a cleanup failure.
+///
+/// On Windows a descendant that was just stopped can still hold the workspace as its working
+/// directory for a moment, which makes the first `remove_dir_all` fail with a sharing violation.
+/// The retry is bounded: cleanup stays best-effort and never turns the primary outcome into
+/// success, but it no longer reports a cleanup failure that a few more milliseconds would fix.
+fn remove_workspace(path: &Path) -> io::Result<()> {
+    let mut delay = Duration::from_millis(10);
+    for attempt in 0..6 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if attempt == 5 => return Err(error),
+            Err(_) => {
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(80));
+            }
+        }
+    }
+    unreachable!("the retry loop either returns or reports the last attempt")
+}
+
 fn fail_cleanup<T>(workspace: tempfile::TempDir, primary: RunError) -> Result<T, RunError> {
-    match workspace.close() {
+    let path = workspace.keep();
+    match remove_workspace(&path) {
         Ok(()) => Err(primary),
         Err(error) => Err(RunError::WorkspaceCleanup {
             primary: Box::new(primary),

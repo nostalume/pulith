@@ -133,9 +133,9 @@ pub struct Sha256;
 
 /// The declared digest algorithm, as data.
 ///
-/// `DigestAlgorithmKind` is the canonical data representation of a digest algorithm (mirrors
-/// `archive::ArchiveKind`): manifests and callers declare the algorithm as this value, and
-/// data-driven entries (e.g. materialization) dispatch on it once in core.
+/// `DigestAlgorithmKind` is the canonical data representation of a digest algorithm: manifests
+/// declare the algorithm as this value, and data-driven entries (e.g. materialization) dispatch on
+/// it once in core. The value is declared, never inferred from bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DigestAlgorithmKind {
     /// The blake3 outcome.
@@ -264,6 +264,7 @@ impl ArtifactDescriptor {
         })
     }
 
+    #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
     fn from_digest(digest: DigestValue, size: u64) -> Self {
         Self { digest, size }
     }

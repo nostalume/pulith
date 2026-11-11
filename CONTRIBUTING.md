@@ -30,6 +30,10 @@ cargo doc --locked --all-features --no-deps
 cargo deny check advisories bans sources
 ```
 
+Tests are self-contained. A test that needs a hostile network condition builds its fixture in
+process (see `tests/ambient_proxy.rs`); no external service, CI-only environment setup, or host
+state is required. `cargo test --locked --all-features` is the whole verification path.
+
 The process-tree tests share Windows job-object and child-process resources; run the full suite
 serially on Windows to avoid scheduler-dependent contention:
 
@@ -51,6 +55,7 @@ the authoritative matrix.
 - Keep observable behavior covered by contract tests.
 - Put example tests under `tests/examples/`; example source may reference those modules.
 - Prefer evidence assertions over exact timing.
+- Do not add a CI-only verification path that `cargo test` cannot reproduce locally.
 - Document public contracts, errors, safety boundaries, and feature requirements.
 - Do not combine unrelated formatting or refactoring with a behavioral fix.
 - Do not commit build output, credentials, local agent state, or temporary verification scripts.

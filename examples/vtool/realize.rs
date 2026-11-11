@@ -1,32 +1,62 @@
 //! Caller-owned vtool realization: acquire, verify, prepare, apply, link, and state repair.
+use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
-use pulith::archive::ArchivePolicy;
+use pulith::archive::{ArchivePolicy, prepare_tar, prepare_zip};
 use pulith::local::{
     LinkChange, LocalExpectation, LocalMaterial, LocalReconciliation, LocalSource, LocalTarget,
 };
 use pulith::net::RemoteSource;
 use pulith::{Acquire, Inspect, Link, Reconcile, Unlink, Verify};
 
-use crate::manifest::{Phase, Resolved, Source, State, StateError};
+use crate::manifest::{ArchiveFormat, Phase, Resolved, Source, State, StateError};
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn material_path(material: &LocalMaterial) -> &Path {
+    match material {
+        LocalMaterial::File { path } => path,
+        LocalMaterial::Directory { path } => path,
+        LocalMaterial::StagedFile { path } => path.as_ref(),
+    }
+}
 
 impl Resolved {
     fn realize(source: Source, hash: pulith::hash::DigestValue, target: &Path) -> BoxResult<()> {
         let target = LocalTarget::new(target)?;
         let stage = target.stage()?;
+        let format = source.format();
         let material = match source {
-            Source::Local { path } => LocalSource::new(path)?.acquire()?,
-            Source::Url { url } => RemoteSource::new(*url).prepare()?.acquire()?.0,
+            Source::Local { path, .. } => LocalSource::new(path)?.acquire()?,
+            Source::Url { url, .. } => RemoteSource::new(*url).prepare()?.acquire()?.0,
         };
         let material = match material {
             LocalMaterial::Directory { .. } => material,
             _ => material.verify(hash)?.0,
         };
-        let (tree, _) = material.prepare(stage, ArchivePolicy::new())?;
-        tree.publish(target)?;
+        // The recipe declares the encoding, so the caller composes the decoder explicitly. pulith
+        // owns the custody contract, not format detection.
+        let stage = match format {
+            ArchiveFormat::Plain => material.prepare(stage)?,
+            ArchiveFormat::Zip => {
+                prepare_zip(
+                    File::open(material_path(&material))?,
+                    stage.root(),
+                    ArchivePolicy::new(),
+                )?;
+                stage
+            }
+            ArchiveFormat::Tar => {
+                prepare_tar(
+                    File::open(material_path(&material))?,
+                    stage.root(),
+                    ArchivePolicy::new(),
+                )?;
+                stage
+            }
+        };
+        stage.publish(target)?;
         Ok(())
     }
 

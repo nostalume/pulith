@@ -11,7 +11,7 @@ assignees: ''
 - OS: [e.g. Windows, macOS, Linux]
 - Pulith version or revision:
 - Rust version:
-- Feature set: [e.g. `local`, `process-tokio`, `http-ureq`, `sha2`, `zip`]
+- Feature set: [e.g. `local`, `process`, `http-ureq`, `sha2`, `zip`]
 
 ### Description
 

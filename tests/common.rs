@@ -22,7 +22,6 @@ use pulith::process::{Arg, EnvVars, OutputPath, OutputProcess};
 #[cfg(any(feature = "process", feature = "zip", feature = "tar"))]
 use pulith::Acquire;
 #[cfg(any(feature = "zip", feature = "tar"))]
-use pulith::archive::ArchivePolicy;
 #[cfg(any(feature = "zip", feature = "tar"))]
 use pulith::local::{LocalSource, LocalTarget};
 
@@ -64,7 +63,7 @@ pub fn publish_tree(
     let material = LocalSource::new(source).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     let evidence = tree.publish(admitted).unwrap();
 
     (target, evidence)
@@ -295,23 +294,37 @@ pub fn captured_contains(diagnostics: &pulith::process::Diagnostics, needle: &[u
         .is_some_and(|stdout| contains_bytes(stdout, needle))
 }
 
+/// Observes a stopped descendant across a bounded window rather than sleeping once and sampling.
+/// A growing marker fails immediately; the window is an observation bound, not a sync delay.
+#[cfg(feature = "process")]
+pub fn assert_marker_stable(marker: &Path, before: u64, window: Duration) {
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = std::fs::metadata(marker)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            now, before,
+            "descendant marker kept growing after the tree stop"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock HTTP server (previously HttpFixture in lifecycle/materialization.rs).
 //
-// Binds `127.0.0.1` and serves one connection. Ambient `http_proxy`/`https_proxy` environment
-// variables must not intercept the request: run local HTTP tests with the proxy unset (or a
-// `no_proxy` entry the async client honors exactly, e.g. `127.0.0.1,localhost`), otherwise a proxy
-// can answer the mock-server request with its own status (observed: 502 from a local proxy because
-// reqwest does not match a `127.*` no_proxy glob).
+// The listener, port, and bytes all belong to the test. Callers inject `without_proxy()`
+// resources, so host-wide proxy settings are never an input to these tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(feature = "http-ureq")]
 pub struct HttpFixture {
     pub url: String,
     handle: std::thread::JoinHandle<()>,
 }
 
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(feature = "http-ureq")]
 impl HttpFixture {
     pub fn get(body: &'static [u8]) -> Self {
         use std::io::{Read, Write};
@@ -320,8 +333,11 @@ impl HttpFixture {
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut request = [0_u8; 1_024];
-            let _ = stream.read(&mut request).unwrap();
+            let _ = stream.read(&mut request).unwrap_or(0);
             stream
                 .write_all(
                     format!(
@@ -357,4 +373,12 @@ pub fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
         writer.write_all(bytes).unwrap();
     }
     writer.finish().unwrap();
+}
+
+/// Real-process fixtures contend for the platform shell. Serialize the owning tests so host
+/// load and parallel scheduling cannot decide their outcome; no runner flag is required.
+#[cfg(feature = "process")]
+pub fn process_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

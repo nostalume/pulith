@@ -37,8 +37,11 @@ jobs:
         run: |
           set -eu
           RUSTFLAGS="-D warnings" cargo check --locked --no-default-features
-          for feature in local process process-tokio net http-ureq http-reqwest hash blake3 sha2 archive zip tar gzip xz zstd serde; do
+          for feature in local process net http-ureq hash blake3 sha2 archive zip tar serde; do
             RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features "$feature"
+          done
+          for pair in local,sha2 zip,tar local,blake3,serde; do
+            RUSTFLAGS="-D warnings" cargo check --locked --no-default-features --features "$pair"
           done
 
   test:
@@ -68,7 +71,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          for feature in net hash zip tar gzip xz zstd; do
+          for feature in net hash zip tar archive; do
             RUSTFLAGS="-D warnings" cargo test --locked --lib --no-default-features --features "$feature"
           done
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --features local,blake3 --test hash

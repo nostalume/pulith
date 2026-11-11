@@ -27,23 +27,20 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["archive"]
-local = ["dep:rustix", "dep:same-file", "dep:tempfile", "dep:walkdir", "dep:windows-sys"]
+default = ["local"]
+local = ["dep:rustix", "dep:tempfile", "dep:walkdir", "dep:windows-sys"]
 process = ["local"]
 net = ["dep:url", "dep:httpdate", "dep:governor"]
 http-ureq = ["net", "local", "dep:ureq"]
-http-reqwest = ["net", "local", "dep:tokio", "dep:reqwest"]
-process-tokio = ["process", "dep:tokio"]
 hash = []
 serde = ["dep:serde"]
 blake3 = ["hash", "local", "dep:blake3", "dep:hex"]
 sha2 = ["hash", "local", "dep:sha2", "dep:hex"]
-archive = ["zip", "gzip", "xz", "zstd"]
-zip = ["local", "dep:zip"]
-tar = ["local", "dep:tar"]
-gzip = ["tar", "dep:flate2"]
-xz = ["tar", "dep:xz2"]
-zstd = ["tar", "dep:zstd"]
+archive = ["zip", "tar"]
+# `zip` needs one deflate backend; `flate2` supplies the one this crate already trusts. pulith
+# itself never composes a codec: no API in this crate wraps a decoder.
+zip = ["dep:zip", "dep:flate2"]
+tar = ["dep:tar"]
 
 [dependencies]
 blake3 = { version = "1.8", optional = true }
@@ -52,18 +49,13 @@ flate2 = { version = "1.1.10", optional = true }
 governor = { version = "0.10", default-features = false, features = ["std"], optional = true }
 hex = { version = "0.4", optional = true }
 httpdate = { version = "1.0.3", optional = true }
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls"], optional = true }
-same-file = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 tar = { version = "0.4.46", optional = true }
 tempfile = { version = "3", optional = true }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "time"], optional = true }
 ureq = { version = "3.4.1", default-features = false, features = ["rustls"], optional = true }
-url = { version = "2.5", features = ["serde"], optional = true }
+url = { version = "2.5", optional = true }
 walkdir = { version = "2.5", optional = true }
-xz2 = { version = "0.1.7", optional = true }
-zip = { version = "8.4.0", optional = true }
-zstd = { version = "0.13.3", optional = true }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"], optional = true }
@@ -72,6 +64,7 @@ rustix = { version = "1", features = ["fs", "process"], optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Services"], optional = true }
 
 [dev-dependencies]
+flate2 = "1.1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
@@ -83,7 +76,7 @@ sd-notify = "0.5"
 
 [[example]]
 name = "vtool"
-required-features = ["local", "http-ureq", "zip", "tar", "gzip", "blake3", "sha2", "serde"]
+required-features = ["local", "http-ureq", "zip", "tar", "blake3", "sha2", "serde"]
 
 [[example]]
 name = "toolhost"

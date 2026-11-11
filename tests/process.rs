@@ -5,8 +5,8 @@ use std::time::Duration;
 
 mod common;
 use common::{
-    Fixture, assert_failure_keeps_target_missing, captured_contains, fixture_process,
-    marker_environment,
+    Fixture, assert_failure_keeps_target_missing, assert_marker_stable, captured_contains,
+    fixture_process, marker_environment,
 };
 use pulith::Acquire;
 use pulith::process::{
@@ -23,6 +23,7 @@ fn acquire(root: &std::path::Path, action: OutputProcess) -> Result<ProcessOutpu
 
 #[test]
 fn managed_process_reports_nonzero_exit_as_observation() {
+    let _guard = common::process_fixture_guard();
     #[cfg(unix)]
     let arguments = ["-c", "exit 7"].map(OsString::from);
     #[cfg(windows)]
@@ -44,6 +45,7 @@ fn managed_process_reports_nonzero_exit_as_observation() {
 
 #[test]
 fn managed_process_observes_running_and_stops_explicitly() {
+    let _guard = common::process_fixture_guard();
     #[cfg(unix)]
     let arguments = ["-c", "sleep 5"].map(OsString::from);
     #[cfg(windows)]
@@ -73,6 +75,7 @@ fn managed_process_observes_running_and_stops_explicitly() {
 
 #[test]
 fn worktree_process_runs_in_the_existing_worktree_and_returns_evidence() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let worktree = root.path().join("caller-worktree");
     std::fs::create_dir(&worktree).unwrap();
@@ -109,6 +112,7 @@ fn worktree_process_runs_in_the_existing_worktree_and_returns_evidence() {
 
 #[test]
 fn worktree_process_rejects_missing_worktree_before_spawn() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let missing = root.path().join("missing-worktree");
     let result = WorktreeProcess::new(
@@ -167,6 +171,7 @@ fn scripted_worktree_process(
 
 #[test]
 fn worktree_timeout_is_distinct_from_cancellation() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let result = sleeping_worktree_process(root.path(), Duration::from_millis(100)).execute();
     assert!(matches!(result, Err(RunError::TimedOut { .. })));
@@ -174,6 +179,7 @@ fn worktree_timeout_is_distinct_from_cancellation() {
 
 #[test]
 fn worktree_cancellable_stops_a_running_child() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let token = CancelToken::new();
     let canceler = std::thread::spawn({
@@ -191,6 +197,7 @@ fn worktree_cancellable_stops_a_running_child() {
 
 #[test]
 fn worktree_pre_cancelled_fails_before_child_effect() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let token = CancelToken::new();
     token.cancel();
@@ -207,6 +214,7 @@ fn worktree_pre_cancelled_fails_before_child_effect() {
 
 #[test]
 fn worktree_rejects_file_and_reports_spawn_and_nonzero_distinctly() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let file = root.path().join("not-a-directory");
     std::fs::write(&file, b"x").unwrap();
@@ -238,6 +246,7 @@ fn worktree_rejects_file_and_reports_spawn_and_nonzero_distinctly() {
 
 #[test]
 fn worktree_inherits_environment_and_caps_diagnostics() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let result = scripted_worktree_process(
         root.path(),
@@ -256,6 +265,7 @@ fn worktree_inherits_environment_and_caps_diagnostics() {
 
 #[test]
 fn worktree_env_vars_do_not_inherit_caller_entries() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let key = "PULITH_WORKTREE_AMBIENT_FIXTURE";
     unsafe { std::env::set_var(key, "ambient") };
@@ -282,6 +292,7 @@ fn worktree_env_vars_do_not_inherit_caller_entries() {
 
 #[test]
 fn worktree_cancellation_stops_descendants() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let marker = root.path().join("descendant-marker");
     #[cfg(windows)]
@@ -317,7 +328,7 @@ fn worktree_cancellation_stops_descendants() {
     );
     canceler.join().unwrap();
     let before = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(300));
+    assert_marker_stable(&marker, before, Duration::from_millis(300));
     let after = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
     assert!(before > 0);
     assert_eq!(before, after, "descendant survived cancellation");
@@ -325,6 +336,7 @@ fn worktree_cancellation_stops_descendants() {
 
 #[test]
 fn output_process_stages_tree_before_local_apply() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let target = root.path().join("published");
     let acquired = acquire(
@@ -347,6 +359,7 @@ fn output_process_stages_tree_before_local_apply() {
 
 #[test]
 fn successful_staged_tree_is_removed_when_not_applied() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let acquired = acquire(
         root.path(),
@@ -367,6 +380,7 @@ fn successful_staged_tree_is_removed_when_not_applied() {
 
 #[test]
 fn nonzero_exit_leaves_final_target_untouched() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::Nonzero, Duration::from_secs(10), |error| {
         matches!(error, RunError::ExitedNonZero { .. })
     });
@@ -374,6 +388,7 @@ fn nonzero_exit_leaves_final_target_untouched() {
 
 #[test]
 fn nonzero_exit_carries_captured_diagnostics() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::Nonzero, Duration::from_secs(10), |error| {
         matches!(
             error,
@@ -385,6 +400,7 @@ fn nonzero_exit_carries_captured_diagnostics() {
 
 #[test]
 fn missing_declared_output_leaves_final_target_untouched() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::MissingOutput, Duration::from_secs(10), |error| {
         matches!(error, RunError::OutputMissing { .. })
     });
@@ -392,6 +408,7 @@ fn missing_declared_output_leaves_final_target_untouched() {
 
 #[test]
 fn non_directory_output_leaves_final_target_untouched() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::FileOutput, Duration::from_secs(10), |error| {
         matches!(error, RunError::OutputWrongKind { .. })
     });
@@ -399,6 +416,7 @@ fn non_directory_output_leaves_final_target_untouched() {
 
 #[test]
 fn wrong_kind_output_carries_captured_diagnostics() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::FileOutput, Duration::from_secs(10), |error| {
         matches!(
             error,
@@ -409,6 +427,7 @@ fn wrong_kind_output_carries_captured_diagnostics() {
 
 #[test]
 fn success_capture_preserves_evidence_chain_order() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let acquired = acquire(
         root.path(),
@@ -432,6 +451,7 @@ fn success_capture_preserves_evidence_chain_order() {
 
 #[test]
 fn capture_truncates_streams_at_the_cap() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let acquired = acquire(
         root.path(),
@@ -446,6 +466,7 @@ fn capture_truncates_streams_at_the_cap() {
 
 #[test]
 fn capture_cap_zero_disables_capture() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let acquired = acquire(
         root.path(),
@@ -459,6 +480,7 @@ fn capture_cap_zero_disables_capture() {
 
 #[test]
 fn timeout_kills_direct_child_and_leaves_final_target_untouched() {
+    let _guard = common::process_fixture_guard();
     assert_failure_keeps_target_missing(Fixture::Sleeps, Duration::from_millis(200), |error| {
         matches!(error, RunError::TimedOut { .. })
     });
@@ -466,6 +488,7 @@ fn timeout_kills_direct_child_and_leaves_final_target_untouched() {
 
 #[test]
 fn timeout_stops_descendant_and_carries_captured_diagnostics() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let marker = root.path().join("descendant-marker");
     let target = root.path().join("published");
@@ -491,7 +514,7 @@ fn timeout_stops_descendant_and_carries_captured_diagnostics() {
     let before = std::fs::metadata(&marker)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    std::thread::sleep(Duration::from_millis(600));
+    assert_marker_stable(&marker, before, Duration::from_millis(600));
     let after = std::fs::metadata(&marker)
         .map(|meta| meta.len())
         .unwrap_or(0);
@@ -504,6 +527,7 @@ fn timeout_stops_descendant_and_carries_captured_diagnostics() {
 
 #[test]
 fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let marker = root.path().join("descendant-marker");
     let target = root.path().join("published");
@@ -555,7 +579,7 @@ fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
         .map(|meta| meta.len())
         .unwrap_or(0);
     assert!(before > 0, "descendant never wrote before cancellation");
-    std::thread::sleep(Duration::from_millis(600));
+    assert_marker_stable(&marker, before, Duration::from_millis(600));
     let after = std::fs::metadata(&marker)
         .map(|meta| meta.len())
         .unwrap_or(0);
@@ -568,6 +592,7 @@ fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
 
 #[test]
 fn pre_cancelled_token_fails_fast_without_spawning() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let target = root.path().join("published");
     let token = CancelToken::new();
@@ -591,6 +616,7 @@ fn pre_cancelled_token_fails_fast_without_spawning() {
 
 #[test]
 fn staged_input_is_reachable_with_exact_bytes_via_input_root() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let source = root.path().join("source-input.txt");
     std::fs::write(&source, b"closure-bytes-42").unwrap();
@@ -612,6 +638,7 @@ fn staged_input_is_reachable_with_exact_bytes_via_input_root() {
 
 #[test]
 fn structured_argument_can_reference_a_staged_input() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let source = root.path().join("source-input.txt");
     std::fs::write(&source, b"arg-referenced-bytes").unwrap();
@@ -633,6 +660,7 @@ fn structured_argument_can_reference_a_staged_input() {
 
 #[test]
 fn missing_declared_input_fails_pre_spawn_and_keeps_target_missing() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let target = root.path().join("published");
     let missing = root.path().join("nope.txt");
@@ -651,6 +679,7 @@ fn missing_declared_input_fails_pre_spawn_and_keeps_target_missing() {
 
 #[test]
 fn non_regular_declared_input_fails_pre_spawn() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let directory = root.path().join("directory");
     std::fs::create_dir(&directory).unwrap();
@@ -676,6 +705,7 @@ fn non_regular_declared_input_fails_pre_spawn() {
 
 #[test]
 fn colliding_staged_names_fail_pre_spawn() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let first = root.path().join("first.txt");
     let second = root.path().join("second.txt");
@@ -699,6 +729,7 @@ fn colliding_staged_names_fail_pre_spawn() {
 
 #[test]
 fn staged_input_admission_rejects_invalid_name_and_relative_source() {
+    let _guard = common::process_fixture_guard();
     let root = common::temp_dir();
     let source = root.path().join("source.txt");
     std::fs::write(&source, b"x").unwrap();
@@ -710,6 +741,7 @@ fn staged_input_admission_rejects_invalid_name_and_relative_source() {
 
 #[test]
 fn input_root_environment_key_is_reserved() {
+    let _guard = common::process_fixture_guard();
     let error =
         EnvVars::new([(OsString::from("PULITH_INPUT_ROOT"), OsString::from("x"))]).unwrap_err();
     assert!(matches!(error, ConfigError::ReservedEnvironmentKey(_)));

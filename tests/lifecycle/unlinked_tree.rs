@@ -4,10 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use pulith::archive::{ArchiveKind, ArchivePolicy};
+use pulith::archive::{ArchivePolicy, prepare_zip};
 use pulith::local::{
     LocalError, LocalExpectation, LocalObservation, LocalReconciliation, LocalSource, LocalTarget,
-    PreparationEvidence,
 };
 use pulith::{Acquire, Inspect, Reconcile};
 
@@ -20,8 +19,8 @@ fn write_archive(path: &std::path::Path) {
     writer.finish().unwrap();
 }
 
-/// The unlinked-artifact flow: acquire the zip, verify is skipped (the artifact is byte
-/// material — here we just prepare), prepare, apply, observe, reconcile.
+/// The unlinked-artifact flow: acquire the zip, decode it into custody, apply, observe, reconcile.
+/// Decoding is the caller's composition: the stream is handed in, nothing is guessed.
 fn flow(root: &std::path::Path) -> (PathBuf, pulith::local::ApplyEvidence) {
     let archive = root.join("demo-tool-1.0.0.zip");
     let target = root.join("artifacts/demo-tool/1.0.0");
@@ -29,21 +28,19 @@ fn flow(root: &std::path::Path) -> (PathBuf, pulith::local::ApplyEvidence) {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
     let material = LocalSource::new(archive).unwrap().acquire().unwrap();
-    let kind = ArchiveKind::sniff(material_path(&material))
-        .unwrap()
-        .unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, evidence) = material.prepare(stage, ArchivePolicy::default()).unwrap();
-    let PreparationEvidence::Extracted(evidence) = evidence else {
-        panic!("expected extraction")
-    };
-    assert_eq!(evidence.format, kind);
+    let evidence = prepare_zip(
+        fs::File::open(material_path(&material)).unwrap(),
+        stage.root(),
+        ArchivePolicy::default(),
+    )
+    .unwrap();
     assert_eq!(evidence.entries, 1);
     assert_eq!(evidence.files, 1);
     assert!(!target.exists());
 
-    let apply_evidence = tree.publish(admitted).unwrap();
+    let apply_evidence = stage.publish(admitted).unwrap();
     assert_eq!(apply_evidence.files, 1);
     assert_eq!(apply_evidence.bytes, 16);
     assert_eq!(
@@ -90,7 +87,7 @@ fn unlinked_artifact_tree_rejects_quiescent_existing_target() {
     let material = LocalSource::new(archive).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     let error = tree.publish(admitted).unwrap_err();
 
     assert!(matches!(

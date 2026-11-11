@@ -16,14 +16,11 @@ use std::path::{Path, PathBuf};
 use crate::{Acquire, Inspect, Reconcile};
 
 mod apply;
-#[cfg(any(feature = "zip", feature = "tar"))]
 mod materialize;
 mod record;
 mod view;
 
-pub use apply::{ApplyEvidence, RemoveEvidence};
-#[cfg(any(feature = "zip", feature = "tar"))]
-pub use materialize::{MaterializeError, PreparationEvidence};
+pub use apply::{Admission, ApplyEvidence, Occupancy, RemoveEvidence};
 pub use record::{
     RecordChange, RecordEdit, RecordError, RecordEvidence, RecordLimit, RecordObservation,
     RecordStore,
@@ -204,6 +201,14 @@ pub enum LocalError {
     MissingSource(PathBuf),
     /// Immutable publication found an existing predecessor and did not commit the target.
     AlreadyPublished(PathBuf),
+    /// Publication found an occupant it never replaces: a directory, symlink, reparse point, or
+    /// other entry. The target was classified without following links and was left untouched.
+    OccupiedTarget {
+        /// The admitted target path.
+        path: PathBuf,
+        /// The no-follow entry kind found at the path.
+        kind: LocalEntryKind,
+    },
     /// The unsupported local entry outcome.
     UnsupportedLocalEntry(PathBuf),
     /// The invalid stage path outcome.
@@ -246,9 +251,16 @@ impl fmt::Display for LocalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSource(path) => write!(f, "source does not exist: {}", path.display()),
-            Self::AlreadyPublished(path) => {
-                write!(f, "target is already published: {}", path.display())
-            }
+            Self::AlreadyPublished(path) => write!(
+                f,
+                "existing predecessor entry found; target was not committed: {}",
+                path.display()
+            ),
+            Self::OccupiedTarget { path, kind } => write!(
+                f,
+                "target is occupied by a {kind:?} entry, which publication never replaces: {}",
+                path.display()
+            ),
             Self::UnsupportedLocalEntry(path) => {
                 write!(
                     f,
@@ -481,7 +493,9 @@ impl Acquire for LocalSource {
 }
 
 /// A local target path for observation, activation, or removal (restricted law newtype —
-/// non-empty; I/O laws stay in each behavior).
+/// non-empty; I/O laws stay in each behavior). This is a plain path value: it carries no custody,
+/// handle, or generation token, so cloning it does not duplicate an authority.
+#[derive(Clone)]
 pub struct LocalTarget(PathBuf);
 
 impl LocalTarget {
@@ -499,7 +513,29 @@ impl LocalTarget {
         &self.0
     }
 
+    /// Classifies what currently occupies this target, without following links.
+    ///
+    /// Only absence and a regular file are publishable. A directory, symlink, reparse point, or
+    /// other entry is refused with [`LocalError::OccupiedTarget`]; the target is neither followed
+    /// nor modified. This classification is read-only and advisory: `StagedTree::commit`
+    /// re-classifies at commit time and never trusts a caller-held observation.
+    pub fn occupancy(&self) -> Result<Occupancy, LocalError> {
+        apply::occupancy(self.as_path())
+    }
+
+    /// Observes this target without changing it.
+    ///
+    /// This is the no-argument convenience entry for `Inspect<()> for LocalTarget`: it delegates
+    /// to that implementation and produces exactly the same observation and evidence. The trait
+    /// remains the observation law carrier.
+    pub fn observe(self) -> Result<(LocalObservation, LocalInspectEvidence), LocalError> {
+        self.inspect(())
+    }
+
     /// Creates eager private custody beside this target without publishing it.
+    ///
+    /// Effect law: this is not a zero-write observation. Staging creates the target's ancestor
+    /// directories before creating the private staged-tree workspace.
     pub fn stage(&self) -> Result<StagedTree, LocalError> {
         apply::stage(self.as_path())
     }

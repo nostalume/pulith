@@ -1,34 +1,26 @@
 #![cfg(feature = "local")]
 
-use std::path::PathBuf;
-
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(feature = "http-ureq")]
 use crate::common::HttpFixture;
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest", feature = "zip"))]
+#[cfg(any(feature = "http-ureq", feature = "zip"))]
 use std::io::Write;
 
 #[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::Verify;
-use pulith::archive::{ArchiveKind, ArchivePolicy};
+use pulith::archive::ArchivePolicy;
 #[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::hash::{DigestAlgorithmKind, DigestValue};
-use pulith::local::{LocalObservation, LocalSource, LocalTarget, PreparationEvidence};
+use pulith::local::{LocalSource, LocalTarget};
 use pulith::{Acquire, Remove};
-#[cfg(all(
-    feature = "blake3",
-    any(feature = "http-ureq", feature = "http-reqwest")
-))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::{Inspect, Reconcile};
 
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(feature = "http-ureq")]
 use pulith::local::{LocalExpectation, LocalReconciliation};
-#[cfg(any(feature = "http-ureq", feature = "http-reqwest"))]
+#[cfg(feature = "http-ureq")]
 use pulith::net::{RemoteSource, RemoteUrl};
 
-#[cfg(all(
-    feature = "blake3",
-    any(feature = "http-ureq", feature = "http-reqwest")
-))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 fn assert_applied_then_reconciled(target: &std::path::Path, body: &[u8]) {
     assert_eq!(std::fs::read(target).unwrap(), body);
 
@@ -68,35 +60,9 @@ fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
     assert_eq!(digest_evidence.expected, expected);
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     tree.publish(admitted).unwrap();
     assert_applied_then_reconciled(&target, body);
-}
-
-#[cfg(all(feature = "blake3", feature = "http-reqwest"))]
-#[test]
-fn async_http_acquire_stages_artifact_with_evidence() {
-    use pulith::AsyncAcquire;
-
-    let body = b"async artifact";
-    let server = HttpFixture::get(body);
-    let root = tempfile::tempdir().unwrap();
-    let target = root.path().join("async-artifact");
-
-    let (_artifact, evidence) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(AsyncAcquire::acquire(
-            RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
-                .prepare()
-                .unwrap(),
-        ))
-        .unwrap();
-    server.join();
-    assert!(!target.exists());
-    assert_eq!(evidence.status, 200);
-    assert_eq!(evidence.bytes, body.len() as u64);
 }
 
 #[cfg(feature = "zip")]
@@ -112,27 +78,23 @@ fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
     writer.write_all(b"zip payload").unwrap();
     writer.finish().unwrap();
 
-    let material = LocalSource::new(archive.clone())
-        .unwrap()
-        .acquire()
-        .unwrap();
-    let kind = ArchiveKind::sniff(&archive).unwrap().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, evidence) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let evidence = pulith::archive::prepare_zip(
+        std::fs::File::open(&archive).unwrap(),
+        stage.root(),
+        ArchivePolicy::default(),
+    )
+    .unwrap();
     assert!(!target.exists());
-    let PreparationEvidence::Extracted(evidence) = evidence else {
-        panic!("expected extraction")
-    };
-    assert_eq!(evidence.format, kind);
     assert_eq!(evidence.entries, 1);
     assert_eq!(evidence.files, 1);
     assert_eq!(
-        std::fs::read(tree.root().join("bin/tool.txt")).unwrap(),
+        std::fs::read(stage.root().join("bin/tool.txt")).unwrap(),
         b"zip payload"
     );
 
-    tree.publish(admitted).unwrap();
+    stage.publish(admitted).unwrap();
     assert_eq!(
         std::fs::read(target.join("bin/tool.txt")).unwrap(),
         b"zip payload"
@@ -160,27 +122,23 @@ fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
         .unwrap();
     builder.finish().unwrap();
 
-    let material = LocalSource::new(archive.clone())
-        .unwrap()
-        .acquire()
-        .unwrap();
-    let kind = ArchiveKind::sniff(&archive).unwrap().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, evidence) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let evidence = pulith::archive::prepare_tar(
+        std::fs::File::open(&archive).unwrap(),
+        stage.root(),
+        ArchivePolicy::default(),
+    )
+    .unwrap();
     assert!(!target.exists());
-    let PreparationEvidence::Extracted(evidence) = evidence else {
-        panic!("expected extraction")
-    };
-    assert_eq!(evidence.format, kind);
     assert_eq!(evidence.entries, 1);
     assert_eq!(evidence.files, 1);
     assert_eq!(
-        std::fs::read(tree.root().join("bin/tool.txt")).unwrap(),
+        std::fs::read(stage.root().join("bin/tool.txt")).unwrap(),
         b"tar payload"
     );
 
-    tree.publish(admitted).unwrap();
+    stage.publish(admitted).unwrap();
     assert_eq!(
         std::fs::read(target.join("bin/tool.txt")).unwrap(),
         b"tar payload"
@@ -200,10 +158,16 @@ fn unsafe_archive_preparation_leaves_no_final_target_or_contaminated_workspace()
     writer.write_all(b"unsafe payload").unwrap();
     writer.finish().unwrap();
 
-    let material = LocalSource::new(archive).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    assert!(material.prepare(stage, ArchivePolicy::default()).is_err());
+    assert!(
+        pulith::archive::prepare_zip(
+            std::fs::File::open(&archive).unwrap(),
+            stage.root(),
+            ArchivePolicy::default()
+        )
+        .is_err()
+    );
 
     assert!(!target.exists());
     assert!(!root.path().join("escape.txt").exists());
@@ -220,10 +184,7 @@ fn forget_applies_directly_without_a_synthetic_predecessor() {
     assert!(!target.exists());
 }
 
-#[cfg(all(
-    feature = "blake3",
-    any(feature = "http-ureq", feature = "http-reqwest")
-))]
+#[cfg(all(feature = "blake3", feature = "http-ureq"))]
 #[test]
 fn local_file_materialization_verification_and_reconciliation() {
     let body = b"local artifact";
@@ -235,16 +196,8 @@ fn local_file_materialization_verification_and_reconciliation() {
     let material = LocalSource::new(source).unwrap().acquire().unwrap();
     let admitted = LocalTarget::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let (tree, _) = material.prepare(stage, ArchivePolicy::default()).unwrap();
+    let tree = material.prepare(stage).unwrap();
     tree.publish(admitted).unwrap();
 
     assert_applied_then_reconciled(&target, body);
-}
-
-/// A plain placeholder so the http-reqwest-only build keeps a non-empty target.
-#[allow(dead_code)]
-fn _unused() {
-    let _ = PathBuf::new();
-    let _ = LocalObservation::Missing;
-    let _ = ArchiveKind::Plain;
 }

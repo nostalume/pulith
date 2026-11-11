@@ -1,9 +1,11 @@
-//! ZIP/TAR preparation into an exclusive guarded scratch tree.
+//! Archive preparation into an exclusive guarded scratch tree.
 //!
-//! Owns archive-extraction semantics: entry paths, entry types, decoded and materialized limits,
-//! and path-escape guards. Preparation writes into caller-provided private custody and returns
-//! evidence; the final destination is never touched. Feature-gated on `zip`/`tar`
-//! (with gzip/xz/zstd codecs composing tar).
+//! This module connects a decoder's entry stream to pulith's custody contract. It owns entry-path
+//! and entry-type policy, decoded and materialized limits, path-escape and collision guards, and
+//! failure atomicity. It owns no format knowledge: the caller decides whether a stream is ZIP or
+//! TAR and how it was compressed, then hands the reader in. Preparation writes into
+//! caller-provided private custody and returns evidence; the final destination is never touched.
+//! Feature-gated on `zip`/`tar`.
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -15,8 +17,6 @@ use std::path::{Component, Path, PathBuf};
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ArchiveError {
-    /// The archive requires file outcome.
-    ArchiveRequiresFile(PathBuf),
     /// The archive invalid path outcome.
     ArchiveInvalidPath(String),
     /// The archive limit exceeded outcome.
@@ -79,9 +79,6 @@ impl ArchiveError {
 impl std::fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ArchiveRequiresFile(path) => {
-                write!(f, "archive preparation requires a file: {}", path.display())
-            }
             Self::ArchiveInvalidPath(path) => write!(f, "archive entry path is invalid: {path}"),
             Self::ArchiveLimitExceeded { limit, actual, max } => {
                 write!(f, "archive {limit} limit exceeded: {actual} > {max}")
@@ -328,39 +325,12 @@ impl Default for ArchivePolicy {
     }
 }
 
-/// The concrete archive format of a prepared tree, as data.
-///
-/// `ArchiveKind` is the canonical data representation of an archive format: [`ArchiveKind::sniff`]
-/// detects it from magic bytes, `prepare` dispatches on it, and [`ArchiveEvidence`] attests it.
-/// Cargo features select compiled decoders; this value selects one of them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArchiveKind {
-    /// No extraction: the tree was copied as-is (plain file or directory material).
-    Plain,
-    #[cfg(feature = "zip")]
-    /// The zip outcome.
-    Zip,
-    #[cfg(feature = "tar")]
-    /// The tar outcome.
-    Tar,
-    #[cfg(feature = "gzip")]
-    /// The tar gz outcome.
-    TarGz,
-    #[cfg(feature = "xz")]
-    /// The tar xz outcome.
-    TarXz,
-    #[cfg(feature = "zstd")]
-    /// The tar zstd outcome.
-    TarZstd,
-}
-
 /// Evidence observed while preparing an archive tree.
 ///
-/// `total_bytes` counts materialized regular-file bytes. For TAR families, `decoded_bytes` counts
-/// the decoded container stream, including headers, padding, extensions, and stripped entries.
-/// For ZIP, `decoded_bytes` counts decoded entry material; ZIP container metadata is seek-parsed
-/// rather than emitted through an equivalent decoded stream. `format` attests the archive kind
-/// the tree was prepared as (data, not a type).
+/// `total_bytes` counts materialized regular-file bytes. `decoded_bytes` counts the bytes pulled
+/// from the decoder stream the caller supplied: for TAR that includes headers, padding,
+/// extensions, and stripped entries; for ZIP, whose entries are decoded individually, it equals
+/// `total_bytes`.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveEvidence {
@@ -378,12 +348,10 @@ pub struct ArchiveEvidence {
     pub directories: u64,
     /// The symlinks value.
     pub symlinks: u64,
-    /// The format value.
-    pub format: ArchiveKind,
 }
 
 impl ArchiveEvidence {
-    fn empty(root: impl Into<PathBuf>, format: ArchiveKind) -> Self {
+    fn empty(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             entries: 0,
@@ -392,132 +360,60 @@ impl ArchiveEvidence {
             files: 0,
             directories: 0,
             symlinks: 0,
-            format,
         }
     }
 }
 
-impl ArchiveKind {
-    /// Prepare a source archive into caller-owned exclusive custody and return extraction evidence.
-    /// `Plain` is a copy operation and is therefore rejected here.
-    pub fn prepare(
-        self,
-        source: &Path,
-        workspace: &Path,
-        policy: ArchivePolicy,
-    ) -> Result<ArchiveEvidence, ArchiveError> {
-        match self {
-            Self::Plain => Err(ArchiveError::InvalidPreparation(
-                "a plain material is copied, not extracted".into(),
-            )),
-            #[cfg(feature = "zip")]
-            Self::Zip => extract_source(source, workspace, policy, extract_zip),
-            #[cfg(feature = "tar")]
-            Self::Tar => extract_source(source, workspace, policy, extract_tar_plain),
-            #[cfg(feature = "gzip")]
-            Self::TarGz => extract_source(source, workspace, policy, extract_tar_gzip),
-            #[cfg(feature = "xz")]
-            Self::TarXz => extract_source(source, workspace, policy, extract_tar_xz),
-            #[cfg(feature = "zstd")]
-            Self::TarZstd => extract_source(source, workspace, policy, extract_tar_zstd),
-        }
-    }
-}
-
-/// Shared extraction driver: reset the exclusive root, extract, clean up on failure, and pair
-/// the prepared tree with its attestation.
-fn extract_source(
-    source: &Path,
+/// Shared driver: reset the exclusive root, extract, clean up on failure, and pair the prepared
+/// tree with its attestation.
+fn prepare_into(
     root: &Path,
     policy: ArchivePolicy,
-    extract: fn(&Path, &Path, &ArchivePolicy) -> Result<ArchiveEvidence, ArchiveError>,
+    extract: impl FnOnce(&Path, &ArchivePolicy) -> Result<ArchiveEvidence, ArchiveError>,
 ) -> Result<ArchiveEvidence, ArchiveError> {
     let root = root.to_path_buf();
     reset_extract_root(&root)?;
-    let evidence = match extract(source, &root, &policy) {
-        Ok(evidence) => evidence,
+    match extract(&root, &policy) {
+        Ok(evidence) => Ok(evidence),
         Err(error) => {
             let cleanup = reset_extract_root(&root);
-            return Err(combine_archive_failure(&root, error, cleanup));
-        }
-    };
-    Ok(evidence)
-}
-
-impl ArchiveKind {
-    /// Detect an archive format from its magic bytes, reading the head once.
-    ///
-    /// Returns `Ok(None)` when the material is not a recognized archive (the caller copies it
-    /// as-is), and an unsupported error for a recognized format whose decoder feature is disabled.
-    /// Detection is read-only; it never extracts or opens a decoder.
-    pub fn sniff(path: &Path) -> io::Result<Option<Self>> {
-        let mut head = [0u8; 512];
-        let mut file = File::open(path)?;
-        let read = read_head(&mut file, &mut head)?;
-        let head = &head[..read];
-        if head.len() >= 4
-            && (head[..4] == [0x50, 0x4b, 0x03, 0x04]
-                || head[..4] == [0x50, 0x4b, 0x05, 0x06]
-                || head[..4] == [0x50, 0x4b, 0x07, 0x08])
-        {
-            #[cfg(feature = "zip")]
-            return Ok(Some(ArchiveKind::Zip));
-            #[cfg(not(feature = "zip"))]
-            return Err(unsupported_format("ZIP"));
-        }
-        if head.len() >= 2 && head[..2] == [0x1f, 0x8b] {
-            #[cfg(feature = "gzip")]
-            return Ok(Some(ArchiveKind::TarGz));
-            #[cfg(not(feature = "gzip"))]
-            return Err(unsupported_format("gzip"));
-        }
-        if head.len() >= 6 && head[..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
-            #[cfg(feature = "xz")]
-            return Ok(Some(ArchiveKind::TarXz));
-            #[cfg(not(feature = "xz"))]
-            return Err(unsupported_format("XZ"));
-        }
-        if head.len() >= 4 && head[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-            #[cfg(feature = "zstd")]
-            return Ok(Some(ArchiveKind::TarZstd));
-            #[cfg(not(feature = "zstd"))]
-            return Err(unsupported_format("Zstandard"));
-        }
-        if head.len() >= 262 && &head[257..262] == b"ustar" {
-            #[cfg(feature = "tar")]
-            return Ok(Some(ArchiveKind::Tar));
-            #[cfg(not(feature = "tar"))]
-            return Err(unsupported_format("tar"));
-        }
-        Ok(None)
-    }
-}
-
-#[cfg(not(all(
-    feature = "zip",
-    feature = "tar",
-    feature = "gzip",
-    feature = "xz",
-    feature = "zstd"
-)))]
-fn unsupported_format(format: &'static str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("{format} archive support is not enabled"),
-    )
-}
-
-fn read_head(file: &mut File, head: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-    while filled < head.len() {
-        match file.read(&mut head[filled..]) {
-            Ok(0) => break,
-            Ok(bytes) => filled += bytes,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+            Err(combine_archive_failure(&root, error, cleanup))
         }
     }
-    Ok(filled)
+}
+
+/// Prepares a TAR stream into caller-owned exclusive custody.
+///
+/// The caller owns the encoding. Pass a `File` for plain TAR, or any reader that yields TAR bytes
+/// (`flate2::read::GzDecoder`, `xz2::read::XzDecoder`, `zstd::stream::Decoder`) for a compressed
+/// stream; this function takes no position on how those bytes were produced. `max_decoded_bytes`
+/// bounds the bytes pulled through `reader`, so a decompression bomb is stopped before it reaches
+/// the entry parser.
+#[cfg(feature = "tar")]
+pub fn prepare_tar<R: Read>(
+    reader: R,
+    root: &Path,
+    policy: ArchivePolicy,
+) -> Result<ArchiveEvidence, ArchiveError> {
+    prepare_into(root, policy, |root, policy| {
+        extract_tar_reader(reader, root, policy)
+    })
+}
+
+/// Prepares a ZIP stream into caller-owned exclusive custody.
+///
+/// The stream is parsed by `zip`: entry names, entry types, and header consistency are its
+/// knowledge. Path policy, collision policy, limits, evidence, and failure atomicity are this
+/// module's.
+#[cfg(feature = "zip")]
+pub fn prepare_zip<R: Read + io::Seek>(
+    reader: R,
+    root: &Path,
+    policy: ArchivePolicy,
+) -> Result<ArchiveEvidence, ArchiveError> {
+    prepare_into(root, policy, |root, policy| {
+        extract_zip(reader, root, policy)
+    })
 }
 
 fn combine_archive_failure(
@@ -536,16 +432,20 @@ fn combine_archive_failure(
 }
 
 #[cfg(feature = "zip")]
-fn extract_zip(
-    archive_path: &Path,
+fn extract_zip<R: Read + io::Seek>(
+    reader: R,
     root: &Path,
     policy: &ArchivePolicy,
 ) -> Result<ArchiveEvidence, ArchiveError> {
-    let file = File::open(archive_path)
-        .map_err(|err| ArchiveError::io("open zip archive", archive_path, err))?;
-    let mut archive = zip::ZipArchive::new(file)
+    let mut archive = zip::ZipArchive::new(reader)
         .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
-    let mut evidence = ArchiveEvidence::empty(root, ArchiveKind::Zip);
+    // Delegate header validation to `zip`: it rejects duplicate names, local/central mismatches,
+    // overlapping entries, and local headers missing from the central directory. Entries that
+    // defer sizes to a trailing data descriptor are still accepted.
+    archive
+        .validate_header_consistency()
+        .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
+    let mut evidence = ArchiveEvidence::empty(root);
     let mut paths = ArchivePathIndex::default();
 
     for index in 0..archive.len() {
@@ -555,9 +455,15 @@ fn extract_zip(
         let mut file = archive
             .by_index(index)
             .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip entry: {err}")))?;
+        let name = file
+            .name()
+            .map_err(|err| {
+                ArchiveError::InvalidPreparation(format!("invalid zip entry name: {err}"))
+            })?
+            .into_owned();
         let enclosed = file
             .enclosed_name()
-            .ok_or_else(|| ArchiveError::ArchiveInvalidPath(file.name().to_string()))?;
+            .ok_or(ArchiveError::ArchiveInvalidPath(name))?;
         let Some(relative) = sanitize_relative(&enclosed, policy.strip_components)? else {
             continue;
         };
@@ -565,7 +471,7 @@ fn extract_zip(
         ensure_under_root(root, &target)?;
         reject_existing_symlink_path(root, &target)?;
 
-        if is_zip_symlink(file.unix_mode()) {
+        if file.is_symlink() {
             evidence.symlinks += 1;
             return Err(ArchiveError::UnsupportedArchiveEntry(relative));
         }
@@ -626,71 +532,14 @@ fn extract_zip(
 }
 
 #[cfg(feature = "tar")]
-fn extract_tar_plain(
-    archive_path: &Path,
-    root: &Path,
-    policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence, ArchiveError> {
-    let file = File::open(archive_path)
-        .map_err(|err| ArchiveError::io("open tar archive", archive_path, err))?;
-    extract_tar_reader(file, root, policy, ArchiveKind::Tar)
-}
-
-#[cfg(feature = "gzip")]
-fn extract_tar_gzip(
-    archive_path: &Path,
-    root: &Path,
-    policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence, ArchiveError> {
-    let file = File::open(archive_path)
-        .map_err(|err| ArchiveError::io("open gzip tar archive", archive_path, err))?;
-    extract_tar_reader(
-        flate2::read::GzDecoder::new(file),
-        root,
-        policy,
-        ArchiveKind::TarGz,
-    )
-}
-
-#[cfg(feature = "xz")]
-fn extract_tar_xz(
-    archive_path: &Path,
-    root: &Path,
-    policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence, ArchiveError> {
-    let file = File::open(archive_path)
-        .map_err(|err| ArchiveError::io("open xz tar archive", archive_path, err))?;
-    extract_tar_reader(
-        xz2::read::XzDecoder::new(file),
-        root,
-        policy,
-        ArchiveKind::TarXz,
-    )
-}
-
-#[cfg(feature = "zstd")]
-fn extract_tar_zstd(
-    archive_path: &Path,
-    root: &Path,
-    policy: &ArchivePolicy,
-) -> Result<ArchiveEvidence, ArchiveError> {
-    let file = File::open(archive_path)
-        .map_err(|err| ArchiveError::io("open zstd tar archive", archive_path, err))?;
-    let decoder = zstd::stream::Decoder::new(file)
-        .map_err(|err| ArchiveError::io("open zstd tar decoder", archive_path, err))?;
-    extract_tar_reader(decoder, root, policy, ArchiveKind::TarZstd)
-}
-
-#[cfg(feature = "tar")]
 fn extract_tar_reader<R: Read>(
     reader: R,
     root: &Path,
     policy: &ArchivePolicy,
-    format: ArchiveKind,
 ) -> Result<ArchiveEvidence, ArchiveError> {
     let reader = DecodedLimitReader::new(reader, policy.max_decoded_bytes);
     let mut archive = tar::Archive::new(reader);
-    let mut evidence = ArchiveEvidence::empty(root, format);
+    let mut evidence = ArchiveEvidence::empty(root);
     let mut paths = ArchivePathIndex::default();
     let entries = archive
         .entries()
@@ -906,6 +755,12 @@ fn archive_io_error(action: &'static str, path: &Path, error: io::Error) -> Arch
         };
         source = next;
     }
+    // A decode failure reports corrupt archive bytes, not host I/O on `path`. Classify it as an
+    // invalid archive so callers do not retry or blame the filesystem for a malformed input.
+    if error.kind() == io::ErrorKind::InvalidData {
+        return ArchiveError::InvalidPreparation(format!("{action} {}: {error}", path.display()));
+    }
+
     ArchiveError::io(action, path, error)
 }
 
@@ -997,7 +852,7 @@ fn validate_archive_component(component: &OsStr) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn validate_archive_component(_component: &std::ffi::OsStr) -> Result<(), ArchiveError> {
     Ok(())
 }
@@ -1029,12 +884,7 @@ fn reject_existing_symlink_path(root: &Path, target: &Path) -> Result<(), Archiv
     Ok(())
 }
 
-#[cfg(feature = "zip")]
-fn is_zip_symlink(mode: Option<u32>) -> bool {
-    mode.is_some_and(|mode| mode & 0o170000 == 0o120000)
-}
-
-#[cfg(all(test, feature = "zip", feature = "local"))]
+#[cfg(all(test, feature = "zip"))]
 mod tests {
     use std::error::Error as _;
     use std::fs::{self, File};
@@ -1042,17 +892,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ArchiveEntryKind, ArchiveError, ArchiveKind, ArchivePathIndex, ArchivePolicy,
-        combine_archive_failure,
+        ArchiveEntryKind, ArchiveError, ArchivePathIndex, ArchivePolicy, combine_archive_failure,
     };
 
     fn prepare(
         source: &Path,
         workspace: &Path,
         policy: ArchivePolicy,
-        kind: ArchiveKind,
     ) -> Result<super::ArchiveEvidence, ArchiveError> {
-        kind.prepare(source, workspace, policy)
+        super::prepare_zip(File::open(source).unwrap(), workspace, policy)
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1096,21 +944,6 @@ mod tests {
                 && matches!(*extraction, ArchiveError::InvalidPreparation(_))
                 && matches!(*cleanup, ArchiveError::Io { .. })
         ));
-    }
-
-    #[test]
-    fn plain_kind_is_rejected_without_extracting() {
-        let error = prepare(
-            Path::new("unused-source"),
-            Path::new("unused-workspace"),
-            ArchivePolicy::default(),
-            ArchiveKind::Plain,
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(error, ArchiveError::InvalidPreparation(message) if message.contains("plain"))
-        );
     }
 
     #[test]
@@ -1233,13 +1066,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("bin/tool.txt", b"pulith")]);
 
-        let evidence = prepare(
-            &zip_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap();
+        let evidence = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap();
 
         assert_eq!(evidence.root, extract_root);
         assert_eq!(evidence.entries, 1);
@@ -1261,13 +1088,7 @@ mod tests {
         fs::write(extract_root.join("old/stale.txt"), "stale").unwrap();
         write_zip(&zip_path, &[("fresh.txt", b"fresh")]);
 
-        prepare(
-            &zip_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap();
+        prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap();
 
         assert_eq!(
             fs::read_to_string(extract_root.join("fresh.txt")).unwrap(),
@@ -1290,7 +1111,6 @@ mod tests {
             &zip_path,
             &extract_root,
             ArchivePolicy::new().strip_components(1),
-            ArchiveKind::Zip,
         )
         .unwrap();
 
@@ -1316,7 +1136,6 @@ mod tests {
             &zip_path,
             &root.join("extract"),
             ArchivePolicy::new().max_entries(1),
-            ArchiveKind::Zip,
         )
         .unwrap_err();
 
@@ -1337,13 +1156,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("../escape.txt", b"nope")]);
 
-        let err = prepare(
-            &zip_path,
-            &root.join("extract"),
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap_err();
+        let err = prepare(&zip_path, &root.join("extract"), ArchivePolicy::default()).unwrap_err();
 
         assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)));
         assert!(!root.parent().unwrap().join("escape.txt").exists());
@@ -1357,13 +1170,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip_with_symlink(&zip_path);
 
-        let err = prepare(
-            &zip_path,
-            &root.join("extract"),
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap_err();
+        let err = prepare(&zip_path, &root.join("extract"), ArchivePolicy::default()).unwrap_err();
 
         assert!(matches!(err, ArchiveError::UnsupportedArchiveEntry(_)));
         fs::remove_dir_all(root).unwrap();
@@ -1380,7 +1187,6 @@ mod tests {
             &zip_path,
             &root.join("extract"),
             ArchivePolicy::new().max_total_bytes(3),
-            ArchiveKind::Zip,
         )
         .unwrap_err();
 
@@ -1395,7 +1201,38 @@ mod tests {
     }
 
     #[test]
-    fn zip_prepare_enforces_observed_byte_limit() {
+    fn zip_prepare_rejects_local_header_mismatch() {
+        let root = temp_root("local-header-mismatch");
+        let zip_path = root.join("payload.zip");
+        let extract_root = root.join("extract");
+        fs::create_dir_all(&root).unwrap();
+        write_zip(&zip_path, &[("payload.txt", b"12345678")]);
+
+        // Rewrite only the local header's uncompressed size; the central directory still says 8.
+        // Iterating entries alone would read the real 8 bytes and accept the archive.
+        let mut bytes = fs::read(&zip_path).unwrap();
+        let local = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+            .unwrap();
+        bytes[local + 22..local + 26].copy_from_slice(&3u32.to_le_bytes());
+        fs::write(&zip_path, bytes).unwrap();
+
+        let err = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ArchiveError::InvalidPreparation(message) if message.contains("header inconsistency")
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_prepare_rejects_entry_larger_than_declared_size() {
         let root = temp_root("observed-byte-limit");
         let zip_path = root.join("payload.zip");
         let extract_root = root.join("extract");
@@ -1406,18 +1243,20 @@ mod tests {
             &zip_path,
             &extract_root,
             ArchivePolicy::new().max_total_bytes(4),
-            ArchiveKind::Zip,
         )
         .unwrap_err();
 
-        assert!(matches!(
-            err,
-            ArchiveError::ArchiveLimitExceeded {
-                limit: "total-bytes",
-                actual: 5,
-                max: 4,
-            }
-        ));
+        // `zip` 9 rejects the entry while reading, before the declared-total guard is reached, so
+        // the outcome is an invalid archive rather than a limit breach. The law that matters is
+        // unchanged: the workspace is left clean.
+        assert!(
+            matches!(
+                &err,
+                ArchiveError::InvalidPreparation(message)
+                    if message.contains("payload.txt") && message.contains("declared")
+            ),
+            "unexpected error: {err:?}"
+        );
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1430,13 +1269,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("foo", b"file"), ("foo/child.txt", b"child")]);
 
-        let err = prepare(
-            &zip_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap_err();
+        let err = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1454,13 +1287,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_zip(&zip_path, &[("Foo", b"file"), ("foo/child.txt", b"child")]);
 
-        let err = prepare(
-            &zip_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap_err();
+        let err = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1488,13 +1315,7 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             write_zip(&zip_path, &[(name, b"unsafe")]);
 
-            let err = prepare(
-                &zip_path,
-                &extract_root,
-                ArchivePolicy::default(),
-                ArchiveKind::Zip,
-            )
-            .unwrap_err();
+            let err = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap_err();
 
             assert!(matches!(err, ArchiveError::ArchiveInvalidPath(_)), "{name}");
             assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
@@ -1514,7 +1335,6 @@ mod tests {
             &zip_path,
             &extract_root,
             ArchivePolicy::new().max_entry_bytes(3),
-            ArchiveKind::Zip,
         )
         .unwrap_err();
 
@@ -1529,82 +1349,36 @@ mod tests {
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
-
-    #[test]
-    fn sniff_format_detects_zip_from_magic() {
-        let root = temp_root("sniff-zip");
-        fs::create_dir_all(&root).unwrap();
-        let zip_path = root.join("tool.zip");
-        write_zip(&zip_path, &[("bin/tool", b"payload")]);
-        assert_eq!(
-            ArchiveKind::sniff(&zip_path).unwrap(),
-            Some(ArchiveKind::Zip)
-        );
-
-        let empty_zip_path = root.join("empty.zip");
-        fs::write(
-            &empty_zip_path,
-            b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
-        )
-        .unwrap();
-        assert_eq!(
-            ArchiveKind::sniff(&empty_zip_path).unwrap(),
-            Some(ArchiveKind::Zip)
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(not(feature = "gzip"))]
-    #[test]
-    fn sniff_format_rejects_a_known_disabled_format() {
-        let root = temp_root("sniff-disabled-gzip");
-        fs::create_dir_all(&root).unwrap();
-        let gzip_path = root.join("tool.tar.gz");
-        fs::write(&gzip_path, [0x1f, 0x8b]).unwrap();
-
-        assert_eq!(
-            ArchiveKind::sniff(&gzip_path).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn preparation_evidence_attests_its_format_as_data() {
-        let root = temp_root("prepared-format");
-        fs::create_dir_all(&root).unwrap();
-        let zip_path = root.join("tool.zip");
-        write_zip(&zip_path, &[("bin/tool", b"payload")]);
-        let extract_root = root.join("extract");
-
-        let evidence = prepare(
-            &zip_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::Zip,
-        )
-        .unwrap();
-
-        assert_eq!(evidence.format, ArchiveKind::Zip);
-        fs::remove_dir_all(root).unwrap();
-    }
 }
 
-#[cfg(all(test, feature = "tar", feature = "local"))]
+#[cfg(all(test, feature = "tar"))]
 mod tar_tests {
     use std::fs::{self, File};
-    use std::io::{self, Cursor, Write};
+    use std::io::{Cursor, Write};
     use std::path::{Path, PathBuf};
 
-    use super::{ArchiveError, ArchiveKind, ArchivePolicy};
+    use super::{ArchiveError, ArchivePolicy};
+
+    /// The test plays the caller: it owns the decoder choice, exactly as a real caller does.
+    #[derive(Clone, Copy)]
+    enum Codec {
+        Plain,
+        Gzip,
+    }
 
     fn prepare(
         source: &Path,
         workspace: &Path,
         policy: ArchivePolicy,
-        kind: ArchiveKind,
+        codec: Codec,
     ) -> Result<super::ArchiveEvidence, ArchiveError> {
-        kind.prepare(source, workspace, policy)
+        let file = File::open(source).unwrap();
+        match codec {
+            Codec::Plain => super::prepare_tar(file, workspace, policy),
+            Codec::Gzip => {
+                super::prepare_tar(flate2::read::GzDecoder::new(file), workspace, policy)
+            }
+        }
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1668,19 +1442,16 @@ mod tar_tests {
         fs::write(path, bytes).unwrap();
     }
 
-    #[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
     fn tar_bytes(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         build(&mut builder);
         builder.into_inner().unwrap()
     }
 
-    #[cfg(feature = "gzip")]
     fn write_tar_gzip(path: &Path, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) {
         write_gzip_bytes(path, &tar_bytes(build));
     }
 
-    #[cfg(feature = "gzip")]
     fn write_gzip_bytes(path: &Path, bytes: &[u8]) {
         let file = File::create(path).unwrap();
         let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -1688,11 +1459,10 @@ mod tar_tests {
         encoder.finish().unwrap();
     }
 
-    #[cfg(any(feature = "gzip", feature = "xz", feature = "zstd"))]
+    /// A compressed stream is not an entry stream: the caller must decode before handing it in.
     fn assert_raw_compressed_stream_rejected(
         name: &str,
         extension: &str,
-        kind: ArchiveKind,
         write: impl FnOnce(&Path),
     ) {
         let root = temp_root(name);
@@ -1701,25 +1471,17 @@ mod tar_tests {
         fs::create_dir_all(&root).unwrap();
         write(&source);
 
-        assert!(prepare(&source, &extract_root, ArchivePolicy::default(), kind).is_err());
+        assert!(
+            prepare(
+                &source,
+                &extract_root,
+                ArchivePolicy::default(),
+                Codec::Gzip
+            )
+            .is_err()
+        );
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "xz")]
-    fn write_tar_xz(path: &Path, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) {
-        let file = File::create(path).unwrap();
-        let mut encoder = xz2::write::XzEncoder::new(file, 6);
-        encoder.write_all(&tar_bytes(build)).unwrap();
-        encoder.finish().unwrap();
-    }
-
-    #[cfg(feature = "zstd")]
-    fn write_tar_zstd(path: &Path, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) {
-        let file = File::create(path).unwrap();
-        let mut encoder = zstd::stream::Encoder::new(file, 3).unwrap();
-        encoder.write_all(&tar_bytes(build)).unwrap();
-        encoder.finish().unwrap();
     }
 
     fn patch_first_tar_path(path: &Path, name: &[u8]) {
@@ -1752,7 +1514,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap();
 
@@ -1780,7 +1542,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::new().strip_components(1),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap();
 
@@ -1809,7 +1571,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::new().max_decoded_bytes(0),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -1838,7 +1600,7 @@ mod tar_tests {
             &tar_path,
             &root.join("measure"),
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap()
         .decoded_bytes;
@@ -1847,7 +1609,7 @@ mod tar_tests {
             &tar_path,
             &root.join("exact"),
             ArchivePolicy::new().max_decoded_bytes(measured),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap();
 
@@ -1856,7 +1618,7 @@ mod tar_tests {
             &tar_path,
             &below_root,
             ArchivePolicy::new().max_decoded_bytes(measured - 1),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1885,7 +1647,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::new().max_decoded_bytes(512),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -1915,7 +1677,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::new().max_entries(1),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -1943,7 +1705,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -1970,7 +1732,7 @@ mod tar_tests {
                 &tar_path,
                 &extract_root,
                 ArchivePolicy::default(),
-                ArchiveKind::Tar,
+                Codec::Plain,
             )
             .unwrap_err();
 
@@ -1999,7 +1761,7 @@ mod tar_tests {
                 &tar_path,
                 &extract_root,
                 ArchivePolicy::default(),
-                ArchiveKind::Tar,
+                Codec::Plain,
             )
             .unwrap_err();
 
@@ -2022,7 +1784,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -2041,7 +1803,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::new().max_total_bytes(3),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -2070,7 +1832,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -2094,7 +1856,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::default(),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -2122,7 +1884,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::new().strip_components(1),
-            ArchiveKind::Tar,
+            Codec::Plain,
         )
         .unwrap_err();
 
@@ -2131,7 +1893,6 @@ mod tar_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_extracts_archive_tree() {
         let root = temp_root("gzip-extract");
@@ -2146,7 +1907,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::default(),
-            ArchiveKind::TarGz,
+            Codec::Gzip,
         )
         .unwrap();
 
@@ -2159,20 +1920,13 @@ mod tar_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_rejects_a_raw_gzip_stream() {
-        assert_raw_compressed_stream_rejected(
-            "gzip-raw-stream",
-            "gz",
-            ArchiveKind::TarGz,
-            |path| {
-                write_gzip_bytes(path, b"not a tar archive");
-            },
-        );
+        assert_raw_compressed_stream_rejected("gzip-raw-stream", "gz", |path| {
+            write_gzip_bytes(path, b"not a tar archive");
+        });
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_rejects_parent_path() {
         let root = temp_root("gzip-path");
@@ -2186,7 +1940,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::default(),
-            ArchiveKind::TarGz,
+            Codec::Gzip,
         )
         .unwrap_err();
 
@@ -2195,7 +1949,6 @@ mod tar_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_rejects_byte_limit() {
         let root = temp_root("gzip-byte-limit");
@@ -2207,7 +1960,7 @@ mod tar_tests {
             &tar_path,
             &root.join("extract"),
             ArchivePolicy::new().max_total_bytes(3),
-            ArchiveKind::TarGz,
+            Codec::Gzip,
         )
         .unwrap_err();
 
@@ -2221,7 +1974,6 @@ mod tar_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_limits_all_decoded_container_bytes() {
         let root = temp_root("gzip-decoded-limit");
@@ -2239,7 +1991,7 @@ mod tar_tests {
             ArchivePolicy::new()
                 .strip_components(2)
                 .max_decoded_bytes(1024),
-            ArchiveKind::TarGz,
+            Codec::Gzip,
         )
         .unwrap_err();
 
@@ -2258,7 +2010,6 @@ mod tar_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(feature = "gzip")]
     #[test]
     fn tar_gzip_prepare_limits_hidden_pax_bytes() {
         let root = temp_root("gzip-pax-limit");
@@ -2277,7 +2028,7 @@ mod tar_tests {
             &tar_path,
             &extract_root,
             ArchivePolicy::new().max_decoded_bytes(1024),
-            ArchiveKind::TarGz,
+            Codec::Gzip,
         )
         .unwrap_err();
 
@@ -2290,173 +2041,6 @@ mod tar_tests {
             }
         ));
         assert_eq!(fs::read_dir(&extract_root).unwrap().count(), 0);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "xz")]
-    #[test]
-    fn tar_xz_prepare_extracts_archive_tree() {
-        let root = temp_root("xz-extract");
-        let tar_path = root.join("payload.tar.xz");
-        let extract_root = root.join("extract");
-        fs::create_dir_all(&root).unwrap();
-        write_tar_xz(&tar_path, |builder| {
-            append_file(builder, "bin/tool.txt", b"pulith")
-        });
-
-        let evidence = prepare(
-            &tar_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::TarXz,
-        )
-        .unwrap();
-
-        assert_eq!(evidence.entries, 1);
-        assert_eq!(
-            fs::read_to_string(extract_root.join("bin/tool.txt")).unwrap(),
-            "pulith"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "xz")]
-    #[test]
-    fn tar_xz_prepare_rejects_a_raw_xz_stream() {
-        assert_raw_compressed_stream_rejected("xz-raw-stream", "xz", ArchiveKind::TarXz, |path| {
-            let file = File::create(path).unwrap();
-            let mut encoder = xz2::write::XzEncoder::new(file, 6);
-            encoder.write_all(b"not a tar archive").unwrap();
-            encoder.finish().unwrap();
-        });
-    }
-
-    #[cfg(feature = "zstd")]
-    #[test]
-    fn tar_zstd_prepare_extracts_archive_tree() {
-        let root = temp_root("zstd-extract");
-        let tar_path = root.join("payload.tar.zst");
-        let extract_root = root.join("extract");
-        fs::create_dir_all(&root).unwrap();
-        write_tar_zstd(&tar_path, |builder| {
-            append_file(builder, "bin/tool.txt", b"pulith")
-        });
-
-        let evidence = prepare(
-            &tar_path,
-            &extract_root,
-            ArchivePolicy::default(),
-            ArchiveKind::TarZstd,
-        )
-        .unwrap();
-
-        assert_eq!(evidence.entries, 1);
-        assert_eq!(
-            fs::read_to_string(extract_root.join("bin/tool.txt")).unwrap(),
-            "pulith"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "zstd")]
-    #[test]
-    fn tar_zstd_prepare_rejects_a_raw_zstd_stream() {
-        assert_raw_compressed_stream_rejected(
-            "zstd-raw-stream",
-            "zst",
-            ArchiveKind::TarZstd,
-            |path| {
-                let file = File::create(path).unwrap();
-                let mut encoder = zstd::stream::Encoder::new(file, 3).unwrap();
-                encoder.write_all(b"not a tar archive").unwrap();
-                encoder.finish().unwrap();
-            },
-        );
-    }
-    #[test]
-    fn sniff_format_detects_archives_from_magic_and_plain_bytes() {
-        let root = temp_root("sniff-format");
-        fs::create_dir_all(&root).unwrap();
-
-        let tar_path = root.join("tool.tar");
-        write_tar(&tar_path, |builder| {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(3);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, "tool", b"bin".as_slice())
-                .unwrap();
-        });
-        assert_eq!(
-            ArchiveKind::sniff(&tar_path).unwrap(),
-            Some(ArchiveKind::Tar)
-        );
-
-        #[cfg(feature = "gzip")]
-        {
-            let gz_path = root.join("tool.tar.gz");
-            write_tar_gzip(&gz_path, |builder| {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(3);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, "tool", b"bin".as_slice())
-                    .unwrap();
-            });
-            assert_eq!(
-                ArchiveKind::sniff(&gz_path).unwrap(),
-                Some(ArchiveKind::TarGz)
-            );
-        }
-
-        #[cfg(feature = "xz")]
-        {
-            let xz_path = root.join("tool.tar.xz");
-            write_tar_xz(&xz_path, |builder| {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(3);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, "tool", b"bin".as_slice())
-                    .unwrap();
-            });
-            assert_eq!(
-                ArchiveKind::sniff(&xz_path).unwrap(),
-                Some(ArchiveKind::TarXz)
-            );
-        }
-
-        #[cfg(feature = "zstd")]
-        {
-            let zstd_path = root.join("tool.tar.zst");
-            write_tar_zstd(&zstd_path, |builder| {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(3);
-                header.set_mode(0o644);
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, "tool", b"bin".as_slice())
-                    .unwrap();
-            });
-            assert_eq!(
-                ArchiveKind::sniff(&zstd_path).unwrap(),
-                Some(ArchiveKind::TarZstd)
-            );
-        }
-
-        let plain_path = root.join("plain.bin");
-        fs::write(&plain_path, b"not an archive at all").unwrap();
-        assert_eq!(ArchiveKind::sniff(&plain_path).unwrap(), None);
-
-        assert_eq!(
-            ArchiveKind::sniff(&root.join("missing.bin"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
         fs::remove_dir_all(root).unwrap();
     }
 }

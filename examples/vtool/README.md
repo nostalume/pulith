@@ -84,7 +84,7 @@ performs only the required install or activation behavior up to the declared att
 | --- | --- | --- |
 | `local` | `LocalSource`, `LocalTarget`, `StagedTree`, `RecordStore`, `Link`, `Unlink`, `Inspect`, `Reconcile` | local custody, publication, views, observations, and state |
 | `http-ureq` | `RemoteUrl`, `RemoteSource`, `Acquire` | synchronous staged HTTP acquisition |
-| `zip`, `tar`, `gzip` | `ArchiveKind`, `ArchivePolicy` | archive detection and preparation |
+| `zip`, `tar` | `prepare_zip`, `prepare_tar`, `ArchivePolicy` | manifest-declared archive preparation |
 | `blake3`, `sha2` | `DigestValue`, `Verify` | explicit artifact identity |
 | `serde` | digest and manifest deserialization | strict TOML declarations |
 

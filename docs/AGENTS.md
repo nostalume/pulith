@@ -36,11 +36,10 @@ system, service ecosystem, or global workflow engine.
 | Language | Rust 2024 |
 | Development toolchain | Rust 1.99 |
 | MSRV | Rust 1.88 |
-| Synchronous HTTP | ureq with rustls |
-| Asynchronous HTTP | reqwest with rustls on Tokio |
+| HTTP | ureq with rustls |
 | Admission and pacing | governor |
-| Local staging and traversal | tempfile, walkdir, same-file |
-| Archives and codecs | zip, tar, flate2, xz2, zstd |
+| Local staging and traversal | tempfile, walkdir |
+| Archives and codecs | zip, tar, flate2 |
 | Digests | blake3, sha2, hex |
 | URL and HTTP dates | url, httpdate |
 | Platform APIs | rustix on Unix, windows-sys on Windows |

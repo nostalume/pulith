@@ -73,8 +73,13 @@ TAR, and compressed TAR support share a safety contract while retaining format-s
 ### Staging and publication
 
 A destination-oriented `StagedTree` is created beside its target. Its methods assemble a complete
-tree while that tree is private. `publish` consumes the stage and is the commit boundary: readers
-must not observe a partially assembled destination.
+tree while that tree is private. `commit` consumes the stage and is the commit boundary: readers
+must not observe a partially assembled destination. The commit takes an explicit `Admission`:
+`Absent` renames only onto a free name, `ReplaceRegularFile` also replaces a regular file in place
+and, on POSIX, carries the predecessor's permission bits onto the new file. An `Occupancy`
+classified by `LocalTarget::occupancy` reports the same facts read-only. Neither ever follows a
+link: a directory, symlink, reparse point, or other occupant is refused and left untouched, and a
+commit re-classifies at commit time rather than trusting a caller-held observation.
 
 Process scratch output uses separate custody. A scratch worktree cannot accidentally acquire the
 authority of a destination-oriented stage.
@@ -112,12 +117,11 @@ evidence; only waiting and I/O modality change.
 | `blake3`, `sha2` | concrete exact-digest verification |
 | archive format features | safe preparation through a selected decoder |
 | `net` | URL admission, retry, pacing, limits, and transport-neutral evidence |
-| `http-ureq`, `http-reqwest` | synchronous and asynchronous HTTP transport |
+| `http-ureq` | synchronous HTTP transport |
 | `process` | admitted worktrees, exact environments, bounded execution, managed sessions |
-| `process-tokio` | asynchronous process execution with the same process contract |
 
 Parent features do not silently choose unrelated algorithms or runtimes. Consumers select only the
-adapter, codec, digest, or runtime they need.
+adapter, codec, or digest they need.
 
 ## Failure and recovery
 

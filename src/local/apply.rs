@@ -1,14 +1,75 @@
-//! Local publication: atomically publish one eagerly populated stage, or remove one target.
+//! Local publication: atomically commit one eagerly populated stage, or remove one target.
 //!
-//! Owns the exact single-target effect law: a native no-replace rename commit boundary and direct
-//! idempotent target removal. It never republishes, follows
+//! Owns the exact single-target effect law: one native rename commit boundary chosen by an
+//! explicit [`Admission`], and direct idempotent target removal. It never republishes, follows
 //! links, claims ownership, or retries. Evidence is adapter-attested effect data, not an
 //! authorization. Feature-gated on `local`.
+//!
+//! Staging is not a zero-write operation. `stage` creates the target's ancestor directories
+//! before it creates the private staged-tree workspace beside the target; callers that require a
+//! plan with no filesystem writes must not call it. Inspection and reconciliation stay read-only.
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{LocalError, LocalSource, LocalTarget, StagePlacement, StagedTree};
+use super::{LocalEntryKind, LocalError, LocalSource, LocalTarget, StagePlacement, StagedTree};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What currently occupies a target path, restricted to what publication can admit.
+///
+/// Produced by no-follow classification: a directory, symlink, reparse point, or other entry is
+/// never reported here, it is refused with [`LocalError::OccupiedTarget`].
+pub enum Occupancy {
+    /// Nothing occupies the target.
+    Absent,
+    /// A regular file occupies the target.
+    RegularFile {
+        /// Observed file length in bytes.
+        bytes: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The occupancy precondition a commit may proceed under.
+///
+/// The variants select different native rename forms, not a preference: `Absent` maps to a
+/// no-replace rename and `ReplaceRegularFile` to a replacing rename.
+pub enum Admission {
+    /// Commit only when the target is absent.
+    Absent,
+    /// Commit when the target is absent or a regular file.
+    ///
+    /// An existing regular file is replaced in place. On POSIX it keeps its permission bits; on
+    /// Windows it is replaced as-is, and a read-only or otherwise denied target surfaces as an
+    /// [`LocalError::Io`] with the target path, leaving the predecessor intact.
+    ReplaceRegularFile,
+}
+
+pub(crate) fn occupancy(target: &Path) -> Result<Occupancy, LocalError> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Occupancy::Absent),
+        Err(error) => return Err(LocalError::io("inspect target occupancy", target, error)),
+    };
+    let kind = metadata.file_type();
+    let refused = if kind.is_symlink() {
+        LocalEntryKind::Symlink
+    } else if is_reparse_metadata(&metadata)? {
+        LocalEntryKind::Reparse
+    } else if kind.is_file() {
+        return Ok(Occupancy::RegularFile {
+            bytes: metadata.len(),
+        });
+    } else if kind.is_dir() {
+        LocalEntryKind::Directory
+    } else {
+        LocalEntryKind::Other
+    };
+    Err(LocalError::OccupiedTarget {
+        path: target.to_path_buf(),
+        kind: refused,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Materialized file, directory, and byte totals published with one staged tree.
@@ -108,7 +169,23 @@ impl StagedTree {
     }
 
     /// Atomically publishes this complete stage only when the target is absent.
+    ///
+    /// Exactly [`StagedTree::commit`] with [`Admission::Absent`]; the immutable publication law is
+    /// unchanged.
     pub fn publish(self, target: LocalTarget) -> Result<ApplyEvidence, LocalError> {
+        self.commit(target, Admission::Absent)
+    }
+
+    /// Atomically commits this complete stage under an explicit [`Admission`].
+    ///
+    /// The staged tree is re-staged beside the target when it was built elsewhere, so the final
+    /// rename is always a same-directory operation: that is what makes the commit atomic and, on
+    /// Windows, what lets the new file inherit the target parent's ACL.
+    pub fn commit(
+        self,
+        target: LocalTarget,
+        admission: Admission,
+    ) -> Result<ApplyEvidence, LocalError> {
         let target_path = target.0;
         let target_parent = target_parent(&target_path)?
             .canonicalize()
@@ -119,29 +196,54 @@ impl StagedTree {
             root,
             placement,
         } = self;
-        if matches!(&placement, StagePlacement::Destination(parent) if parent == &target_parent) {
-            let stats = inspect_regular_tree(&root)?;
-            rename_no_replace(&root, &target_path)?;
-            drop(workspace);
-            return Ok(ApplyEvidence {
-                files: stats.files,
-                directories: stats.directories,
-                bytes: stats.bytes,
-            });
-        }
-
-        let destination = stage(&target_path)?;
-        let destination = if fs::symlink_metadata(&root)
-            .map_err(|error| LocalError::io("inspect staged root", &root, error))?
-            .file_type()
-            .is_dir()
+        let (workspace, root) = if matches!(&placement, StagePlacement::Destination(parent) if parent == &target_parent)
         {
-            destination.copy_tree(LocalSource(root), PathBuf::new())?
+            (workspace, root)
         } else {
-            destination.copy_file(LocalSource(root), PathBuf::new())?
+            let destination = stage(&target_path)?;
+            let destination = if fs::symlink_metadata(&root)
+                .map_err(|error| LocalError::io("inspect staged root", &root, error))?
+                .file_type()
+                .is_dir()
+            {
+                destination.copy_tree(LocalSource(root), PathBuf::new())?
+            } else {
+                destination.copy_file(LocalSource(root), PathBuf::new())?
+            };
+            drop(workspace);
+            let StagedTree {
+                workspace, root, ..
+            } = destination;
+            (workspace, root)
         };
+
+        let stats = inspect_regular_tree(&root)?;
+        match admission {
+            Admission::Absent => rename_no_replace(&root, &target_path)?,
+            Admission::ReplaceRegularFile => match occupancy(&target_path)? {
+                Occupancy::Absent => rename_no_replace(&root, &target_path)?,
+                Occupancy::RegularFile { .. } => {
+                    if !fs::symlink_metadata(&root)
+                        .map_err(|error| LocalError::io("inspect staged root", &root, error))?
+                        .file_type()
+                        .is_file()
+                    {
+                        return Err(LocalError::InvalidPreparation(format!(
+                            "a regular-file target cannot be replaced by a staged directory: {}",
+                            target_path.display()
+                        )));
+                    }
+                    inherit_mode(&target_path, &root)?;
+                    rename_replace(&root, &target_path)?;
+                }
+            },
+        }
         drop(workspace);
-        destination.publish(LocalTarget(target_path))
+        Ok(ApplyEvidence {
+            files: stats.files,
+            directories: stats.directories,
+            bytes: stats.bytes,
+        })
     }
 }
 
@@ -189,15 +291,13 @@ impl RegularEntry {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn is_reparse(_: &walkdir::DirEntry) -> Result<bool, LocalError> {
     Ok(false)
 }
 
 #[cfg(windows)]
 fn is_reparse(entry: &walkdir::DirEntry) -> Result<bool, LocalError> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     let metadata = entry.metadata().map_err(|error| {
         LocalError::io(
             "inspect staged entry",
@@ -205,6 +305,18 @@ fn is_reparse(entry: &walkdir::DirEntry) -> Result<bool, LocalError> {
             io::Error::other(error),
         )
     })?;
+    is_reparse_metadata(&metadata)
+}
+
+#[cfg(unix)]
+fn is_reparse_metadata(_metadata: &fs::Metadata) -> Result<bool, LocalError> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn is_reparse_metadata(metadata: &fs::Metadata) -> Result<bool, LocalError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
@@ -247,6 +359,35 @@ fn inspect_regular_tree(root: &Path) -> Result<TreeStats, LocalError> {
         }
     }
     Ok(stats)
+}
+
+/// Carries the replaced target's permission bits onto the staged file before the rename.
+///
+/// POSIX only: a rename keeps the *source* file's mode, so the target's mode has to travel with
+/// the staged file. Windows has no POSIX mode, and its only permission bit (read-only) makes a
+/// target unreplaceable, so nothing is inherited there.
+#[cfg(unix)]
+fn inherit_mode(target: &Path, staged: &Path) -> Result<(), LocalError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::symlink_metadata(target)
+        .map_err(|error| LocalError::io("read replaced target mode", target, error))?
+        .permissions()
+        .mode()
+        & 0o7777;
+    fs::set_permissions(staged, fs::Permissions::from_mode(mode))
+        .map_err(|error| LocalError::io("apply replaced target mode", staged, error))
+}
+
+#[cfg(windows)]
+fn inherit_mode(_target: &Path, _staged: &Path) -> Result<(), LocalError> {
+    Ok(())
+}
+
+/// Replaces an existing regular file with the staged file in one rename.
+///
+/// [`std::fs::rename`] is already a replacing rename on every supported platform.
+fn rename_replace(source: &Path, target: &Path) -> Result<(), LocalError> {
+    fs::rename(source, target).map_err(|error| LocalError::io("replace target", target, error))
 }
 
 #[cfg(unix)]

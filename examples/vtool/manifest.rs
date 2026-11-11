@@ -106,11 +106,44 @@ impl Manifest {
     }
 }
 
+/// The encoding of a source artifact.
+///
+/// The caller declares it in the manifest. Nothing sniffs magic bytes: the recipe already says
+/// what was published, so the recipe is the authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArchiveFormat {
+    /// The source is copied as a file or tree.
+    #[default]
+    Plain,
+    /// The source is a ZIP stream.
+    Zip,
+    /// The source is a plain TAR stream.
+    Tar,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Source {
-    Url { url: Box<RemoteUrl> },
-    Local { path: PathBuf },
+    Url {
+        url: Box<RemoteUrl>,
+        #[serde(default)]
+        format: ArchiveFormat,
+    },
+    Local {
+        path: PathBuf,
+        #[serde(default)]
+        format: ArchiveFormat,
+    },
+}
+
+impl Source {
+    /// The declared artifact encoding for this source.
+    pub fn format(&self) -> ArchiveFormat {
+        match self {
+            Self::Url { format, .. } | Self::Local { format, .. } => *format,
+        }
+    }
 }
 
 #[derive(Debug)]
