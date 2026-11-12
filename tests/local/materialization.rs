@@ -28,6 +28,102 @@ fn staged_tree_writes_generated_bytes_inside_its_boundary() {
         b"schema = 1\n"
     );
 }
+/// A file-shaped publication pays for one temporary file, not for a workspace directory holding
+/// a tree. The target's neighbours are the observable proof: after a successful write and after
+/// a refusal alike, the directory holds what it held before plus the target itself.
+#[test]
+fn write_atomic_publishes_one_file_and_leaves_nothing_beside_it() {
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("nested/deeper/a.txt");
+    let target = LocalTarget::new(&target_path).unwrap();
+    let evidence = target
+        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .unwrap();
+    assert_eq!(evidence.files, 1);
+    assert_eq!(evidence.directories, 0);
+    assert_eq!(evidence.bytes, 5);
+    assert_eq!(fs::read(&target_path).unwrap(), b"fresh");
+    let siblings: Vec<_> = fs::read_dir(target_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(siblings, vec![std::ffi::OsString::from("a.txt")]);
+}
+
+#[test]
+fn write_atomic_replaces_the_predecessor_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("a.txt");
+    fs::write(&target_path, "stale").unwrap();
+    let target = LocalTarget::new(&target_path).unwrap();
+    target
+        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .unwrap();
+    assert_eq!(fs::read(&target_path).unwrap(), b"fresh");
+}
+
+/// The immutable admission keeps its promise here too: an existing predecessor is reported, not
+/// replaced, and the bytes that were there are still there.
+#[test]
+fn write_atomic_under_absent_admission_refuses_a_predecessor() {
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("a.txt");
+    fs::write(&target_path, "keep").unwrap();
+    let target = LocalTarget::new(&target_path).unwrap();
+    let error = target.write_atomic(b"new", Admission::Absent).unwrap_err();
+    assert!(
+        matches!(error, pulith::local::LocalError::AlreadyPublished(_)),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(&target_path).unwrap(), b"keep");
+    let siblings: Vec<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(siblings, vec![std::ffi::OsString::from("a.txt")]);
+}
+
+/// A refusal happens before the rename, so the occupant is untouched and no temporary file is
+/// left where a later run would trip over it.
+#[test]
+fn write_atomic_refuses_a_directory_without_leaving_a_temporary_file() {
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("a.txt");
+    fs::create_dir(&target_path).unwrap();
+    let target = LocalTarget::new(&target_path).unwrap();
+    let error = target
+        .write_atomic(b"new", Admission::ReplaceRegularFile)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        pulith::local::LocalError::OccupiedTarget { .. }
+    ));
+    assert!(target_path.is_dir());
+    let siblings: Vec<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(siblings, vec![std::ffi::OsString::from("a.txt")]);
+}
+
+/// Replacing a file must not reformat it: the mode of the file that is already there travels
+/// onto the staged file before the rename.
+#[cfg(unix)]
+#[test]
+fn write_atomic_keeps_the_mode_of_the_file_it_replaces() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("a.txt");
+    fs::write(&target_path, "stale").unwrap();
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let target = LocalTarget::new(&target_path).unwrap();
+    target
+        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .unwrap();
+    let mode = fs::metadata(&target_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 use pulith::{Acquire, Inspect, Reconcile, Remove};
 
 fn temp_root(name: &str) -> PathBuf {

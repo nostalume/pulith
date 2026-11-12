@@ -81,6 +81,14 @@ classified by `LocalTarget::occupancy` reports the same facts read-only. Neither
 link: a directory, symlink, reparse point, or other occupant is refused and left untouched, and a
 commit re-classifies at commit time rather than trusting a caller-held observation.
 
+`LocalTarget::write_atomic` is the same boundary at the size of one file: a hidden temporary file
+beside the target, the same admission check before the rename, the same mode inheritance, and no
+tree. The tree is the right unit when several entries must become visible together; it is the wrong
+unit when each file is an independent decision, because then every file pays for a workspace
+directory, a `tree/` child, a post-commit walk, and a recursive removal that publish nothing. The
+two entries share `occupancy`, `inherit_mode`, and the two rename forms, so platform differences
+still exist once.
+
 Process scratch output uses separate custody. A scratch worktree cannot accidentally acquire the
 authority of a destination-oriented stage.
 

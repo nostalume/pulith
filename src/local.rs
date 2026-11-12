@@ -539,6 +539,23 @@ impl LocalTarget {
     pub fn stage(&self) -> Result<StagedTree, LocalError> {
         apply::stage(self.as_path())
     }
+
+    /// Writes these bytes to this target with one rename, without a staged tree.
+    ///
+    /// The commit boundary is [`StagedTree::commit`]'s: the predecessor or the new bytes are
+    /// visible, never a half-written file. The difference is custody size — one temporary file
+    /// beside the target instead of a workspace directory holding a `tree/` directory — for
+    /// callers whose unit of decision is a file rather than a tree.
+    ///
+    /// Effect law: ancestor directories are created on demand, exactly as [`Self::stage`] does.
+    /// A refusal leaves the target untouched, and the temporary file is removed.
+    pub fn write_atomic(
+        &self,
+        bytes: impl AsRef<[u8]>,
+        admission: Admission,
+    ) -> Result<ApplyEvidence, LocalError> {
+        apply::write_atomic(self.as_path(), bytes.as_ref(), admission)
+    }
 }
 
 /// Local material with explicit caller-owned or adapter-owned custody.
