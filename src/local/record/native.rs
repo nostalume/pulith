@@ -1,9 +1,10 @@
-use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use super::{RecordError, RecordEvidence, RecordLimit, RecordObservation};
+use crate::local::{LocalEntryKind, LocalError, LocalPath, entry_kind};
+
+use super::{RecordError, RecordLimit};
 
 pub(super) enum Entry {
     Missing,
@@ -13,10 +14,16 @@ pub(super) enum Entry {
 
 pub(super) fn record_path(root: &Path, name: &Path) -> Result<PathBuf, RecordError> {
     let mut parts = name.components();
-    let valid = matches!(parts.next(), Some(Component::Normal(_)))
-        && parts.next().is_none()
-        && name != OsStr::new("lock")
-        && name != OsStr::new("stage");
+    let valid = parts.next().is_some_and(|component| {
+        if let Component::Normal(leaf) = component {
+            let bytes = leaf.as_encoded_bytes();
+            super::super::descendant_component(component)
+                && !bytes.eq_ignore_ascii_case(b"lock")
+                && !bytes.eq_ignore_ascii_case(b"stage")
+        } else {
+            false
+        }
+    }) && parts.next().is_none();
     if valid {
         Ok(root.join(name))
     } else {
@@ -26,34 +33,25 @@ pub(super) fn record_path(root: &Path, name: &Path) -> Result<PathBuf, RecordErr
 
 pub(super) fn classify(path: &Path) -> Result<Entry, RecordError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(Entry::File),
-        Ok(_) => Ok(Entry::Other),
+        Ok(metadata) => {
+            match entry_kind(path, &metadata).map_err(|error| record_open_error(path, error))? {
+                LocalEntryKind::File => Ok(Entry::File),
+                _ => Ok(Entry::Other),
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Entry::Missing),
         Err(error) => Err(RecordError::before("inspect record", path, error)),
     }
 }
 
-pub(super) fn inspect(
-    path: &Path,
-    limit: RecordLimit,
-) -> Result<(RecordObservation, RecordEvidence), RecordError> {
-    if matches!(classify(path)?, Entry::Missing) {
-        return Ok((
-            RecordObservation::Missing,
-            RecordEvidence {
-                path: path.into(),
-                bytes: 0,
-            },
-        ));
-    }
-    if !matches!(classify(path)?, Entry::File) {
-        return Err(RecordError::Conflict { path: path.into() });
-    }
-    let mut file =
-        File::open(path).map_err(|error| RecordError::before("open record", path, error))?;
+pub(super) fn read(path: &Path, limit: RecordLimit) -> Result<Option<Vec<u8>>, RecordError> {
+    let file = LocalPath::new(path).and_then(|target| target.open_file());
+    let Some(mut file) = file.map_err(|error| record_open_error(path, error))? else {
+        return Ok(None);
+    };
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
-        .take(limit.0 + 1)
+        .take(limit.0.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| RecordError::before("read record", path, error))?;
     if bytes.len() as u64 > limit.0 {
@@ -62,25 +60,34 @@ pub(super) fn inspect(
             limit: limit.0,
         });
     }
-    let evidence = RecordEvidence {
-        path: path.into(),
-        bytes: bytes.len() as u64,
-    };
-    Ok((RecordObservation::Present(bytes), evidence))
+    Ok(Some(bytes))
+}
+
+fn record_open_error(path: &Path, error: LocalError) -> RecordError {
+    match error {
+        LocalError::NotRegularFile { path, .. } => RecordError::Conflict { path },
+        LocalError::Io {
+            action,
+            path,
+            source,
+        } => RecordError::before(action, &path, source),
+        LocalError::InvalidPath(path) => RecordError::InvalidName(path),
+        other => RecordError::before("open record", path, io::Error::other(other)),
+    }
 }
 
 pub(super) fn ensure_stage(path: &Path) -> Result<(), RecordError> {
-    match classify(path)? {
-        Entry::Missing => fs::create_dir(path)
-            .map_err(|error| RecordError::before("create record stage", path, error)),
-        Entry::Other
-            if fs::symlink_metadata(path)
-                .map(|m| m.is_dir() && !m.file_type().is_symlink())
-                .unwrap_or(false) =>
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if entry_kind(path, &metadata).map_err(|error| record_open_error(path, error))?
+                == LocalEntryKind::Directory =>
         {
             Ok(())
         }
-        _ => Err(RecordError::Conflict { path: path.into() }),
+        Ok(_) => Err(RecordError::Conflict { path: path.into() }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path)
+            .map_err(|error| RecordError::before("create record stage", path, error)),
+        Err(error) => Err(RecordError::before("inspect record stage", path, error)),
     }
 }
 
@@ -183,18 +190,11 @@ pub(super) fn commit(stage: &Path, target: &Path, replace: bool) -> io::Result<(
 
 #[cfg(windows)]
 pub(super) fn commit(stage: &Path, target: &Path, replace: bool) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>()
-    };
-    let source = wide(stage);
-    let destination = wide(target);
+    let source = super::super::wide_path(stage)?;
+    let destination = super::super::wide_path(target)?;
     let flags = MOVEFILE_WRITE_THROUGH
         | if replace {
             MOVEFILE_REPLACE_EXISTING

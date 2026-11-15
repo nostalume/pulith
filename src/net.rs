@@ -28,11 +28,6 @@ use std::time::{Duration, SystemTime};
 #[cfg(feature = "http-ureq")]
 use governor::clock::Clock;
 
-#[cfg(feature = "http-ureq")]
-use crate::local::LocalMaterial;
-#[cfg(feature = "http-ureq")]
-use crate::{Acquire, Inspect};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Failure to admit an absolute HTTP or HTTPS URL.
 pub enum RemoteUrlError {
@@ -63,7 +58,7 @@ impl std::error::Error for RemoteUrlError {}
 
 #[derive(Debug)]
 /// Failure to acquire remote material, retaining available attempt and resume evidence.
-pub enum AcquireError {
+pub enum DownloadError {
     /// The remote url outcome.
     RemoteUrl(RemoteUrlError),
     /// The http status outcome.
@@ -155,7 +150,7 @@ pub enum ProtocolError {
     },
 }
 
-impl fmt::Display for AcquireError {
+impl fmt::Display for DownloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RemoteUrl(error) => write!(f, "net acquire source error: {error}"),
@@ -201,7 +196,7 @@ impl fmt::Display for AcquireError {
     }
 }
 
-impl std::error::Error for AcquireError {
+impl std::error::Error for DownloadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::RemoteUrl(error) => Some(error),
@@ -211,7 +206,7 @@ impl std::error::Error for AcquireError {
     }
 }
 
-impl AcquireError {
+impl DownloadError {
     #[cfg(feature = "http-ureq")]
     fn local(
         url: Option<&RemoteUrl>,
@@ -245,14 +240,9 @@ impl AcquireError {
     }
 }
 
-#[derive(Clone)]
-/// Admitted absolute HTTP or HTTPS URL with optional inspection adapter resources.
-pub struct RemoteUrl {
-    url: url::Url,
-    policy: HttpInspectPolicy,
-    #[cfg(feature = "http-ureq")]
-    sync_resources: Option<UreqResources>,
-}
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Admitted absolute HTTP or HTTPS URL.
+pub struct RemoteUrl(url::Url);
 
 impl RemoteUrl {
     /// Parses and admits an absolute HTTP or HTTPS URL.
@@ -261,69 +251,33 @@ impl RemoteUrl {
             input: input.to_string(),
         })?;
         match url.scheme() {
-            "http" | "https" => Ok(Self {
-                url,
-                policy: HttpInspectPolicy::default(),
-                #[cfg(feature = "http-ureq")]
-                sync_resources: None,
-            }),
+            "http" | "https" => Ok(Self(url)),
             scheme => Err(RemoteUrlError::UnsupportedScheme {
                 scheme: scheme.to_string(),
             }),
         }
     }
 
-    /// Replace the default synchronous HEAD resources (agent, delay, admission).
-    #[cfg(feature = "http-ureq")]
-    pub fn with_ureq(mut self, resources: UreqResources) -> Self {
-        self.sync_resources = Some(resources);
-        self
-    }
-
-    /// Replace the default HEAD inspection policy (timeout and retry).
-    pub fn with_inspect_policy(mut self, policy: HttpInspectPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
     /// Returns the admitted URL as a string.
     pub fn as_str(&self) -> &str {
-        self.url.as_str()
+        self.0.as_str()
     }
 
     #[cfg(feature = "http-ureq")]
-    fn local_error(&self, action: &'static str, path: &Path, source: io::Error) -> AcquireError {
-        AcquireError::local(Some(self), action, path, source)
+    fn local_error(&self, action: &'static str, path: &Path, source: io::Error) -> DownloadError {
+        DownloadError::local(Some(self), action, path, source)
     }
 
     /// Borrows the parsed URL value.
     pub fn as_url(&self) -> &url::Url {
-        &self.url
+        &self.0
     }
 
     /// Consumes this wrapper and returns the parsed URL value.
     pub fn into_url(self) -> url::Url {
-        self.url
+        self.0
     }
 }
-
-impl PartialEq for RemoteUrl {
-    fn eq(&self, other: &Self) -> bool {
-        self.url == other.url
-    }
-}
-
-impl fmt::Debug for RemoteUrl {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RemoteUrl")
-            .field("url", &self.url)
-            .field("policy", &self.policy)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Eq for RemoteUrl {}
 
 impl std::str::FromStr for RemoteUrl {
     type Err = RemoteUrlError;
@@ -353,7 +307,7 @@ impl<'de> serde::Deserialize<'de> for RemoteUrl {
     }
 }
 
-impl From<RemoteUrlError> for AcquireError {
+impl From<RemoteUrlError> for DownloadError {
     fn from(error: RemoteUrlError) -> Self {
         Self::RemoteUrl(error)
     }
@@ -361,7 +315,7 @@ impl From<RemoteUrlError> for AcquireError {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 /// Caller-selected timeout, size, header, retry, and resume policy for acquisition.
-pub struct AcquirePolicy {
+pub struct DownloadPolicy {
     /// The timeout value.
     pub timeout: Option<Duration>,
     /// The max bytes value.
@@ -374,7 +328,7 @@ pub struct AcquirePolicy {
     pub resume: ResumePolicy,
 }
 
-impl AcquirePolicy {
+impl DownloadPolicy {
     /// Sets the timeout applied to each acquisition attempt.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -843,7 +797,7 @@ impl Validator {
             })
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "http-ureq"))]
     fn if_range_value(&self) -> String {
         match &self.kind {
             ValidatorKind::StrongEtag(value) => value.clone(),
@@ -851,7 +805,7 @@ impl Validator {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "http-ureq"))]
     fn permits_response(&self, etag: Option<&str>, last_modified: Option<&str>) -> bool {
         match &self.kind {
             ValidatorKind::StrongEtag(expected) => etag
@@ -864,22 +818,11 @@ impl Validator {
     }
 }
 
-/// HTTP source identity, acquisition policy, and transport resources; it carries no publication
-/// destination.
+/// An HTTP address and its download policy.
 #[derive(Clone)]
 pub struct RemoteSource {
     pub(crate) url: RemoteUrl,
-    pub(crate) policy: AcquirePolicy,
-    #[cfg(feature = "http-ureq")]
-    pub(crate) sync_resources: Option<UreqResources>,
-}
-
-#[cfg(feature = "http-ureq")]
-/// Remote acquisition whose resume input has been observed and frozen before transport.
-pub struct PreparedRemote {
-    source: RemoteSource,
-    stage: tempfile::NamedTempFile,
-    resume: Option<PlannedResume>,
+    pub(crate) policy: DownloadPolicy,
 }
 
 impl PartialEq for RemoteSource {
@@ -891,13 +834,11 @@ impl PartialEq for RemoteSource {
 impl Eq for RemoteSource {}
 
 impl RemoteSource {
-    /// Constructs a remote source with default acquisition policy and adapter resources.
+    /// Constructs a remote source with the default download policy.
     pub fn new(url: RemoteUrl) -> Self {
         Self {
             url,
-            policy: AcquirePolicy::default(),
-            #[cfg(feature = "http-ureq")]
-            sync_resources: None,
+            policy: DownloadPolicy::default(),
         }
     }
 
@@ -907,15 +848,8 @@ impl RemoteSource {
     }
 
     /// Replaces the acquisition policy.
-    pub fn policy(mut self, policy: AcquirePolicy) -> Self {
+    pub fn policy(mut self, policy: DownloadPolicy) -> Self {
         self.policy = policy;
-        self
-    }
-
-    /// Replace the default synchronous transport resources (agent, delay, admission, pacing).
-    #[cfg(feature = "http-ureq")]
-    pub fn with_ureq(mut self, resources: UreqResources) -> Self {
-        self.sync_resources = Some(resources);
         self
     }
 
@@ -925,51 +859,63 @@ impl RemoteSource {
     }
 
     #[cfg(feature = "http-ureq")]
-    /// Freezes resume metadata before any HTTP attempt begins.
-    pub fn prepare(mut self) -> Result<PreparedRemote, AcquireError> {
-        let mut stage = tempfile::NamedTempFile::new().map_err(|error| {
-            self.url
-                .local_error("create download stage", &std::env::temp_dir(), error)
-        })?;
+    fn prepare_resume(
+        &mut self,
+        stage: &mut std::fs::File,
+    ) -> Result<Option<PlannedResume>, DownloadError> {
         let resume = match std::mem::take(&mut self.policy.resume) {
             ResumePolicy::RestartOnly => None,
             ResumePolicy::IfRange {
                 partial_path,
                 validator,
-            } => match std::fs::File::open(&partial_path) {
-                Ok(mut partial) => {
-                    let partial_bytes =
-                        std::io::copy(&mut partial, stage.as_file_mut()).map_err(|error| {
-                            self.url
-                                .local_error("snapshot partial download", &partial_path, error)
+            } => {
+                use std::io::Read;
+                let source =
+                    crate::local::LocalPath::new(&partial_path).and_then(|path| path.open_file());
+                let partial = match source {
+                    Ok(Some(partial)) => partial,
+                    Ok(None) => return Ok(None),
+                    Err(error) => {
+                        return Err(self.url.local_error(
+                            "open partial download",
+                            &partial_path,
+                            io::Error::other(error),
+                        ));
+                    }
+                };
+                let limit = self.policy.max_bytes.unwrap_or(u64::MAX);
+                let mut prefix = partial.take(limit.saturating_add(1));
+                let partial_bytes = std::io::copy(&mut prefix, stage).map_err(|error| {
+                    self.url
+                        .local_error("snapshot partial download", &partial_path, error)
+                })?;
+                if partial_bytes > limit {
+                    stage
+                        .set_len(0)
+                        .and_then(|()| stage.rewind())
+                        .map_err(|error| {
+                            self.url.local_error(
+                                "reset oversized partial download",
+                                &partial_path,
+                                error,
+                            )
                         })?;
-                    (partial_bytes > 0).then_some(PlannedResume {
-                        partial_path,
-                        partial_bytes,
-                        validator,
-                    })
+                    return Ok(None);
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(self.url.local_error(
-                        "open partial download",
-                        &partial_path,
-                        error,
-                    ));
-                }
-            },
+                (partial_bytes > 0).then_some(PlannedResume {
+                    partial_path,
+                    partial_bytes,
+                    validator,
+                })
+            }
         };
-        Ok(PreparedRemote {
-            source: self,
-            stage,
-            resume,
-        })
+        Ok(resume)
     }
 }
 
 /// Observed HTTP acquisition facts, excluding the ephemeral stage owned by the output artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemoteAcquireEvidence {
+pub struct DownloadEvidence {
     /// The url value.
     pub url: url::Url,
     /// The status value.
@@ -1132,14 +1078,14 @@ pub enum AttemptOutcome {
 }
 
 #[cfg(feature = "http-ureq")]
-type SyncSleep = Arc<dyn Fn(Duration) + Send + Sync>;
+type RetryDelay = Arc<dyn Fn(Duration) + Send + Sync>;
 
 #[cfg(feature = "http-ureq")]
 #[derive(Clone)]
 /// Shareable synchronous HTTP agent, admission gate, and decoded-byte pacer.
 pub struct UreqResources {
     agent: ureq::Agent,
-    delay: SyncSleep,
+    delay: RetryDelay,
     admission: Option<Arc<RateAdmission>>,
     byte_pacer: Option<Arc<ByteRatePacer>>,
 }
@@ -1150,36 +1096,24 @@ impl Default for UreqResources {
     /// an explicit resource injected through [`UreqResources::from_agent`].
     fn default() -> Self {
         let config = ureq::Agent::config_builder().proxy(None).build();
-        Self {
-            agent: config.new_agent(),
-            delay: Arc::new(std::thread::sleep),
-            admission: None,
-            byte_pacer: None,
-        }
+        Self::from_agent(config.new_agent())
     }
 }
 
 #[cfg(feature = "http-ureq")]
 impl UreqResources {
-    /// Constructs synchronous adapter resources around an existing ureq agent.
+    /// Constructs adapter resources around an existing ureq agent.
     pub fn from_agent(agent: ureq::Agent) -> Self {
         Self {
             agent,
-            ..Self::default()
+            delay: Arc::new(std::thread::sleep),
+            admission: None,
+            byte_pacer: None,
         }
     }
 
-    /// Builds resources whose agent ignores ambient proxy environment variables.
-    ///
-    /// Direct transport is already the default law. This named constructor exists so callers can
-    /// state that intent explicitly; to use a proxy, inject an agent with
-    /// [`UreqResources::from_agent`].
-    pub fn without_proxy() -> Self {
-        Self::default()
-    }
-
     #[cfg(test)]
-    fn with_delay(mut self, delay: SyncSleep) -> Self {
+    fn with_delay(mut self, delay: RetryDelay) -> Self {
         self.delay = delay;
         self
     }
@@ -1198,41 +1132,64 @@ impl UreqResources {
 }
 
 #[cfg(feature = "http-ureq")]
-impl Inspect<()> for RemoteUrl {
-    type Error = HttpInspectError;
-    type Output = (RemoteObservation, RemoteInspectEvidence);
+impl UreqResources {
+    /// Downloads into an unnamed byte file that can be verified and consumed without reopening it.
+    pub fn download(
+        &self,
+        mut source: RemoteSource,
+    ) -> Result<(crate::local::FileSnapshot, DownloadEvidence), DownloadError> {
+        let path = std::env::temp_dir();
+        let mut file = tempfile::tempfile().map_err(|error| {
+            source
+                .url
+                .local_error("create download stage", &path, error)
+        })?;
+        let resume = source.prepare_resume(&mut file)?;
+        let evidence = source.download_into(self, &mut file, &path, resume)?;
+        file.rewind().map_err(|source| DownloadError::Local {
+            url: Some(evidence.url.clone()),
+            action: "rewind download",
+            path: path.clone(),
+            source,
+        })?;
+        Ok((crate::local::FileSnapshot { file, source: path }, evidence))
+    }
 
-    fn inspect(mut self, (): ()) -> Result<Self::Output, Self::Error> {
+    /// Issues a HEAD request and returns the status, declared length, and attempt history.
+    pub fn inspect_headers(
+        &self,
+        url: &RemoteUrl,
+        policy: HttpInspectPolicy,
+    ) -> Result<(RemoteObservation, RemoteInspectEvidence), HttpInspectError> {
         use ureq::ResponseExt as _;
 
-        let resources = self.sync_resources.take().unwrap_or_default();
-        let requested_url = self.url.clone();
+        let requested_url = url.as_url().clone();
         let mut attempts = Vec::new();
-        for attempt in 0..=self.policy.retry.max_retries {
-            let admission_wait = resources
+        for attempt in 0..=policy.retry.max_retries {
+            let admission_wait = self
                 .admission
                 .as_ref()
                 .map(|admission| admission.enter_sync());
 
-            let mut request_config = resources
+            let mut request_config = self
                 .agent
-                .head(self.url.as_str())
+                .head(url.as_str())
                 .config()
                 .http_status_as_error(false);
-            if let Some(timeout) = self.policy.timeout {
+            if let Some(timeout) = policy.timeout {
                 request_config = request_config.timeout_global(Some(timeout));
             }
             let response = match request_config.build().call() {
                 Ok(response) => response,
                 Err(error) => {
-                    let will_retry = attempt < self.policy.retry.max_retries;
-                    let planned_delay = will_retry.then(|| retry_delay(self.policy.retry, attempt));
+                    let will_retry = attempt < policy.retry.max_retries;
+                    let planned_delay = will_retry.then(|| retry_delay(policy.retry, attempt));
                     attempts.push(
                         HttpInspectAttemptEvidence::new(attempt, None, admission_wait)
                             .with_planned_delay(planned_delay),
                     );
                     if let Some(delay) = planned_delay {
-                        (resources.delay)(delay);
+                        (self.delay)(delay);
                         continue;
                     }
                     return Err(HttpInspectError::Transport {
@@ -1266,15 +1223,15 @@ impl Inspect<()> for RemoteUrl {
                     attempts: attempts.clone(),
                 }
             })?;
-            let will_retry = should_retry_status(status) && attempt < self.policy.retry.max_retries;
+            let will_retry = should_retry_status(status) && attempt < policy.retry.max_retries;
             let planned_delay =
-                will_retry.then(|| planned_retry_delay(self.policy.retry, attempt, retry_after));
+                will_retry.then(|| planned_retry_delay(policy.retry, attempt, retry_after));
             attempts.push(
                 HttpInspectAttemptEvidence::new(attempt, Some(status), admission_wait)
                     .with_planned_delay(planned_delay),
             );
             if let Some(delay) = planned_delay {
-                (resources.delay)(delay);
+                (self.delay)(delay);
                 continue;
             }
 
@@ -1295,21 +1252,17 @@ impl Inspect<()> for RemoteUrl {
 }
 
 #[cfg(feature = "http-ureq")]
-impl Acquire for PreparedRemote {
-    type Error = AcquireError;
-    type Output = (LocalMaterial, RemoteAcquireEvidence);
-
-    fn acquire(self) -> Result<Self::Output, Self::Error> {
-        let PreparedRemote {
-            mut source,
-            mut stage,
-            resume: mut prepared_resume,
-        } = self;
-        let resources = source.sync_resources.take().unwrap_or_default();
-
+impl RemoteSource {
+    fn download_into(
+        self,
+        resources: &UreqResources,
+        stage: &mut std::fs::File,
+        stage_path: &Path,
+        mut prepared_resume: Option<PlannedResume>,
+    ) -> Result<DownloadEvidence, DownloadError> {
         let mut attempts = Vec::new();
         let mut resume = None;
-        let max_attempts = source
+        let max_attempts = self
             .policy
             .retry
             .max_retries
@@ -1320,8 +1273,8 @@ impl Acquire for PreparedRemote {
                 .admission
                 .as_ref()
                 .map(|admission| admission.enter_sync());
-            let mut request = resources.agent.get(source.url.as_str());
-            for (name, value) in &source.policy.headers {
+            let mut request = resources.agent.get(self.url.as_str());
+            for (name, value) in &self.policy.headers {
                 request = request.header(name, value);
             }
             if let Some(resume) = &resume_context {
@@ -1329,7 +1282,7 @@ impl Acquire for PreparedRemote {
                 request = request.header("If-Range", resume.validator.if_range_value());
             }
             let mut request_config = request.config().http_status_as_error(false);
-            if let Some(timeout) = source.policy.timeout {
+            if let Some(timeout) = self.policy.timeout {
                 request_config = request_config.timeout_global(Some(timeout));
             }
             let request = request_config.build();
@@ -1337,9 +1290,8 @@ impl Acquire for PreparedRemote {
             let mut response = match request.call() {
                 Ok(response) => response,
                 Err(err) => {
-                    let will_retry = attempt < source.policy.retry.max_retries;
-                    let planned_delay =
-                        will_retry.then(|| retry_delay(source.policy.retry, attempt));
+                    let will_retry = attempt < self.policy.retry.max_retries;
+                    let planned_delay = will_retry.then(|| retry_delay(self.policy.retry, attempt));
                     attempts.push(
                         AttemptEvidence::new(attempt, AttemptOutcome::RetryableNetworkError)
                             .with_planned_delay(planned_delay)
@@ -1349,8 +1301,8 @@ impl Acquire for PreparedRemote {
                         (resources.delay)(delay);
                         continue;
                     }
-                    return Err(AcquireError::transport(
-                        &source.url,
+                    return Err(DownloadError::transport(
+                        &self.url,
                         TransportPhase::SendRequest,
                         err.to_string(),
                         attempts,
@@ -1377,7 +1329,7 @@ impl Acquire for PreparedRemote {
                 content_range: header("content-range").map(str::to_owned),
             };
             let (append_resume, response_validator) = match facts.admit(
-                &source,
+                &self,
                 attempt,
                 resume_context,
                 admission_wait,
@@ -1400,35 +1352,28 @@ impl Acquire for PreparedRemote {
             } else {
                 0
             };
+            stage.set_len(initial_bytes).map_err(|error| {
+                self.url
+                    .local_error("reset download stage", stage_path, error)
+            })?;
             stage
-                .as_file_mut()
-                .set_len(initial_bytes)
-                .map_err(|error| {
-                    source
-                        .url
-                        .local_error("reset download stage", stage.path(), error)
-                })?;
-            stage
-                .as_file_mut()
                 .seek(std::io::SeekFrom::Start(initial_bytes))
                 .map_err(|error| {
-                    source
-                        .url
-                        .local_error("seek download stage", stage.path(), error)
+                    self.url
+                        .local_error("seek download stage", stage_path, error)
                 })?;
             let active_pacer = resources.byte_pacer.as_ref();
             let copy = match copy_response_body(
                 response.body_mut().as_reader(),
-                stage.as_file_mut(),
-                source.policy.max_bytes,
+                stage,
+                self.policy.max_bytes,
                 initial_bytes,
                 active_pacer,
             ) {
                 Ok(copy) => copy,
                 Err(BodyCopyError::Transport { message, bytes }) => {
-                    let will_retry = attempt < source.policy.retry.max_retries;
-                    let planned_delay =
-                        will_retry.then(|| retry_delay(source.policy.retry, attempt));
+                    let will_retry = attempt < self.policy.retry.max_retries;
+                    let planned_delay = will_retry.then(|| retry_delay(self.policy.retry, attempt));
                     attempts.push(
                         AttemptEvidence::transfer(
                             attempt,
@@ -1444,8 +1389,8 @@ impl Acquire for PreparedRemote {
                         (resources.delay)(delay);
                         continue;
                     }
-                    return Err(AcquireError::transport(
-                        &source.url,
+                    return Err(DownloadError::transport(
+                        &self.url,
                         TransportPhase::ReadBody,
                         message,
                         attempts,
@@ -1461,8 +1406,8 @@ impl Acquire for PreparedRemote {
                         admission_wait,
                         AttemptOutcome::LimitExceeded,
                     ));
-                    return Err(AcquireError::LimitExceeded {
-                        url: source.url.as_url().clone(),
+                    return Err(DownloadError::LimitExceeded {
+                        url: self.url.as_url().clone(),
                         max,
                         actual,
                         attempts,
@@ -1484,8 +1429,8 @@ impl Acquire for PreparedRemote {
                         admission_wait,
                         AttemptOutcome::LocalFailure,
                     ));
-                    return Err(AcquireError::Local {
-                        url: Some(source.url.as_url().clone()),
+                    return Err(DownloadError::Local {
+                        url: Some(self.url.as_url().clone()),
                         action,
                         path,
                         source: io_error,
@@ -1493,15 +1438,13 @@ impl Acquire for PreparedRemote {
                 }
             };
             if let Some(append) = &append_resume {
-                append.validate(copy.bytes, &source.url, &attempts, &resume)?;
+                append.validate(copy.bytes, &self.url, &attempts, &resume)?;
             }
-            stage.as_file_mut().flush().map_err(|error| {
-                source
-                    .url
-                    .local_error("flush download temp file", stage.path(), error)
+            stage.flush().map_err(|error| {
+                self.url
+                    .local_error("flush download temp file", stage_path, error)
             })?;
 
-            let staged_path = stage.into_temp_path();
             if let Some(append) = append_resume {
                 resume = Some(append.resume.into_evidence(ResumeOutcome::PartialAppended));
             }
@@ -1517,18 +1460,15 @@ impl Acquire for PreparedRemote {
                 )
                 .with_pacing_wait(copy.pacing_wait),
             );
-            return Ok((
-                LocalMaterial::StagedFile { path: staged_path },
-                RemoteAcquireEvidence {
-                    url: source.url.into_url(),
-                    status,
-                    bytes: copy.bytes,
-                    content_length,
-                    attempts,
-                    resume,
-                    validator: response_validator,
-                },
-            ));
+            return Ok(DownloadEvidence {
+                url: self.url.into_url(),
+                status,
+                bytes: copy.bytes,
+                content_length,
+                attempts,
+                resume,
+                validator: response_validator,
+            });
         }
         unreachable!("retry loop always returns")
     }
@@ -1547,7 +1487,7 @@ fn reject_known_oversize(
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 fn retry_delay(policy: RetryPolicy, retry_index: u32) -> Duration {
     let delay = policy
         .base_delay
@@ -1569,12 +1509,12 @@ fn planned_retry_delay(
     retry_delay(policy, retry_index)
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 fn should_retry_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -1636,9 +1576,9 @@ impl PlannedResume {
         url: &RemoteUrl,
         attempts: &[AttemptEvidence],
         evidence: &Option<ResumeEvidence>,
-    ) -> Result<AppendResume, AcquireError> {
+    ) -> Result<AppendResume, DownloadError> {
         if !self.validator.permits_response(etag, last_modified) {
-            return Err(AcquireError::Protocol {
+            return Err(DownloadError::Protocol {
                 url: url.as_url().clone(),
                 kind: ProtocolError::ResumeValidatorMismatch,
                 attempts: attempts.to_vec(),
@@ -1648,7 +1588,7 @@ impl PlannedResume {
         let range = header
             .as_deref()
             .and_then(|value| parse_content_range(value, self.partial_bytes))
-            .ok_or_else(|| AcquireError::Protocol {
+            .ok_or_else(|| DownloadError::Protocol {
                 url: url.as_url().clone(),
                 kind: ProtocolError::InvalidContentRange {
                     expected_start: self.partial_bytes,
@@ -1690,7 +1630,7 @@ impl ResponseFacts {
         admission_wait: Option<Duration>,
         attempts: &mut Vec<AttemptEvidence>,
         resume: &mut Option<ResumeEvidence>,
-    ) -> Result<ResponseAdmission, AcquireError> {
+    ) -> Result<ResponseAdmission, DownloadError> {
         if let Some(admission) = self.admit_status(
             source,
             attempt,
@@ -1702,7 +1642,7 @@ impl ResponseFacts {
             return Ok(admission);
         }
         let append = if self.status == 206 {
-            let context = context.ok_or_else(|| AcquireError::Protocol {
+            let context = context.ok_or_else(|| DownloadError::Protocol {
                 url: source.url.as_url().clone(),
                 kind: ProtocolError::UnexpectedPartialResponse,
                 attempts: attempts.clone(),
@@ -1733,7 +1673,7 @@ impl ResponseFacts {
         admission_wait: Option<Duration>,
         attempts: &mut Vec<AttemptEvidence>,
         resume: &mut Option<ResumeEvidence>,
-    ) -> Result<Option<ResponseAdmission>, AcquireError> {
+    ) -> Result<Option<ResponseAdmission>, DownloadError> {
         if self.status == 416
             && let Some(context) = context.take()
         {
@@ -1761,7 +1701,7 @@ impl ResponseFacts {
             );
             return match planned {
                 Some(wait) => Ok(Some(ResponseAdmission::Retry(wait))),
-                None => Err(AcquireError::HttpStatus {
+                None => Err(DownloadError::HttpStatus {
                     url: source.url.as_url().clone(),
                     status: self.status,
                     retryable,
@@ -1776,7 +1716,7 @@ impl ResponseFacts {
             return Ok(None);
         };
         attempts.push(self.evidence(attempt, admission_wait, AttemptOutcome::LimitExceeded));
-        Err(AcquireError::LimitExceeded {
+        Err(DownloadError::LimitExceeded {
             url: source.url.as_url().clone(),
             max,
             actual,
@@ -1794,14 +1734,14 @@ impl AppendResume {
         url: &RemoteUrl,
         attempts: &[AttemptEvidence],
         evidence: &Option<ResumeEvidence>,
-    ) -> Result<(), AcquireError> {
+    ) -> Result<(), DownloadError> {
         if self
             .range
             .matches_materialized_bytes(self.resume.partial_bytes, bytes)
         {
             return Ok(());
         }
-        Err(AcquireError::Protocol {
+        Err(DownloadError::Protocol {
             url: url.as_url().clone(),
             kind: ProtocolError::InvalidContentRange {
                 expected_start: self.resume.partial_bytes,
@@ -1835,7 +1775,7 @@ fn parse_strong_etag(value: &str) -> Option<String> {
         .then(|| value.to_string())
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 fn selected_response_validator(
     etag: Option<&str>,
     last_modified: Option<&str>,
@@ -1849,14 +1789,14 @@ fn selected_response_validator(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParsedContentRange {
     end: u64,
     total: u64,
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 impl ParsedContentRange {
     fn matches_materialized_bytes(self, start: u64, materialized_bytes: u64) -> bool {
         let Some(fragment_bytes) = self
@@ -1871,7 +1811,7 @@ impl ParsedContentRange {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "http-ureq"))]
 fn parse_content_range(value: &str, expected_start: u64) -> Option<ParsedContentRange> {
     let range = value.trim().strip_prefix("bytes ")?;
     let (span, total) = range.split_once('/')?;
@@ -1959,7 +1899,6 @@ fn copy_response_body(
 mod tests {
     use super::*;
     #[cfg(feature = "http-ureq")]
-    use crate::Inspect;
     #[cfg(feature = "http-ureq")]
     use std::io::Write as TestWrite;
     #[cfg(feature = "http-ureq")]
@@ -2043,7 +1982,7 @@ mod tests {
 
     #[test]
     fn retry_policy_is_disabled_by_default_and_computes_delay() {
-        assert_eq!(AcquirePolicy::default().retry, RetryPolicy::disabled());
+        assert_eq!(DownloadPolicy::default().retry, RetryPolicy::disabled());
         let policy = RetryPolicy::exponential(3, Duration::from_millis(25))
             .max_delay(Duration::from_millis(60));
         assert_eq!(retry_delay(policy, 0), Duration::from_millis(25));
@@ -2156,8 +2095,12 @@ mod tests {
     #[cfg(feature = "http-ureq")]
     fn ureq_inspect_uses_head_and_reports_declared_metadata() {
         let server = serve_once(200, b"body-not-materialized", &[]);
-        let (observation, evidence) =
-            Inspect::inspect(RemoteUrl::parse(&server.url).unwrap(), ()).unwrap();
+        let (observation, evidence) = UreqResources::default()
+            .inspect_headers(
+                &RemoteUrl::parse(&server.url).unwrap(),
+                HttpInspectPolicy::default(),
+            )
+            .unwrap();
         let request = server.next_request();
         server.join();
 
@@ -2175,8 +2118,12 @@ mod tests {
     #[cfg(feature = "http-ureq")]
     fn ureq_inspect_returns_non_success_status_as_observation_without_get_fallback() {
         let server = serve_once(405, b"method not allowed", &[]);
-        let (observation, evidence) =
-            Inspect::inspect(RemoteUrl::parse(&server.url).unwrap(), ()).unwrap();
+        let (observation, evidence) = UreqResources::default()
+            .inspect_headers(
+                &RemoteUrl::parse(&server.url).unwrap(),
+                HttpInspectPolicy::default(),
+            )
+            .unwrap();
         let request = server.next_request();
         server.join();
 
@@ -2198,14 +2145,9 @@ mod tests {
             max_delay: None,
             respect_retry_after: false,
         });
-        let (observation, evidence) = Inspect::inspect(
-            RemoteUrl::parse(&server.url)
-                .unwrap()
-                .with_ureq(resources)
-                .with_inspect_policy(policy),
-            (),
-        )
-        .unwrap();
+        let (observation, evidence) = resources
+            .inspect_headers(&RemoteUrl::parse(&server.url).unwrap(), policy)
+            .unwrap();
         assert!(server.next_request().starts_with("HEAD "));
         assert!(server.next_request().starts_with("HEAD "));
         server.join();
@@ -2223,7 +2165,9 @@ mod tests {
     fn ureq_inspect_records_requested_and_final_redirect_urls() {
         let server = serve_redirect_then(200, b"final");
         let requested = RemoteUrl::parse(&server.url).unwrap();
-        let (_, evidence) = Inspect::inspect(requested.clone(), ()).unwrap();
+        let (_, evidence) = UreqResources::default()
+            .inspect_headers(&requested, HttpInspectPolicy::default())
+            .unwrap();
         assert!(server.next_request().starts_with("HEAD /artifact.bin "));
         assert!(server.next_request().starts_with("HEAD /final "));
         server.join();
@@ -2237,13 +2181,12 @@ mod tests {
     fn ureq_inspect_preserves_transport_attempt_evidence() {
         let (url, server) = closed_endpoint();
 
-        let error = Inspect::inspect(
-            RemoteUrl::parse(&url)
-                .unwrap()
-                .with_ureq(UreqResources::without_proxy()),
-            (),
-        )
-        .unwrap_err();
+        let error = UreqResources::default()
+            .inspect_headers(
+                &RemoteUrl::parse(&url).unwrap(),
+                HttpInspectPolicy::default(),
+            )
+            .unwrap_err();
         server.join().unwrap();
 
         match error {
@@ -2257,18 +2200,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_downloads_file_to_local_material() {
+    fn ureq_download_returns_owned_snapshot() {
         let body = b"downloaded bytes";
         let server = serve_once(200, body, &[]);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         server.join();
 
-        let LocalMaterial::StagedFile { path } = &artifact else {
-            panic!("remote acquisition must keep staged-file custody")
-        };
-        assert_eq!(std::fs::read(path).unwrap(), body);
+        let path = snapshot_bytes(artifact);
+        assert_eq!(path, body);
         assert_eq!(evidence.status, 200);
         assert_eq!(evidence.bytes, body.len() as u64);
         assert_eq!(evidence.content_length, Some(body.len() as u64));
@@ -2276,14 +2217,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_does_not_publish_materialize_target() {
+    fn ureq_download_does_not_publish_materialize_target() {
         let server = serve_once(200, b"replacement", &[]);
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target.bin");
         std::fs::write(&target, b"original").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let (artifact, _) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, _) = UreqResources::default().download(source).unwrap();
         server.join();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
@@ -2292,49 +2233,34 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_does_not_create_target_parent() {
+    fn ureq_download_does_not_create_target_parent() {
         let server = serve_once(200, b"staged", &[]);
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("absent/target.bin");
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let (artifact, _) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, _) = UreqResources::default().download(source).unwrap();
         server.join();
 
         assert!(!target.parent().unwrap().exists());
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"staged");
+        assert_eq!(snapshot_bytes(artifact), b"staged");
     }
 
     #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquired_material_is_removed_when_abandoned() {
-        let server = serve_once(200, b"temporary", &[]);
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-
-        let (artifact, _) = Acquire::acquire(source.prepare().unwrap()).unwrap();
-        server.join();
-        let staged_path = artifact.path().to_path_buf();
-        assert!(staged_path.exists());
-        drop(artifact);
-
-        assert!(!staged_path.exists());
-    }
-
-    #[test]
-    #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_rejects_non_success_status_without_touching_target() {
+    fn ureq_download_rejects_non_success_status_without_touching_target() {
         let server = serve_once(404, b"not found", &[]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
         std::fs::write(&destination, b"old").unwrap();
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
         assert!(matches!(
             error,
-            AcquireError::HttpStatus {
+            DownloadError::HttpStatus {
                 status: 404,
                 retryable: false,
                 ..
@@ -2345,18 +2271,39 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_enforces_max_bytes_without_publishing_target() {
+    fn ureq_download_enforces_max_bytes_without_publishing_target() {
         let server = serve_once(200, b"too large", &[]);
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("artifact.bin");
-        let policy = AcquirePolicy::default().max_bytes(3);
+        let policy = DownloadPolicy::default().max_bytes(3);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
-        assert!(matches!(error, AcquireError::LimitExceeded { max: 3, .. }));
+        assert!(matches!(error, DownloadError::LimitExceeded { max: 3, .. }));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "http-ureq")]
+    fn oversized_partial_restarts_with_a_bounded_full_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("artifact.part");
+        std::fs::write(&partial, b"too large").unwrap();
+        let server = serve_once(200, b"ok", &[]);
+        let policy = DownloadPolicy::default()
+            .max_bytes(2)
+            .resume(ResumePolicy::if_range(&partial, test_validator()));
+        let source = RemoteSource::from_url_str(&server.url)
+            .unwrap()
+            .policy(policy);
+        let (file, evidence) = UreqResources::default().download(source).unwrap();
+        assert_eq!(snapshot_bytes(file), b"ok");
+        assert!(evidence.resume.is_none());
+        assert!(!request_has_header_name(&server.next_request(), "range"));
+        server.join();
+        assert_eq!(std::fs::read(partial).unwrap(), b"too large");
     }
 
     #[test]
@@ -2366,16 +2313,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
-        let policy = AcquirePolicy::default()
+        let policy = DownloadPolicy::default()
             .max_bytes(8)
             .resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
         let attempts = match error {
-            AcquireError::LimitExceeded { attempts, .. } => attempts,
+            DownloadError::LimitExceeded { attempts, .. } => attempts,
             other => panic!("expected limit error, got {other:?}"),
         };
         assert_eq!(attempts.last().unwrap().bytes, 5);
@@ -2390,19 +2337,17 @@ mod tests {
             (200, b"ok", &[]),
         ]);
         let policy =
-            AcquirePolicy::default().retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
+            DownloadPolicy::default().retry(RetryPolicy::exponential(1, Duration::from_millis(10)));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
         let sleeps = TestArc::new(Mutex::new(Vec::new()));
         let resources = UreqResources::default().with_delay({
             let sleeps = TestArc::clone(&sleeps);
             TestArc::new(move |duration| sleeps.lock().unwrap().push(duration))
         });
-        let source = source.with_ureq(resources);
-
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = resources.download(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"ok");
+        assert_eq!(snapshot_bytes(artifact), b"ok");
         assert_eq!(*sleeps.lock().unwrap(), vec![Duration::from_secs(2)]);
         assert_eq!(evidence.attempts.len(), 2);
         assert_eq!(evidence.attempts[0].status, Some(503));
@@ -2418,18 +2363,16 @@ mod tests {
     fn ureq_concrete_byte_rate_pacer_downloads() {
         let server = serve_once(200, b"concrete paced", &[]);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
-            .policy(AcquirePolicy::default());
+            .policy(DownloadPolicy::default());
         let pacer = ByteRatePacer::new(ByteRate::new(
             NonZeroU32::new(1_000_000).unwrap(),
             NonZeroU32::new(16_384).unwrap(),
         ));
         let resources = UreqResources::default().with_byte_pacer(TestArc::new(pacer));
-        let source = source.with_ureq(resources);
-
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = resources.download(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"concrete paced");
+        assert_eq!(snapshot_bytes(artifact), b"concrete paced");
         assert_eq!(evidence.attempts[0].pacing_wait, Duration::ZERO);
         assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
     }
@@ -2439,18 +2382,16 @@ mod tests {
     fn ureq_concrete_rate_admission_downloads() {
         let server = serve_once(200, b"rate admitted", &[]);
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
-            .policy(AcquirePolicy::default());
+            .policy(DownloadPolicy::default());
         let admission = RateAdmission::new(AttemptRate::new(
             NonZeroU32::new(1_000).unwrap(),
             NonZeroU32::new(1).unwrap(),
         ));
         let resources = UreqResources::default().with_admission(TestArc::new(admission));
-        let source = source.with_ureq(resources);
-
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = resources.download(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"rate admitted");
+        assert_eq!(snapshot_bytes(artifact), b"rate admitted");
         assert_eq!(evidence.attempts[0].admission_wait, Some(Duration::ZERO));
         assert_eq!(evidence.attempts[0].outcome, AttemptOutcome::Success);
     }
@@ -2467,13 +2408,13 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
+        assert_eq!(snapshot_bytes(artifact), b"hello world");
         assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
         assert_eq!(evidence.bytes, 11);
         assert_eq!(
@@ -2490,13 +2431,13 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"stale").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         server.join();
 
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
+        assert_eq!(snapshot_bytes(artifact), b"fresh");
         assert_eq!(std::fs::read(&partial).unwrap(), b"stale");
         assert_eq!(
             evidence.resume.unwrap().outcome,
@@ -2512,10 +2453,10 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"stale partial").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         let first_request = server.next_request();
         let second_request = server.next_request();
         server.join();
@@ -2524,7 +2465,7 @@ mod tests {
         assert!(request_has_header_name(&first_request, "If-Range"));
         assert!(!request_has_header_name(&second_request, "Range"));
         assert!(!request_has_header_name(&second_request, "If-Range"));
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"fresh");
+        assert_eq!(snapshot_bytes(artifact), b"fresh");
         assert_eq!(std::fs::read(&partial).unwrap(), b"stale partial");
         assert_eq!(
             evidence.resume.unwrap().outcome,
@@ -2541,15 +2482,15 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
         assert!(matches!(
             error,
-            AcquireError::Protocol {
+            DownloadError::Protocol {
                 kind: ProtocolError::InvalidContentRange { .. },
                 ..
             }
@@ -2567,15 +2508,15 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
         assert!(matches!(
             error,
-            AcquireError::Protocol {
+            DownloadError::Protocol {
                 kind: ProtocolError::InvalidContentRange { .. },
                 ..
             }
@@ -2599,14 +2540,14 @@ mod tests {
             move || std::fs::write(partial_to_truncate, b"hel").unwrap(),
         );
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         server.join();
 
         assert!(!destination.exists());
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
+        assert_eq!(snapshot_bytes(artifact), b"hello world");
         assert_eq!(evidence.resume.unwrap().partial_bytes, 5);
         assert_eq!(std::fs::read(&partial).unwrap(), b"hel");
     }
@@ -2624,16 +2565,16 @@ mod tests {
         std::fs::write(&partial, b"hello").unwrap();
         let validator = test_validator();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, validator.clone()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+        let (artifact, evidence) = UreqResources::default().download(source).unwrap();
         let request = server.next_request();
         server.join();
 
         assert!(request_has_header(&request, "range", "bytes=5-"));
         assert!(request_has_header(&request, "if-range", "\"abc\""));
-        assert_eq!(std::fs::read(artifact.path()).unwrap(), b"hello world");
+        assert_eq!(snapshot_bytes(artifact), b"hello world");
         let resume = evidence.resume.unwrap();
         assert_eq!(resume.outcome, ResumeOutcome::PartialAppended);
         assert_eq!(resume.validator, validator);
@@ -2653,15 +2594,15 @@ mod tests {
         let partial = temp.path().join("artifact.part");
         std::fs::write(&partial, b"hello").unwrap();
         let policy =
-            AcquirePolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
+            DownloadPolicy::default().resume(ResumePolicy::if_range(&partial, test_validator()));
         let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-        let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+        let error = UreqResources::default().download(source).unwrap_err();
         server.join();
 
         assert!(matches!(
             error,
-            AcquireError::Protocol {
+            DownloadError::Protocol {
                 kind: ProtocolError::ResumeValidatorMismatch,
                 ..
             }
@@ -2670,41 +2611,11 @@ mod tests {
         assert_eq!(std::fs::read(&partial).unwrap(), b"hello");
     }
 
-    #[test]
     #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_outputs_staged_artifact_with_evidence() {
-        let body = b"verified bytes";
-        let server = serve_once(200, body, &[]);
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-
-        let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
-        server.join();
-
-        let LocalMaterial::StagedFile { path } = &artifact else {
-            panic!("remote acquisition must keep staged-file custody")
-        };
-        assert_eq!(std::fs::read(path).unwrap(), body);
-        assert_eq!(evidence.status, 200);
-        assert_eq!(evidence.bytes, body.len() as u64);
-    }
-
-    #[test]
-    #[cfg(feature = "http-ureq")]
-    fn ureq_acquire_outputs_staged_artifact_without_publishing_destination() {
-        let body = b"apply bytes";
-        let server = serve_once(200, body, &[]);
-        let temp = tempfile::tempdir().unwrap();
-        let final_path = temp.path().join("final.bin");
-        let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
-
-        let (artifact, _) = Acquire::acquire(source.prepare().unwrap()).unwrap();
-        server.join();
-
-        assert!(!final_path.exists());
-        let LocalMaterial::StagedFile { path } = &artifact else {
-            panic!("remote acquisition must keep staged-file custody")
-        };
-        assert_eq!(std::fs::read(path).unwrap(), body);
+    fn snapshot_bytes(mut file: crate::local::FileSnapshot) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        bytes
     }
 
     #[cfg(feature = "http-ureq")]
@@ -2727,7 +2638,7 @@ mod tests {
 
     /// A transport failure owned by the test: accept one connection and close it without an HTTP
     /// response. This needs neither a port that stays free after `drop` nor any host networking
-    /// assumption. Callers pair it with `without_proxy()` so ambient proxy settings stay out.
+    /// assumption. Default HTTP resources ignore ambient proxy settings.
     #[cfg(feature = "http-ureq")]
     fn closed_endpoint() -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -10,15 +10,9 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 #[cfg(feature = "http-ureq")]
-use pulith::{Acquire, Inspect};
-
-#[cfg(feature = "http-ureq")]
-use pulith::local::LocalMaterial;
-#[cfg(feature = "http-ureq")]
 use pulith::net::{
-    AcquireError, AcquirePolicy, AttemptOutcome, AttemptRate, HttpInspectError, HttpInspectPolicy,
-    RateAdmission, RemoteAcquireEvidence, RemoteInspectEvidence, RemoteObservation, RemoteSource,
-    RetryPolicy,
+    AttemptOutcome, AttemptRate, DownloadError, DownloadPolicy, HttpInspectPolicy, RateAdmission,
+    RemoteSource, RetryPolicy,
 };
 #[cfg(feature = "http-ureq")]
 use pulith::net::{TransportPhase, UreqResources};
@@ -37,56 +31,27 @@ fn remote_url_uses_resource_specific_errors() {
 }
 
 #[cfg(feature = "http-ureq")]
-#[test]
-fn remote_source_implements_sync_acquire_contract() {
-    fn assert_acquire<
-        T: Acquire<Error = AcquireError, Output = (LocalMaterial, RemoteAcquireEvidence)>,
-    >() {
-    }
-    assert_acquire::<pulith::net::PreparedRemote>();
-
-    let source = RemoteSource::new(RemoteUrl::parse("http://example.com/resource").unwrap());
-    assert_eq!(source.url().as_str(), "http://example.com/resource");
+fn snapshot_bytes(mut file: pulith::local::FileSnapshot) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+    bytes
 }
 
 #[cfg(feature = "http-ureq")]
 #[test]
-fn remote_source_acquire_continues_as_local_material() {
-    fn assert_acquire<
-        T: Acquire<Error = AcquireError, Output = (LocalMaterial, RemoteAcquireEvidence)>,
-    >() {
-    }
-
-    assert_acquire::<pulith::net::PreparedRemote>();
-}
-
-#[cfg(feature = "http-ureq")]
-#[test]
-fn remote_url_implements_sync_inspect_contract() {
-    fn assert_inspect<
-        T: Inspect<(), Error = HttpInspectError, Output = (RemoteObservation, RemoteInspectEvidence)>,
-    >() {
-    }
-    assert_inspect::<RemoteUrl>();
-}
-
-#[cfg(feature = "http-ureq")]
-#[test]
-fn sync_acquire_stages_artifact_with_evidence() {
+fn sync_download_stages_artifact_with_evidence() {
     let body = b"sync acquire body";
     let server = serve_once(200, body, &[]);
     let url = server.url.clone();
     let source = RemoteSource::from_url_str(&server.url).unwrap();
 
-    let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+    let (artifact, evidence) = UreqResources::default().download(source).unwrap();
     let request = server.next_request();
     server.join();
 
     assert!(request.starts_with("GET /artifact.bin "));
-    let LocalMaterial::StagedFile { path } = artifact else {
-        panic!("remote acquisition must keep staged-file custody")
-    };
-    assert_eq!(std::fs::read(&path).unwrap(), body);
+    let path = snapshot_bytes(artifact);
+    assert_eq!(path, body);
     assert_eq!(evidence.url.as_str(), url);
     assert_eq!(evidence.status, 200);
     assert_eq!(evidence.bytes, body.len() as u64);
@@ -103,8 +68,12 @@ fn sync_inspect_reports_observation_with_evidence() {
     let server = serve_once(200, body, &[]);
     let url = server.url.clone();
 
-    let (observation, evidence) =
-        Inspect::inspect(RemoteUrl::parse(&server.url).unwrap(), ()).unwrap();
+    let (observation, evidence) = UreqResources::default()
+        .inspect_headers(
+            &RemoteUrl::parse(&server.url).unwrap(),
+            HttpInspectPolicy::default(),
+        )
+        .unwrap();
     let request = server.next_request();
     server.join();
 
@@ -119,21 +88,19 @@ fn sync_inspect_reports_observation_with_evidence() {
 
 #[cfg(feature = "http-ureq")]
 #[test]
-fn sync_acquire_retries_retryable_status_then_succeeds() {
+fn sync_download_retries_retryable_status_then_succeeds() {
     let body = b"retried body";
     let server = serve_sequence(vec![(503, b"", &[]), (200, body, &[])]);
-    let policy = AcquirePolicy::default().retry(RetryPolicy::exponential(1, Duration::ZERO));
+    let policy = DownloadPolicy::default().retry(RetryPolicy::exponential(1, Duration::ZERO));
     let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()).policy(policy);
 
-    let (artifact, evidence) = Acquire::acquire(source.prepare().unwrap()).unwrap();
+    let (artifact, evidence) = UreqResources::default().download(source).unwrap();
     assert!(server.next_request().starts_with("GET "));
     assert!(server.next_request().starts_with("GET "));
     server.join();
 
-    let LocalMaterial::StagedFile { path } = artifact else {
-        panic!("remote acquisition must keep staged-file custody")
-    };
-    assert_eq!(std::fs::read(&path).unwrap(), body);
+    let path = snapshot_bytes(artifact);
+    assert_eq!(path, body);
     assert_eq!(evidence.status, 200);
     assert_eq!(evidence.attempts.len(), 2);
     assert_eq!(evidence.attempts[0].status, Some(503));
@@ -151,13 +118,9 @@ fn sync_inspect_retries_status_and_returns_final_observation() {
     let server = serve_sequence(vec![(503, b"", &[]), (200, b"final", &[])]);
     let policy = HttpInspectPolicy::default().retry(RetryPolicy::exponential(1, Duration::ZERO));
 
-    let (observation, evidence) = Inspect::inspect(
-        RemoteUrl::parse(&server.url)
-            .unwrap()
-            .with_inspect_policy(policy),
-        (),
-    )
-    .unwrap();
+    let (observation, evidence) = UreqResources::default()
+        .inspect_headers(&RemoteUrl::parse(&server.url).unwrap(), policy)
+        .unwrap();
     assert!(server.next_request().starts_with("HEAD "));
     assert!(server.next_request().starts_with("HEAD "));
     server.join();
@@ -172,15 +135,15 @@ fn sync_inspect_retries_status_and_returns_final_observation() {
 
 #[cfg(feature = "http-ureq")]
 #[test]
-fn sync_acquire_reports_non_retryable_http_status() {
+fn sync_download_reports_non_retryable_http_status() {
     let server = serve_once(404, b"not found", &[]);
     let source = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap());
 
-    let error = Acquire::acquire(source.prepare().unwrap()).unwrap_err();
+    let error = UreqResources::default().download(source).unwrap_err();
     server.join();
 
     let attempts = match error {
-        AcquireError::HttpStatus {
+        DownloadError::HttpStatus {
             status: 404,
             retryable: false,
             attempts,
@@ -195,20 +158,16 @@ fn sync_acquire_reports_non_retryable_http_status() {
 
 #[cfg(feature = "http-ureq")]
 #[test]
-fn sync_acquire_reports_transport_error_with_attempt_evidence() {
+fn sync_download_reports_transport_error_with_attempt_evidence() {
     let (url, server) = closed_endpoint();
 
-    let error = Acquire::acquire(
-        RemoteSource::new(RemoteUrl::parse(&url).unwrap())
-            .with_ureq(UreqResources::without_proxy())
-            .prepare()
-            .unwrap(),
-    )
-    .unwrap_err();
+    let error = UreqResources::default()
+        .download(RemoteSource::new(RemoteUrl::parse(&url).unwrap()))
+        .unwrap_err();
     server.join().unwrap();
 
     match error {
-        AcquireError::Transport {
+        DownloadError::Transport {
             phase: TransportPhase::SendRequest,
             attempts,
             ..
@@ -237,7 +196,7 @@ fn closed_endpoint() -> (String, std::thread::JoinHandle<()>) {
 
 #[cfg(feature = "http-ureq")]
 #[test]
-fn sync_acquire_waits_on_shared_rate_admission() {
+fn sync_download_waits_on_shared_rate_admission() {
     let admission = RateAdmission::new(AttemptRate::new(
         NonZeroU32::new(1).unwrap(),
         NonZeroU32::new(1).unwrap(),
@@ -246,30 +205,14 @@ fn sync_acquire_waits_on_shared_rate_admission() {
     let server = serve_sequence(vec![(200, b"first", &[]), (200, b"second", &[])]);
     let url = RemoteUrl::parse(&server.url).unwrap();
 
-    let (first, first_evidence) = Acquire::acquire(
-        RemoteSource::new(url.clone())
-            .with_ureq(resources.clone())
-            .prepare()
-            .unwrap(),
-    )
-    .unwrap();
-    let (second, second_evidence) = Acquire::acquire(
-        RemoteSource::new(url)
-            .with_ureq(resources)
-            .prepare()
-            .unwrap(),
-    )
-    .unwrap();
+    let (first, first_evidence) = resources.download(RemoteSource::new(url.clone())).unwrap();
+    let (second, second_evidence) = resources.download(RemoteSource::new(url)).unwrap();
     server.join();
 
-    let LocalMaterial::StagedFile { path: first_path } = first else {
-        panic!("remote acquisition must keep staged-file custody")
-    };
-    let LocalMaterial::StagedFile { path: second_path } = second else {
-        panic!("remote acquisition must keep staged-file custody")
-    };
-    assert_eq!(std::fs::read(&first_path).unwrap(), b"first");
-    assert_eq!(std::fs::read(&second_path).unwrap(), b"second");
+    let first_path = snapshot_bytes(first);
+    let second_path = snapshot_bytes(second);
+    assert_eq!(first_path, b"first");
+    assert_eq!(second_path, b"second");
     assert_eq!(
         first_evidence.attempts[0].admission_wait,
         Some(Duration::ZERO)

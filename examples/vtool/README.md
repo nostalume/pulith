@@ -9,7 +9,7 @@ For the current operating system, `vtool` selects one atomic source-and-digest d
 TOML manifest. It can:
 
 1. plan the resolved source and destination;
-2. acquire a local file/directory or an HTTP artifact;
+2. acquire a local file or an HTTP artifact;
 3. verify the declared BLAKE3 or SHA-256 digest;
 4. prepare supported archives or copy unarchived material into private staging;
 5. publish `<root>/artifacts/<name>/<version>`;
@@ -75,17 +75,26 @@ vtool deactivate --root <absolute-root> <manifest>
 ```
 
 `plan` is read-only. `install` publishes a version but does not change the active view. `activate`
-links the declared view, and `deactivate` removes it. `repair` repeatedly inspects, reconciles, and
-performs only the required install or activation behavior up to the declared attempt bound.
+links the declared view, and `deactivate` removes it. `repair` reports one result for the
+requested version. An uninstalled or deactivated version is left alone. An active installation
+with a plain file is checked against its digest. For an existing archive directory, repair
+checks the directory and the declared view, and reports that its contents are unchecked.
+If it republishes a missing archive, it reports verification of the archive input.
+
+Repair can restore a missing installation or fix the declared view. A conflicting local
+artifact or view is preserved and stops repair. Failed attempts appear on
+stderr. Repair exits 1 if it stops with a conflict or uses up its attempts. If publication
+completed before a later failure, the result also reports that effect. An uninstalled version
+does not create a state directory. The other results exit 0.
 
 ## Pulith features and APIs
 
 | Feature | APIs exercised | Purpose |
 | --- | --- | --- |
-| `local` | `LocalSource`, `LocalTarget`, `StagedTree`, `RecordStore`, `Link`, `Unlink`, `Inspect`, `Reconcile` | local custody, publication, views, observations, and state |
-| `http-ureq` | `RemoteUrl`, `RemoteSource`, `Acquire` | synchronous staged HTTP acquisition |
-| `zip`, `tar` | `prepare_zip`, `prepare_tar`, `ArchivePolicy` | manifest-declared archive preparation |
-| `blake3`, `sha2` | `DigestValue`, `Verify` | explicit artifact identity |
+| `local` | `LocalPath`, `OpenedFile`, `StagedTree`, `RecordStore`, `inspect_view`, `link_view`, `unlink_view` | local custody, publication, views, observations, and state |
+| `http-ureq` | `RemoteUrl`, `UreqResources::download` | synchronous staged HTTP acquisition |
+| `zip`, `tar` | `extract_zip`, `extract_tar`, `ArchivePolicy` | manifest-declared archive preparation |
+| `blake3`, `sha2` | `DigestValue`, `snapshot_verified`, `verify_digest` | explicit artifact identity |
 | `serde` | digest and manifest deserialization | strict TOML declarations |
 
 ## Guarantees and non-goals

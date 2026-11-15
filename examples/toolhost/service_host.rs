@@ -121,7 +121,7 @@ impl Host {
         ))?
         .with_arguments(args.into_iter().map(OsString::from));
         let mut session = text(process.start_in_environment(text(EnvVars::new(environment))?))?;
-        match text(session.observe())? {
+        match text(session.poll_exit())? {
             ProcessObservation::Exited(status) => return Ok(exit_code(status.code())),
             ProcessObservation::Running => control.ready()?,
         }
@@ -132,7 +132,7 @@ impl Host {
                     .map(|_| ExitCode::SUCCESS)
                     .map_err(|error| error.to_string());
             }
-            match text(session.observe())? {
+            match text(session.poll_exit())? {
                 ProcessObservation::Running => std::thread::sleep(Duration::from_millis(50)),
                 ProcessObservation::Exited(status) => return Ok(exit_code(status.code())),
             }

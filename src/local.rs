@@ -1,4 +1,4 @@
-//! Local adapter facade: acquire, stage, publish, link, inspect, record, and reconcile.
+//! Local entry inspection, staging, publication, views, and records.
 //!
 //! This module owns the local filesystem semantics: entry-kind classification without following
 //! links, private staged-tree custody, single-target publication, and explicit consumer views. It
@@ -7,24 +7,53 @@
 //! this facade re-exports their public vocabulary. The whole module is
 //! feature-gated on `local`.
 use std::fmt;
-use std::fs;
-#[cfg(any(feature = "blake3", feature = "sha2"))]
-use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
-
-use crate::{Acquire, Inspect, Reconcile};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 
 mod apply;
 mod materialize;
+#[cfg(all(windows, feature = "windows-private-preview"))]
+mod private_windows;
 mod record;
 mod view;
 
-pub use apply::{Admission, ApplyEvidence, Occupancy, RemoveEvidence};
-pub use record::{
-    RecordChange, RecordEdit, RecordError, RecordEvidence, RecordLimit, RecordObservation,
-    RecordStore,
+#[cfg(feature = "process")]
+pub(crate) use apply::copy_open_file;
+pub use apply::{
+    CommitOutcome, FileAdmission, FilePublication, RemoveEvidence, TreeAdmission, TreePublication,
 };
+pub use record::{RecordChange, RecordEdit, RecordError, RecordEvidence, RecordLimit, RecordStore};
+
+/// Read-only result of comparing a view with its declared directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ViewStatus {
+    /// The view resolves to the declared directory.
+    Matches,
+    /// The view entry is absent.
+    Missing,
+    /// The view entry is not a symlink.
+    Occupied(LocalObservation),
+    /// The symlink's referent is absent.
+    Dangling,
+    /// The symlink resolves to an existing entry other than the declared directory.
+    WrongTarget,
+}
+
+/// The entry at a view path and, for a symlink, its referent kind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ViewEntry {
+    /// The view path is absent.
+    Missing,
+    /// The view path contains a non-symlink entry.
+    Occupied(LocalObservation),
+    /// A symlink resolving to a directory.
+    DirectoryLink,
+    /// A symlink resolving to a non-directory.
+    OtherLink,
+    /// A symlink with an absent referent.
+    DanglingLink,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Whether linking created a new consumer view or replaced an existing valid view.
@@ -36,7 +65,7 @@ pub enum LinkChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Paths and outcome observed after linking a published tree into a consumer view.
+/// Paths and outcome of the native operation that changed the consumer view.
 pub struct LinkEvidence {
     /// The source value.
     pub source: PathBuf,
@@ -53,6 +82,13 @@ pub enum LinkError {
     BeforeLink {
         /// The view value.
         view: PathBuf,
+        /// The cause value.
+        cause: LocalError,
+    },
+    /// The link was committed, but its resulting relationship could not be confirmed.
+    AfterLink {
+        /// Evidence of the native link operation.
+        evidence: LinkEvidence,
         /// The cause value.
         cause: LocalError,
     },
@@ -73,7 +109,7 @@ pub enum LinkError {
         /// The view value.
         view: PathBuf,
         /// The observed value.
-        observed: LocalObservation,
+        observed: ViewEntry,
     },
     /// The capability unavailable outcome.
     CapabilityUnavailable {
@@ -88,6 +124,11 @@ impl fmt::Display for LinkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BeforeLink { cause, .. } => write!(formatter, "link failed: {cause}"),
+            Self::AfterLink { evidence, cause } => write!(
+                formatter,
+                "linked {} but could not confirm the result: {cause}",
+                evidence.view.display()
+            ),
             Self::InvalidExpose { expose } => write!(
                 formatter,
                 "expose path {} must be a relative, non-escaping subpath",
@@ -114,9 +155,9 @@ impl fmt::Display for LinkError {
 impl std::error::Error for LinkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::BeforeLink { cause, .. } | Self::CapabilityUnavailable { cause, .. } => {
-                Some(cause)
-            }
+            Self::BeforeLink { cause, .. }
+            | Self::AfterLink { cause, .. }
+            | Self::CapabilityUnavailable { cause, .. } => Some(cause),
             _ => None,
         }
     }
@@ -137,7 +178,7 @@ pub enum UnlinkError {
         /// The view value.
         view: PathBuf,
         /// The observed value.
-        observed: LocalObservation,
+        observed: ViewEntry,
     },
     /// The remove outcome.
     Remove {
@@ -200,7 +241,9 @@ pub enum LocalError {
     /// The missing source outcome.
     MissingSource(PathBuf),
     /// Immutable publication found an existing predecessor and did not commit the target.
-    AlreadyPublished(PathBuf),
+    TargetExists(PathBuf),
+    /// The required regular predecessor was absent or its bytes differed.
+    PredecessorChanged(PathBuf),
     /// Publication found an occupant it never replaces: a directory, symlink, reparse point, or
     /// other entry. The target was classified without following links and was left untouched.
     OccupiedTarget {
@@ -209,8 +252,24 @@ pub enum LocalError {
         /// The no-follow entry kind found at the path.
         kind: LocalEntryKind,
     },
+    /// A read requires a regular file and found another kind of entry.
+    NotRegularFile {
+        /// The path value.
+        path: PathBuf,
+        /// The observed entry kind.
+        kind: LocalEntryKind,
+    },
+    /// A descendant path crossed an entry that is not an ordinary directory.
+    NotRegularDirectory {
+        /// The first refused ancestor below the supplied directory.
+        path: PathBuf,
+        /// The observed entry kind.
+        kind: LocalEntryKind,
+    },
     /// The unsupported local entry outcome.
     UnsupportedLocalEntry(PathBuf),
+    /// The selected expose path escapes its tree.
+    InvalidExpose(PathBuf),
     /// The invalid stage path outcome.
     InvalidStagePath(PathBuf),
     /// The publish unavailable outcome.
@@ -220,12 +279,12 @@ pub enum LocalError {
         /// The source value.
         source: io::Error,
     },
+    /// The platform does not support owner-only publication.
+    PrivatePublicationUnavailable(PathBuf),
     /// The invalid preparation outcome.
     InvalidPreparation(String),
-    /// The source law: the empty path is not a valid source reference.
-    InvalidSource(PathBuf),
-    /// The target law: the empty path is not a valid target reference.
-    InvalidTarget(PathBuf),
+    /// An empty path or a path without a usable final component.
+    InvalidPath(PathBuf),
     /// The io outcome.
     Io {
         /// The action value.
@@ -251,14 +310,31 @@ impl fmt::Display for LocalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSource(path) => write!(f, "source does not exist: {}", path.display()),
-            Self::AlreadyPublished(path) => write!(
+            Self::TargetExists(path) => write!(
                 f,
                 "existing predecessor entry found; target was not committed: {}",
+                path.display()
+            ),
+            Self::PredecessorChanged(path) => write!(
+                f,
+                "{} changed after reading; review the current file and retry",
                 path.display()
             ),
             Self::OccupiedTarget { path, kind } => write!(
                 f,
                 "target is occupied by a {kind:?} entry, which publication never replaces: {}",
+                path.display()
+            ),
+            Self::NotRegularFile { path, kind } => {
+                write!(
+                    f,
+                    "cannot read {kind:?} as a regular file: {}",
+                    path.display()
+                )
+            }
+            Self::NotRegularDirectory { path, kind } => write!(
+                f,
+                "cannot traverse {kind:?} as an ordinary directory: {}",
                 path.display()
             ),
             Self::UnsupportedLocalEntry(path) => {
@@ -268,6 +344,7 @@ impl fmt::Display for LocalError {
                     path.display()
                 )
             }
+            Self::InvalidExpose(path) => write!(f, "invalid expose path: {}", path.display()),
             Self::InvalidStagePath(path) => {
                 write!(
                     f,
@@ -282,12 +359,16 @@ impl fmt::Display for LocalError {
                     path.display()
                 )
             }
-            Self::InvalidPreparation(message) => write!(f, "invalid preparation: {message}"),
-            Self::InvalidSource(path) => {
-                write!(f, "invalid source (empty path): {}", path.display())
+            Self::PrivatePublicationUnavailable(path) => {
+                write!(
+                    f,
+                    "owner-only publication is unavailable for {}",
+                    path.display()
+                )
             }
-            Self::InvalidTarget(path) => {
-                write!(f, "invalid target (empty path): {}", path.display())
+            Self::InvalidPreparation(message) => write!(f, "invalid preparation: {message}"),
+            Self::InvalidPath(path) => {
+                write!(f, "invalid local path: {}", path.display())
             }
             Self::Io {
                 action,
@@ -309,33 +390,33 @@ impl std::error::Error for LocalError {
     }
 }
 
-#[cfg(any(feature = "blake3", feature = "sha2"))]
-pub(crate) enum OpenedLocalArtifact {
-    Missing,
-    File(File),
-    Directory,
-    Symlink,
-    #[cfg(windows)]
-    Reparse,
-    Other,
+fn refuse_read(path: &Path, kind: LocalEntryKind) -> LocalError {
+    LocalError::NotRegularFile {
+        path: path.to_path_buf(),
+        kind,
+    }
 }
 
-#[cfg(all(unix, any(feature = "blake3", feature = "sha2")))]
-pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, LocalError> {
+#[cfg(unix)]
+fn open_regular_file(path: &Path) -> Result<Option<File>, LocalError> {
     use rustix::fs::{Mode, OFlags, open};
     use rustix::io::Errno;
 
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Ok(OpenedLocalArtifact::Symlink);
+            return Err(refuse_read(path, LocalEntryKind::Symlink));
         }
-        Ok(metadata) if metadata.is_dir() => return Ok(OpenedLocalArtifact::Directory),
-        Ok(metadata) if !metadata.is_file() => return Ok(OpenedLocalArtifact::Other),
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(refuse_read(path, LocalEntryKind::Directory));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(refuse_read(path, LocalEntryKind::Other));
+        }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(OpenedLocalArtifact::Missing);
+            return Ok(None);
         }
-        Err(error) => return Err(LocalError::io("inspect exact local artifact", path, error)),
+        Err(error) => return Err(LocalError::io("inspect local file", path, error)),
     }
     let descriptor = match open(
         path,
@@ -343,11 +424,11 @@ pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, Lo
         Mode::empty(),
     ) {
         Ok(descriptor) => descriptor,
-        Err(Errno::NOENT) => return Ok(OpenedLocalArtifact::Missing),
-        Err(Errno::LOOP) => return Ok(OpenedLocalArtifact::Symlink),
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP) => return Err(refuse_read(path, LocalEntryKind::Symlink)),
         Err(error) => {
             return Err(LocalError::io(
-                "open exact local artifact",
+                "open local file",
                 path,
                 io::Error::from(error),
             ));
@@ -356,29 +437,26 @@ pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, Lo
     let file = File::from(descriptor);
     let metadata = file
         .metadata()
-        .map_err(|error| LocalError::io("inspect exact local artifact", path, error))?;
+        .map_err(|error| LocalError::io("inspect local file", path, error))?;
     if metadata.is_file() {
-        Ok(OpenedLocalArtifact::File(file))
+        Ok(Some(file))
     } else if metadata.is_dir() {
-        Ok(OpenedLocalArtifact::Directory)
+        Err(refuse_read(path, LocalEntryKind::Directory))
     } else {
-        Ok(OpenedLocalArtifact::Other)
+        Err(refuse_read(path, LocalEntryKind::Other))
     }
 }
 
-#[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
-pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, LocalError> {
-    use std::mem::MaybeUninit;
+#[cfg(windows)]
+fn open_regular_file(path: &Path) -> Result<Option<File>, LocalError> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, SetLastError};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileType,
     };
-    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
 
     let file = match File::options()
         .read(true)
@@ -388,10 +466,45 @@ pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, Lo
     {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(OpenedLocalArtifact::Missing);
+            return Ok(None);
         }
-        Err(error) => return Err(LocalError::io("open exact local artifact", path, error)),
+        Err(error) => return Err(LocalError::io("open local file", path, error)),
     };
+    let information = windows_attribute_tag(&file)
+        .map_err(|error| LocalError::io("inspect opened file", path, error))?;
+    if information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(refuse_read(
+            path,
+            windows_reparse_kind(information.ReparseTag),
+        ));
+    }
+    if information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(refuse_read(path, LocalEntryKind::Directory));
+    }
+    // SAFETY: setting and reading the calling thread's last-error slot surrounds one file query.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    // SAFETY: `file` owns a valid handle for the duration of the query.
+    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
+    // SAFETY: GetLastError reads the calling thread's last-error slot.
+    let last_error = unsafe { GetLastError() };
+    if !classify_windows_file_type(file_type, last_error)
+        .map_err(|error| LocalError::io("inspect opened file", path, error))?
+    {
+        return Err(refuse_read(path, LocalEntryKind::Other));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn windows_attribute_tag(
+    file: &File,
+) -> io::Result<windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+
     let mut information = MaybeUninit::<FILE_ATTRIBUTE_TAG_INFO>::zeroed();
     // SAFETY: `file` owns a valid handle and `information` is correctly sized writable storage.
     let succeeded = unsafe {
@@ -403,39 +516,64 @@ pub(crate) fn open_local_artifact(path: &Path) -> Result<OpenedLocalArtifact, Lo
         )
     };
     if succeeded == 0 {
-        return Err(LocalError::io(
-            "inspect exact local artifact",
-            path,
-            io::Error::last_os_error(),
-        ));
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: GetFileInformationByHandleEx succeeded and initialized the structure.
-    let information = unsafe { information.assume_init() };
-    if information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return if information.ReparseTag == IO_REPARSE_TAG_SYMLINK {
-            Ok(OpenedLocalArtifact::Symlink)
-        } else {
-            Ok(OpenedLocalArtifact::Reparse)
-        };
-    }
-    if information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-        return Ok(OpenedLocalArtifact::Directory);
-    }
-    // SAFETY: setting and reading the calling thread's last-error slot surrounds one file query.
-    unsafe { SetLastError(ERROR_SUCCESS) };
-    // SAFETY: `file` owns a valid handle for the duration of the query.
-    let file_type = unsafe { GetFileType(file.as_raw_handle()) };
-    // SAFETY: GetLastError reads the calling thread's last-error slot.
-    let last_error = unsafe { GetLastError() };
-    if !classify_windows_file_type(file_type, last_error)
-        .map_err(|error| LocalError::io("inspect exact local artifact", path, error))?
-    {
-        return Ok(OpenedLocalArtifact::Other);
-    }
-    Ok(OpenedLocalArtifact::File(file))
+    Ok(unsafe { information.assume_init() })
 }
 
-#[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
+#[cfg(windows)]
+fn windows_reparse_kind(tag: u32) -> LocalEntryKind {
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
+
+    if tag == IO_REPARSE_TAG_SYMLINK {
+        LocalEntryKind::Symlink
+    } else {
+        LocalEntryKind::Reparse
+    }
+}
+
+pub(super) fn entry_kind(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<LocalEntryKind, LocalError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let file = File::options()
+                .access_mode(0)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .map_err(|error| LocalError::io("open entry metadata", path, error))?;
+            let information = windows_attribute_tag(&file)
+                .map_err(|error| LocalError::io("inspect entry metadata", path, error))?;
+            // An ordinary entry may have replaced the reparse point during lookup. Refuse
+            // the original observation conservatively instead of using its stale metadata.
+            return Ok(windows_reparse_kind(information.ReparseTag));
+        }
+    }
+    #[cfg(unix)]
+    let _ = path;
+    let kind = metadata.file_type();
+    Ok(if kind.is_symlink() {
+        LocalEntryKind::Symlink
+    } else if kind.is_dir() {
+        LocalEntryKind::Directory
+    } else if kind.is_file() {
+        LocalEntryKind::File
+    } else {
+        LocalEntryKind::Other
+    })
+}
+
+#[cfg(windows)]
 fn classify_windows_file_type(file_type: u32, last_error: u32) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_UNKNOWN};
@@ -447,89 +585,121 @@ fn classify_windows_file_type(file_type: u32, last_error: u32) -> io::Result<boo
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Filesystem identity observed during local acquisition.
-pub struct LocalAcquireEvidence {
-    /// The path value.
-    pub path: PathBuf,
-}
-
-/// A local acquisition source: a non-empty filesystem reference (restricted law newtype —
-/// carries the acquire behavior; the pure-data law is enforced here, I/O laws stay in acquire).
-pub struct LocalSource(PathBuf);
-
-impl LocalSource {
-    /// Admit one non-empty local path. Relative/absolute and `..` are allowed (an input
-    /// reference — the caller's own filesystem); only the empty path is refused.
-    pub fn new(path: impl Into<PathBuf>) -> Result<Self, LocalError> {
-        let path = path.into();
-        if path.as_os_str().is_empty() {
-            return Err(LocalError::InvalidSource(path));
-        }
-        Ok(Self(path))
-    }
-
-    /// Returns the admitted source path.
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Acquire for LocalSource {
-    type Error = LocalError;
-    type Output = LocalMaterial;
-
-    fn acquire(self) -> Result<Self::Output, Self::Error> {
-        let path = self.0;
-        if !path.exists() {
-            return Err(LocalError::MissingSource(path));
-        }
-        Ok(if path.is_dir() {
-            LocalMaterial::Directory { path }
-        } else {
-            LocalMaterial::File { path }
-        })
-    }
-}
-
-/// A local target path for observation, activation, or removal (restricted law newtype —
-/// non-empty; I/O laws stay in each behavior). This is a plain path value: it carries no custody,
-/// handle, or generation token, so cloning it does not duplicate an authority.
+/// A non-empty local path. Filesystem operations validate whichever role it plays.
 #[derive(Clone)]
-pub struct LocalTarget(PathBuf);
+pub struct LocalPath(PathBuf);
 
-impl LocalTarget {
-    /// Admits a non-empty local target path.
+impl LocalPath {
+    /// Admits a non-empty local path without embedded NUL bytes.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, LocalError> {
         let path = path.into();
-        if path.as_os_str().is_empty() {
-            return Err(LocalError::InvalidTarget(path));
+        if path.as_os_str().is_empty() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(LocalError::InvalidPath(path));
         }
         Ok(Self(path))
     }
 
-    /// Returns the admitted target path.
+    /// Returns the admitted path.
     pub fn as_path(&self) -> &Path {
         &self.0
     }
 
-    /// Classifies what currently occupies this target, without following links.
+    /// Opens a regular file for reading without following the final path component.
     ///
-    /// Only absence and a regular file are publishable. A directory, symlink, reparse point, or
-    /// other entry is refused with [`LocalError::OccupiedTarget`]; the target is neither followed
-    /// nor modified. This classification is read-only and advisory: `StagedTree::commit`
-    /// re-classifies at commit time and never trusts a caller-held observation.
-    pub fn occupancy(&self) -> Result<Occupancy, LocalError> {
-        apply::occupancy(self.as_path())
+    /// A missing entry returns `None`. Non-regular entries are refused by kind. Read bytes and
+    /// metadata through the handle so a later path replacement cannot redirect either.
+    /// An open handle still observes changes made to its file in place.
+    pub fn open_file(self) -> Result<Option<OpenedFile>, LocalError> {
+        Ok(open_regular_file(&self.0)?.map(|file| OpenedFile { file, path: self.0 }))
     }
 
-    /// Observes this target without changing it.
+    /// Inspects the final entry without following a symlink or reparse point.
+    pub fn inspect_entry(&self) -> Result<LocalObservation, LocalError> {
+        inspect_entry(self.as_path())
+    }
+
+    /// Inspects a relative descendant without following links below this directory.
     ///
-    /// This is the no-argument convenience entry for `Inspect<()> for LocalTarget`: it delegates
-    /// to that implementation and produces exactly the same observation and evidence. The trait
-    /// remains the observation law carrier.
-    pub fn observe(self) -> Result<(LocalObservation, LocalInspectEvidence), LocalError> {
-        self.inspect(())
+    /// A missing component yields `Missing`. Other ancestors must be ordinary directories.
+    /// The final entry is classified even when it is a link. The caller supplies the base
+    /// directory. This path-based observation assumes its namespace stays stable through use.
+    pub fn inspect_descendant(&self, relative: &Path) -> Result<LocalObservation, LocalError> {
+        let mut components = relative.components().peekable();
+        if components.peek().is_none() || !relative.components().all(descendant_component) {
+            return Err(LocalError::InvalidPath(relative.to_path_buf()));
+        }
+
+        let mut path = self.0.clone();
+        while let Some(part) = components.next() {
+            path.push(part.as_os_str());
+            let observed = inspect_entry(&path)?;
+            if components.peek().is_none() || observed == LocalObservation::Missing {
+                return Ok(observed);
+            }
+            if observed != LocalObservation::Directory {
+                return Err(LocalError::NotRegularDirectory {
+                    path,
+                    kind: observed.kind(),
+                });
+            }
+        }
+        unreachable!("a descendant has at least one component")
+    }
+
+    /// Resolves a directory path for placement, following directory links.
+    ///
+    /// Missing suffixes are kept beneath the nearest existing directory. An existing
+    /// dangling link is an error. The result observes the current namespace for planning.
+    pub fn resolve_directory(&self) -> Result<PathBuf, LocalError> {
+        let mut path = self.as_path();
+        let mut missing = Vec::new();
+        let mut resolved = loop {
+            match fs::canonicalize(path) {
+                Ok(resolved) => match inspect_entry(&resolved)? {
+                    LocalObservation::Directory => break resolved,
+                    observed => {
+                        return Err(LocalError::NotRegularDirectory {
+                            path: path.to_path_buf(),
+                            kind: observed.kind(),
+                        });
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if inspect_entry(path)? != LocalObservation::Missing {
+                        return Err(LocalError::io("resolve directory link", path, error));
+                    }
+                    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                        return Err(LocalError::io("resolve directory", path, error));
+                    };
+                    missing.push(name);
+                    path = if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    };
+                }
+                Err(error) => return Err(LocalError::io("resolve directory", path, error)),
+            }
+        };
+        resolved.extend(missing.into_iter().rev());
+        Ok(resolved)
+    }
+
+    /// Observes a file position by resolving its parent and retaining the final name.
+    ///
+    /// Missing parents are retained by the same rule as [Self::resolve_directory].
+    /// The final entry is not opened or followed.
+    pub fn resolve_file_position(&self) -> Result<PathBuf, LocalError> {
+        let path = self.as_path();
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(LocalError::InvalidPath(path.to_path_buf()));
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        Ok(Self::new(parent)?.resolve_directory()?.join(name))
     }
 
     /// Creates eager private custody beside this target without publishing it.
@@ -540,75 +710,180 @@ impl LocalTarget {
         apply::stage(self.as_path())
     }
 
-    /// Writes these bytes to this target with one rename, without a staged tree.
+    /// Atomically publishes one file and reports which commit branch succeeded.
     ///
-    /// The commit boundary is [`StagedTree::commit`]'s: the predecessor or the new bytes are
-    /// visible, never a half-written file. The difference is custody size — one temporary file
-    /// beside the target instead of a workspace directory holding a `tree/` directory — for
-    /// callers whose unit of decision is a file rather than a tree.
-    ///
-    /// Effect law: ancestor directories are created on demand, exactly as [`Self::stage`] does.
-    /// A refusal leaves the target untouched, and the temporary file is removed.
-    pub fn write_atomic(
+    /// Stages the bytes beside the target and rechecks admission before the native operation.
+    /// Digest admission observes the predecessor before rename. Both replacement branches
+    /// assume the namespace stays stable between those operations.
+    pub fn publish_file(
         &self,
         bytes: impl AsRef<[u8]>,
-        admission: Admission,
-    ) -> Result<ApplyEvidence, LocalError> {
-        apply::write_atomic(self.as_path(), bytes.as_ref(), admission)
+        admission: impl Into<FileAdmission>,
+    ) -> Result<FilePublication, LocalError> {
+        apply::publish_file(self.as_path(), bytes.as_ref(), admission.into())
     }
-}
 
-/// Local material with explicit caller-owned or adapter-owned custody.
-///
-/// `File` and `Directory` paths survive drop. `StagedFile` owns its temporary path and removes it
-/// when the material or any canonical state carrying it is dropped.
-#[derive(Debug)]
-pub enum LocalMaterial {
-    /// A caller-owned regular-file path. Dropping the value does not remove the file.
-    /// The file outcome.
-    File {
-        /// Caller-owned path to the regular file.
-        path: PathBuf,
-    },
-    /// A caller-owned directory path. Dropping the value does not remove the tree.
-    /// The directory outcome.
-    Directory {
-        /// Caller-owned path to the directory.
-        path: PathBuf,
-    },
-    /// An adapter-owned temporary file. Dropping the value removes the stage.
-    /// The staged file outcome.
-    StagedFile {
-        /// Adapter-owned temporary file custody.
-        path: tempfile::TempPath,
-    },
-}
-
-impl PartialEq for LocalMaterial {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::File { path: left }, Self::File { path: right })
-                | (Self::Directory { path: left }, Self::Directory { path: right })
-                if left == right
-        ) || matches!(
-            (self, other),
-            (Self::StagedFile { path: left }, Self::StagedFile { path: right })
-                if <tempfile::TempPath as AsRef<Path>>::as_ref(left)
-                    == <tempfile::TempPath as AsRef<Path>>::as_ref(right)
-        )
-    }
-}
-
-impl Eq for LocalMaterial {}
-
-impl LocalMaterial {
-    /// Returns the material path without changing its caller-owned or staged custody.
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::File { path } | Self::Directory { path } => path,
-            Self::StagedFile { path } => path.as_ref(),
+    /// Checks known private publication constraints without creating a file or directory.
+    ///
+    /// The publisher verifies protection on the actual staging handle before writing.
+    pub fn check_private_publication(&self) -> Result<(), LocalError> {
+        #[cfg(unix)]
+        {
+            Ok(())
         }
+        #[cfg(all(windows, feature = "windows-private-preview"))]
+        {
+            private_windows::check_destination(self.as_path())
+        }
+        #[cfg(all(windows, not(feature = "windows-private-preview")))]
+        {
+            Err(LocalError::PrivatePublicationUnavailable(self.0.clone()))
+        }
+    }
+
+    /// Publishes an owner-only file, verifying protection before writing and syncing the
+    /// staged file before publication. The supplied admission still governs the destination.
+    /// Windows requires the `windows-private-preview` feature and a local NTFS volume.
+    pub fn publish_private_file(
+        &self,
+        bytes: &[u8],
+        admission: impl Into<FileAdmission>,
+    ) -> Result<FilePublication, LocalError> {
+        #[cfg(any(unix, all(windows, feature = "windows-private-preview")))]
+        {
+            self.check_private_publication()?;
+            apply::publish_private_file(self.as_path(), bytes, admission.into())
+        }
+        #[cfg(all(windows, not(feature = "windows-private-preview")))]
+        {
+            let _ = (bytes, admission);
+            Err(LocalError::PrivatePublicationUnavailable(self.0.clone()))
+        }
+    }
+}
+
+fn descendant_component(part: Component<'_>) -> bool {
+    let Component::Normal(name) = part else {
+        return false;
+    };
+    let bytes = name.as_encoded_bytes();
+    if bytes.contains(&0) {
+        return false;
+    }
+    #[cfg(windows)]
+    if bytes.contains(&b':') || matches!(bytes.last(), Some(b'.' | b' ')) {
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "embedded NUL in path",
+        ));
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // Match Win32 normal path handling for short absolute paths. Longer or relative paths need
+    // absolute normalization before adding a verbatim prefix.
+    if !path.is_absolute() || wide.len() >= 248 {
+        let absolute = std::path::absolute(path)?;
+        let units = absolute.as_os_str().encode_wide();
+        let prefix = match absolute.components().next() {
+            Some(Component::Prefix(prefix)) => Some(prefix.kind()),
+            _ => None,
+        };
+        wide = match prefix {
+            Some(std::path::Prefix::Disk(_)) => r"\\?\".encode_utf16().chain(units).collect(),
+            Some(std::path::Prefix::UNC(..)) => {
+                r"\\?\UNC\".encode_utf16().chain(units.skip(2)).collect()
+            }
+            _ => units.collect(),
+        };
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+/// A read-only regular-file handle bound to the object opened at this path.
+#[derive(Debug)]
+pub struct OpenedFile {
+    pub(crate) file: File,
+    pub(crate) path: PathBuf,
+}
+
+impl OpenedFile {
+    /// Returns the path used to open this handle.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Checks owner-only protection on this opened file.
+    pub fn is_owner_only(&self) -> Result<bool, LocalError> {
+        #[cfg(unix)]
+        {
+            private_file_mode(&self.file)
+                .map_err(|error| LocalError::io("inspect file protection", &self.path, error))
+        }
+        #[cfg(all(windows, feature = "windows-private-preview"))]
+        {
+            private_windows::is_owner_only(&self.file).map_err(|error| {
+                private_windows::protection_error("inspect file protection", &self.path, error)
+            })
+        }
+        #[cfg(all(windows, not(feature = "windows-private-preview")))]
+        {
+            Err(LocalError::PrivatePublicationUnavailable(self.path.clone()))
+        }
+    }
+
+    /// Reads metadata through the same handle as the file content.
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+}
+
+#[cfg(unix)]
+fn private_file_mode(file: &File) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    Ok(file.metadata()?.permissions().mode() & 0o7777 == 0o600)
+}
+
+impl Read for OpenedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for OpenedFile {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+/// An owned, unnamed byte file with read and seek access.
+///
+/// Dropping it releases the bytes. Its writable handle stays inside the adapter.
+#[derive(Debug)]
+pub struct FileSnapshot {
+    pub(crate) file: File,
+    pub(crate) source: PathBuf,
+}
+
+impl Read for FileSnapshot {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for FileSnapshot {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
     }
 }
 
@@ -675,30 +950,55 @@ pub enum LocalEntryKind {
     Other,
 }
 
-/// No-follow local artifact facts with an optional regular-file attestation.
-///
-/// The exact-inspection behavior supplies `T` only after it has admitted and read a regular file.
+impl LocalEntryKind {
+    /// Classifies a directory entry without opening its referent.
+    pub fn from_dir_entry(entry: &fs::DirEntry) -> io::Result<Self> {
+        let kind = entry.file_type()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+            if entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                && !kind.is_symlink()
+            {
+                return Ok(Self::Reparse);
+            }
+        }
+        Ok(if kind.is_symlink() {
+            Self::Symlink
+        } else if kind.is_dir() {
+            Self::Directory
+        } else if kind.is_file() {
+            Self::File
+        } else {
+            Self::Other
+        })
+    }
+}
+
+/// Read-only facts about a final filesystem entry, without following it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LocalArtifactObservation<T> {
+pub enum LocalObservation {
     /// The missing outcome.
     Missing,
     /// The file outcome.
     File {
-        /// Exact attestation produced while reading the regular file.
-        attestation: T,
+        /// Observed file length in bytes.
+        bytes: u64,
     },
     /// The directory outcome.
     Directory,
     /// The symlink outcome.
     Symlink,
-    /// The reparse outcome.
+    /// A non-symlink reparse point.
     Reparse,
     /// The other outcome.
     Other,
 }
 
-impl<T> LocalArtifactObservation<T> {
-    /// Returns the no-follow entry kind represented by this exact observation.
+impl LocalObservation {
+    /// Returns the entry kind represented by this observation.
     pub fn kind(&self) -> LocalEntryKind {
         match self {
             Self::Missing => LocalEntryKind::Missing,
@@ -711,52 +1011,7 @@ impl<T> LocalArtifactObservation<T> {
     }
 }
 
-/// Read-only facts observed for one [`PathBuf`].
-///
-/// A symlink is classified by its resolved target: `SymlinkToDirectory` when the link's
-/// (possibly relative) target resolves to a directory, `SymlinkToFile` when it resolves to a
-/// file or is missing/unreadable (not a directory). This is the single home of the
-/// link-target classification — callers never read links themselves.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LocalObservation {
-    /// The missing outcome.
-    Missing,
-    /// The file outcome.
-    File {
-        /// Observed file length in bytes.
-        bytes: u64,
-    },
-    /// The directory outcome.
-    Directory,
-    /// The symlink to directory outcome.
-    SymlinkToDirectory,
-    /// The symlink to file outcome.
-    SymlinkToFile,
-    /// The other outcome.
-    Other,
-}
-
-/// The observation law's receipt: the observed path.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalInspectEvidence {
-    /// The path value.
-    pub path: PathBuf,
-}
-
-impl LocalObservation {
-    /// Returns the entry kind represented by this observation.
-    pub fn kind(&self) -> LocalEntryKind {
-        match self {
-            Self::Missing => LocalEntryKind::Missing,
-            Self::File { .. } => LocalEntryKind::File,
-            Self::Directory => LocalEntryKind::Directory,
-            Self::SymlinkToDirectory | Self::SymlinkToFile => LocalEntryKind::Symlink,
-            Self::Other => LocalEntryKind::Other,
-        }
-    }
-}
-
-/// Caller-owned expected state compared by the [`Reconcile`] trait.
+/// Caller-owned expectation for an entry comparison.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalExpectation {
     /// The missing outcome.
@@ -811,81 +1066,27 @@ pub enum LocalReconciliation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Expected and observed values used for one pure local reconciliation.
-pub struct LocalReconcileEvidence {
-    /// The expected value.
-    pub expected: LocalExpectation,
-    /// The observed value.
-    pub observed: LocalObservation,
-}
-
-/// The observation law: classify one path (the single home of the classification).
-///
-/// A symlink is classified by its resolved target (`SymlinkToDirectory`/`SymlinkToFile`); a
-/// missing path is `Missing`. `Inspect` builds its receipt node from this, so the observation
-/// is never produced by discarding a node's field.
-pub(crate) fn observe_path(path: &Path) -> Result<LocalObservation, LocalError> {
+fn inspect_entry(path: &Path) -> Result<LocalObservation, LocalError> {
     Ok(match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                classify_symlink(path)
-            } else if file_type.is_file() {
-                LocalObservation::File {
-                    bytes: metadata.len(),
-                }
-            } else if file_type.is_dir() {
-                LocalObservation::Directory
-            } else {
-                LocalObservation::Other
-            }
-        }
+        Ok(metadata) => match entry_kind(path, &metadata)? {
+            LocalEntryKind::Missing => unreachable!("metadata returned for an existing entry"),
+            LocalEntryKind::File => LocalObservation::File {
+                bytes: metadata.len(),
+            },
+            LocalEntryKind::Directory => LocalObservation::Directory,
+            LocalEntryKind::Symlink => LocalObservation::Symlink,
+            LocalEntryKind::Reparse => LocalObservation::Reparse,
+            LocalEntryKind::Other => LocalObservation::Other,
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => LocalObservation::Missing,
         Err(error) => return Err(LocalError::io("inspect local target", path, error)),
     })
 }
 
-impl Inspect<()> for LocalTarget {
-    type Error = LocalError;
-    type Output = (LocalObservation, LocalInspectEvidence);
-
-    fn inspect(self, (): ()) -> Result<Self::Output, Self::Error> {
-        let path = self.0;
-        let observation = observe_path(&path)?;
-        Ok((observation, LocalInspectEvidence { path }))
-    }
-}
-
-/// Classify a symlink by its resolved target: `SymlinkToDirectory` when the (possibly relative)
-/// target resolves to a directory, `SymlinkToFile` otherwise (file target, dangling, or an
-/// unreadable link). This is the single home of the link-target classification; the no-follow
-/// metadata already confirmed the entry is a symlink.
-fn classify_symlink(path: &Path) -> LocalObservation {
-    match fs::read_link(path) {
-        Ok(target) => {
-            let resolved = if target.is_absolute() {
-                target
-            } else {
-                path.parent().unwrap_or_else(|| Path::new("")).join(&target)
-            };
-            match fs::metadata(&resolved) {
-                Ok(metadata) if metadata.is_dir() => LocalObservation::SymlinkToDirectory,
-                _ => LocalObservation::SymlinkToFile,
-            }
-        }
-        Err(_) => LocalObservation::SymlinkToFile,
-    }
-}
-
-/// Pure local expected/observed comparison; it never mutates the target. The observation is
-/// the impl caller: `LocalObservation::reconcile(expected)`.
-impl Reconcile<LocalExpectation> for LocalObservation {
-    type Error = std::convert::Infallible;
-    type Output = (LocalReconciliation, LocalReconcileEvidence);
-
-    fn reconcile(self, expected: LocalExpectation) -> Result<Self::Output, Self::Error> {
-        let reconciliation = match (&expected, &self) {
+impl LocalObservation {
+    /// Compares this observation with the caller's expectation.
+    pub fn compare(&self, expected: &LocalExpectation) -> LocalReconciliation {
+        match (expected, self) {
             (LocalExpectation::Missing, LocalObservation::Missing) => LocalReconciliation::Matches,
             (LocalExpectation::Missing, _) => LocalReconciliation::Unexpected,
             (_, LocalObservation::Missing) => LocalReconciliation::Missing,
@@ -902,14 +1103,7 @@ impl Reconcile<LocalExpectation> for LocalObservation {
                 expected: expected.kind(),
                 observed: self.kind(),
             },
-        };
-        Ok((
-            reconciliation,
-            LocalReconcileEvidence {
-                expected,
-                observed: self,
-            },
-        ))
+        }
     }
 }
 
@@ -923,7 +1117,6 @@ mod tests {
     use std::os::windows::fs::symlink_file;
 
     use super::*;
-    use crate::{Inspect, Reconcile};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -935,30 +1128,7 @@ mod tests {
         ))
     }
 
-    #[cfg(any(feature = "blake3", feature = "sha2"))]
-    #[test]
-    fn exact_local_handle_is_not_redirected_by_path_replacement() {
-        use std::io::Read;
-
-        let root = temp_root("exact-open-replacement");
-        let path = root.join("artifact");
-        let archived = root.join("opened-artifact");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&path, b"opened").unwrap();
-        let OpenedLocalArtifact::File(mut file) = open_local_artifact(&path).unwrap() else {
-            panic!("regular file was not opened as a file");
-        };
-
-        fs::rename(&path, &archived).unwrap();
-        fs::write(&path, b"replacement").unwrap();
-        let mut observed = Vec::new();
-        file.read_to_end(&mut observed).unwrap();
-
-        assert_eq!(observed, b"opened");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(all(windows, any(feature = "blake3", feature = "sha2")))]
+    #[cfg(windows)]
     #[test]
     fn windows_unknown_file_type_with_error_is_failure() {
         use windows_sys::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN;
@@ -976,23 +1146,22 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let (missing_observation, _) = LocalTarget::new(missing.as_path())
+        let missing_observation = LocalPath::new(missing.as_path())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
-        let (file_observation, file_evidence) = LocalTarget::new(file.as_path())
+        let file_observation = LocalPath::new(file.as_path())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
-        let (directory_observation, _) = LocalTarget::new(directory.as_path())
+        let directory_observation = LocalPath::new(directory.as_path())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
 
         assert_eq!(missing_observation, LocalObservation::Missing);
         assert_eq!(file_observation, LocalObservation::File { bytes: 6 });
         assert_eq!(directory_observation, LocalObservation::Directory);
-        assert_eq!(file_evidence, LocalInspectEvidence { path: file.clone() });
         assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
@@ -1005,12 +1174,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         symlink_file(root.join("missing-source"), &target).unwrap();
 
-        let (observation, _) = LocalTarget::new(target.clone())
+        let observation = LocalPath::new(target.clone())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
 
-        assert_eq!(observation, LocalObservation::SymlinkToFile);
+        assert_eq!(observation, LocalObservation::Symlink);
         assert!(
             fs::symlink_metadata(&target)
                 .unwrap()
@@ -1031,12 +1200,11 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let (matched, matched_reconcile_evidence, matched_inspect_evidence) =
-            reconcile(&file, LocalExpectation::FileSize(6));
-        let (missing, _, _) = reconcile(&missing, LocalExpectation::File);
-        let (unexpected, _, _) = reconcile(&file, LocalExpectation::Missing);
-        let (wrong_kind, _, _) = reconcile(&directory, LocalExpectation::File);
-        let (modified, _, _) = reconcile(&file, LocalExpectation::FileSize(7));
+        let matched = reconcile(&file, LocalExpectation::FileSize(6));
+        let missing = reconcile(&missing, LocalExpectation::File);
+        let unexpected = reconcile(&file, LocalExpectation::Missing);
+        let wrong_kind = reconcile(&directory, LocalExpectation::File);
+        let modified = reconcile(&file, LocalExpectation::FileSize(7));
 
         assert_eq!(matched, LocalReconciliation::Matches);
         assert_eq!(missing, LocalReconciliation::Missing);
@@ -1055,33 +1223,16 @@ mod tests {
                 observed_bytes: 6,
             }
         );
-        assert_eq!(
-            matched_inspect_evidence,
-            LocalInspectEvidence { path: file.clone() }
-        );
-        assert_eq!(
-            matched_reconcile_evidence.expected,
-            LocalExpectation::FileSize(6)
-        );
-        assert_eq!(
-            matched_reconcile_evidence.observed,
-            LocalObservation::File { bytes: 6 }
-        );
         assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn reconcile(
-        path: &std::path::Path,
-        expected: LocalExpectation,
-    ) -> (
-        LocalReconciliation,
-        LocalReconcileEvidence,
-        LocalInspectEvidence,
-    ) {
-        let (observation, inspect_evidence) = LocalTarget::new(path).unwrap().inspect(()).unwrap();
-        let (reconciliation, reconcile_evidence) = observation.reconcile(expected).unwrap();
-        (reconciliation, reconcile_evidence, inspect_evidence)
+    fn reconcile(path: &std::path::Path, expected: LocalExpectation) -> LocalReconciliation {
+        LocalPath::new(path)
+            .unwrap()
+            .inspect_entry()
+            .unwrap()
+            .compare(&expected)
     }
 }

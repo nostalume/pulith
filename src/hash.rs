@@ -1,19 +1,17 @@
-//! Typed digest verification and exact local artifact observation/reconciliation.
+//! Typed digest verification and exact byte descriptors.
 //!
 //! Owns artifact-identity semantics: a caller-supplied digest or exact descriptor (`blake3` or
 //! `sha2`) compared against observed bytes. Verification is factual and never applies, adopts, or
 //! authorizes; exact inspection/reconciliation is opt-in under `local + blake3`/`local + sha2`.
 //! No provenance or authenticity claim is made from a matching digest.
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-use crate::local::{LocalArtifactObservation, LocalMaterial, LocalTarget, OpenedLocalArtifact};
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-use crate::{Inspect, Reconcile, Verify};
+use crate::local::{FileSnapshot, OpenedFile};
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 use std::fs::File;
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 use std::io;
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 use std::path::{Path, PathBuf};
 
@@ -29,16 +27,7 @@ pub enum HashError {
         /// The observed value.
         observed: String,
     },
-    /// The artifact size mismatch outcome.
-    ArtifactSizeMismatch {
-        /// The expected value.
-        expected: u64,
-        /// The observed value.
-        observed: u64,
-    },
-    /// The unsupported digest material outcome.
-    UnsupportedDigestMaterial(PathBuf),
-    /// Local artifact inspection failed before hashing could begin.
+    /// A local operation required by a digest operation failed.
     LocalArtifact {
         /// The path value.
         path: PathBuf,
@@ -58,7 +47,14 @@ pub enum HashError {
 
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 impl HashError {
-    fn io(action: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
+    pub(crate) fn local_artifact(path: &Path, source: crate::local::LocalError) -> Self {
+        Self::LocalArtifact {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn io(action: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
         Self::Io {
             action,
             path: path.as_ref().to_path_buf(),
@@ -75,16 +71,9 @@ impl std::fmt::Display for HashError {
                 f,
                 "digest mismatch: expected {expected}, observed {observed}"
             ),
-            Self::ArtifactSizeMismatch { expected, observed } => write!(
-                f,
-                "artifact size mismatch: expected {expected}, observed {observed}"
-            ),
-            Self::UnsupportedDigestMaterial(path) => {
-                write!(f, "digest verification requires a file: {}", path.display())
-            }
             Self::LocalArtifact { path, source } => write!(
                 f,
-                "failed to inspect digest material {}: {source}",
+                "digest operation failed for {}: {source}",
                 path.display()
             ),
             Self::Io {
@@ -106,31 +95,6 @@ impl std::error::Error for HashError {
         }
     }
 }
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-/// Digest algorithm family: implementors attest digests the same way `Blake3`/`Sha256` do.
-///
-/// `DigestAlgorithm` is public vocabulary so callers can write one generic flow over the
-/// algorithm instead of duplicating it per hash. Implementors hash an already-opened regular
-/// file (`file`) whose path is `path` and return the hex digest string together with the byte
-/// count hashed.
-pub trait DigestAlgorithm {
-    /// Digests an already opened regular file and returns both digest and observed size.
-    fn digest_opened_file_with_size(
-        file: &mut File,
-        path: &Path,
-    ) -> Result<(String, u64), HashError>;
-}
-
-#[cfg(feature = "blake3")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// Compile-time selector for BLAKE3 digest computation.
-pub struct Blake3;
-
-#[cfg(feature = "sha2")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// Compile-time selector for SHA-256 digest computation.
-pub struct Sha256;
-
 /// The declared digest algorithm, as data.
 ///
 /// `DigestAlgorithmKind` is the canonical data representation of a digest algorithm: manifests
@@ -153,6 +117,17 @@ pub struct DigestValue {
 }
 
 impl DigestValue {
+    /// Describes the SHA-256 digest of bytes already held by the caller.
+    #[cfg(feature = "sha2")]
+    pub fn sha256(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+
+        Self {
+            algorithm: DigestAlgorithmKind::Sha256,
+            value: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
     /// Construct a digest value; the 64-hex law is enforced here.
     pub fn new(algorithm: DigestAlgorithmKind, value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
@@ -226,17 +201,6 @@ impl<'de> serde::Deserialize<'de> for DigestValue {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Expected and observed digest values from successful byte verification.
-pub struct DigestEvidence {
-    /// The algorithm value.
-    pub algorithm: DigestAlgorithmKind,
-    /// The expected value.
-    pub expected: DigestValue,
-    /// The observed value.
-    pub observed: DigestValue,
-}
-
 /// Source-independent identity for one exact raw artifact representation.
 ///
 /// The digest proves byte equality with the supplied expectation; it does not authenticate the
@@ -270,38 +234,12 @@ impl ArtifactDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Expected and observed size-plus-digest descriptors from exact verification.
-pub struct DescriptorEvidence {
-    /// The algorithm value.
-    pub algorithm: DigestAlgorithmKind,
-    /// The expected value.
-    pub expected: ArtifactDescriptor,
-    /// The observed value.
-    pub observed: ArtifactDescriptor,
-}
-
-/// Evidence emitted by exact local artifact inspection.
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactInspectEvidence {
-    /// The algorithm value.
-    pub algorithm: DigestAlgorithmKind,
-}
-
 /// Exact artifact classification against a caller-supplied descriptor.
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactReconciliation {
     /// The matches outcome.
     Matches,
-    /// The missing outcome.
-    Missing,
-    /// The wrong kind outcome.
-    WrongKind {
-        /// The observed value.
-        observed: crate::local::LocalEntryKind,
-    },
     /// The size mismatch outcome.
     SizeMismatch {
         /// The expected value.
@@ -318,192 +256,143 @@ pub enum ArtifactReconciliation {
     },
 }
 
-/// Evidence preserving the descriptor and observation used by exact reconciliation.
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactReconcileEvidence {
-    /// The expected value.
-    pub expected: ArtifactDescriptor,
-    /// The observed value.
-    pub observed: LocalArtifactObservation<ArtifactDescriptor>,
-}
-
-/// Exact, no-follow inspection selected by a caller-supplied digest algorithm.
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-impl Inspect<DigestAlgorithmKind> for LocalTarget {
-    type Error = HashError;
-    type Output = (
-        LocalArtifactObservation<ArtifactDescriptor>,
-        ArtifactInspectEvidence,
-    );
-
-    fn inspect(self, algorithm: DigestAlgorithmKind) -> Result<Self::Output, Self::Error> {
-        let path = self.as_path().to_path_buf();
-        let observation = match crate::local::open_local_artifact(&path).map_err(|source| {
-            HashError::LocalArtifact {
-                path: path.clone(),
-                source: Box::new(source),
-            }
-        })? {
-            OpenedLocalArtifact::Missing => LocalArtifactObservation::Missing,
-            OpenedLocalArtifact::Directory => LocalArtifactObservation::Directory,
-            OpenedLocalArtifact::Symlink => LocalArtifactObservation::Symlink,
-            #[cfg(windows)]
-            OpenedLocalArtifact::Reparse => LocalArtifactObservation::Reparse,
-            OpenedLocalArtifact::Other => LocalArtifactObservation::Other,
-            OpenedLocalArtifact::File(mut file) => {
-                let (digest, size) = digest_opened(algorithm, &mut file, &path)?;
-                let digest = DigestValue::new(algorithm, digest)
-                    .expect("digest implementations return 64 hexadecimal characters");
-                LocalArtifactObservation::File {
-                    attestation: ArtifactDescriptor::from_digest(digest, size),
-                }
-            }
-        };
-        Ok((observation, ArtifactInspectEvidence { algorithm }))
+impl OpenedFile {
+    /// Reads the complete file through this handle and describes the stream read.
+    pub fn digest(
+        mut self,
+        algorithm: DigestAlgorithmKind,
+    ) -> Result<ArtifactDescriptor, HashError> {
+        self.file
+            .rewind()
+            .map_err(|error| HashError::io("rewind opened file", &self.path, error))?;
+        describe(algorithm, &mut self.file, &self.path, |_| Ok(()))
     }
 }
 
-/// Pure exact-artifact reconciliation selected by an `ArtifactDescriptor` expectation.
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-impl Reconcile<ArtifactDescriptor> for LocalArtifactObservation<ArtifactDescriptor> {
-    type Error = std::convert::Infallible;
-    type Output = (ArtifactReconciliation, ArtifactReconcileEvidence);
-
-    fn reconcile(self, expected: ArtifactDescriptor) -> Result<Self::Output, Self::Error> {
-        let reconciliation = match &self {
-            LocalArtifactObservation::Missing => ArtifactReconciliation::Missing,
-            LocalArtifactObservation::File { attestation } if attestation.size != expected.size => {
-                ArtifactReconciliation::SizeMismatch {
-                    expected: expected.size,
-                    observed: attestation.size,
-                }
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+impl ArtifactDescriptor {
+    /// Compares the size and digest with a caller-supplied descriptor.
+    pub fn compare(&self, expected: &Self) -> ArtifactReconciliation {
+        if self.size != expected.size {
+            ArtifactReconciliation::SizeMismatch {
+                expected: expected.size,
+                observed: self.size,
             }
-            LocalArtifactObservation::File { attestation }
-                if attestation.digest.as_str() != expected.digest.as_str() =>
-            {
-                ArtifactReconciliation::DigestMismatch {
-                    expected: expected.digest.clone(),
-                    observed: attestation.digest.clone(),
-                }
+        } else if self.digest != expected.digest {
+            ArtifactReconciliation::DigestMismatch {
+                expected: expected.digest.clone(),
+                observed: self.digest.clone(),
             }
-            LocalArtifactObservation::File { .. } => ArtifactReconciliation::Matches,
-            observation => ArtifactReconciliation::WrongKind {
-                observed: observation.kind(),
-            },
-        };
-        Ok((
-            reconciliation,
-            ArtifactReconcileEvidence {
-                expected,
-                observed: self,
-            },
-        ))
+        } else {
+            ArtifactReconciliation::Matches
+        }
     }
 }
 
-/// Verify one local regular file against the declared digest. This is the private implementation
-/// of `LocalMaterial::verify`; the public behavior entry point is the trait implementation.
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-pub(crate) fn verify_path(
+pub(crate) fn copy_verified(
+    reader: &mut impl Read,
     path: &Path,
+    writer: &mut File,
+    destination: &Path,
     expected: &DigestValue,
-) -> Result<DigestEvidence, HashError> {
-    let mut file = open_regular_digest_file(path)?;
-    let algorithm = expected.algorithm();
-    let (observed_digest, _) = digest_opened(algorithm, &mut file, path)?;
-    let observed = DigestValue::new(algorithm, observed_digest).expect("observed digest is 64 hex");
-    if observed.as_str() != expected.as_str() {
-        return Err(HashError::DigestMismatch {
-            expected: expected.as_str().to_string(),
-            observed: observed.as_str().to_string(),
-        });
-    }
-    Ok(DigestEvidence {
-        algorithm,
-        expected: expected.clone(),
-        observed,
+) -> Result<ArtifactDescriptor, HashError> {
+    verify_stream(reader, path, expected, |bytes| {
+        writer
+            .write_all(bytes)
+            .map_err(|error| HashError::io("write verified stage", destination, error))
     })
 }
 
-/// Verify a local byte material against a caller-declared digest. Directory trees have no byte
-/// representation and are rejected; verification never prepares or publishes a target.
 #[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-impl Verify<DigestValue> for LocalMaterial {
-    type Error = HashError;
-    type Output = (LocalMaterial, DigestEvidence);
+fn verify_stream(
+    reader: &mut impl Read,
+    path: &Path,
+    expected: &DigestValue,
+    consume: impl FnMut(&[u8]) -> Result<(), HashError>,
+) -> Result<ArtifactDescriptor, HashError> {
+    let observed = describe(expected.algorithm(), reader, path, consume)?;
+    if &observed.digest != expected {
+        return Err(HashError::DigestMismatch {
+            expected: expected.as_str().to_string(),
+            observed: observed.digest.as_str().to_string(),
+        });
+    }
+    Ok(observed)
+}
 
-    fn verify(self, expected: DigestValue) -> Result<Self::Output, Self::Error> {
-        let path = match &self {
-            LocalMaterial::Directory { path } => {
-                return Err(HashError::UnsupportedDigestMaterial(path.clone()));
-            }
-            LocalMaterial::File { path } => path.clone(),
-            LocalMaterial::StagedFile { path } => path.to_path_buf(),
-        };
-        let evidence = verify_path(&path, &expected)?;
+#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
+fn describe(
+    algorithm: DigestAlgorithmKind,
+    reader: &mut impl Read,
+    path: &Path,
+    consume: impl FnMut(&[u8]) -> Result<(), HashError>,
+) -> Result<ArtifactDescriptor, HashError> {
+    let (digest, size) = digest_stream(algorithm, reader, path, consume)?;
+    let digest = DigestValue::new(algorithm, digest).expect("observed digest is 64 hex");
+    Ok(ArtifactDescriptor::from_digest(digest, size))
+}
+
+#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
+impl FileSnapshot {
+    /// Verifies the complete snapshot and returns it positioned for consumption.
+    pub fn verify_digest(
+        mut self,
+        expected: &DigestValue,
+    ) -> Result<(Self, ArtifactDescriptor), HashError> {
+        let rewind_error = |error| HashError::io("rewind file snapshot", &self.source, error);
+        self.file.rewind().map_err(rewind_error)?;
+        let evidence = verify_stream(&mut self.file, &self.source, expected, |_| Ok(()))?;
+        self.file.rewind().map_err(rewind_error)?;
         Ok((self, evidence))
     }
 }
 
 #[cfg(all(feature = "local", feature = "blake3"))]
-impl DigestAlgorithm for Blake3 {
-    fn digest_opened_file_with_size(
-        file: &mut File,
-        path: &Path,
-    ) -> Result<(String, u64), HashError> {
-        let mut hasher = blake3::Hasher::new();
-        let bytes = copy_into_hasher(path, file, |bytes| {
-            hasher.update(bytes);
-        })?;
-        Ok((hasher.finalize().to_hex().to_string(), bytes))
-    }
+fn digest_blake3(
+    reader: &mut impl Read,
+    path: &Path,
+    mut consume: impl FnMut(&[u8]) -> Result<(), HashError>,
+) -> Result<(String, u64), HashError> {
+    let mut hasher = blake3::Hasher::new();
+    let bytes = copy_into_hasher(path, reader, |bytes| {
+        consume(bytes)?;
+        hasher.update(bytes);
+        Ok(())
+    })?;
+    Ok((hasher.finalize().to_hex().to_string(), bytes))
 }
 
 #[cfg(all(feature = "local", feature = "sha2"))]
-impl DigestAlgorithm for Sha256 {
-    fn digest_opened_file_with_size(
-        file: &mut File,
-        path: &Path,
-    ) -> Result<(String, u64), HashError> {
-        use sha2::{Digest, Sha256 as Sha256Hasher};
-
-        let mut hasher = Sha256Hasher::new();
-        let bytes = copy_into_hasher(path, file, |bytes| {
-            hasher.update(bytes);
-        })?;
-        Ok((hex::encode(hasher.finalize()), bytes))
-    }
-}
-
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-fn open_regular_digest_file(path: &Path) -> Result<File, HashError> {
-    match crate::local::open_local_artifact(path).map_err(|source| HashError::LocalArtifact {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })? {
-        crate::local::OpenedLocalArtifact::File(file) => Ok(file),
-        crate::local::OpenedLocalArtifact::Missing => Err(HashError::io(
-            "open file for digest",
-            path,
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        )),
-        _ => Err(HashError::UnsupportedDigestMaterial(path.to_path_buf())),
-    }
-}
-
-/// One closed dispatch from the declared kind to the algorithm family (data-driven).
-#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
-fn digest_opened(
-    kind: DigestAlgorithmKind,
-    file: &mut File,
+fn digest_sha256(
+    reader: &mut impl Read,
     path: &Path,
+    mut consume: impl FnMut(&[u8]) -> Result<(), HashError>,
+) -> Result<(String, u64), HashError> {
+    use sha2::{Digest, Sha256 as Sha256Hasher};
+    let mut hasher = Sha256Hasher::new();
+    let bytes = copy_into_hasher(path, reader, |bytes| {
+        consume(bytes)?;
+        hasher.update(bytes);
+        Ok(())
+    })?;
+    Ok((hex::encode(hasher.finalize()), bytes))
+}
+
+/// One closed dispatch from the declared kind to the digest implementation.
+#[cfg(all(feature = "local", any(feature = "blake3", feature = "sha2")))]
+fn digest_stream(
+    kind: DigestAlgorithmKind,
+    reader: &mut impl Read,
+    path: &Path,
+    consume: impl FnMut(&[u8]) -> Result<(), HashError>,
 ) -> Result<(String, u64), HashError> {
     match kind {
         #[cfg(feature = "blake3")]
-        DigestAlgorithmKind::Blake3 => Blake3::digest_opened_file_with_size(file, path),
+        DigestAlgorithmKind::Blake3 => digest_blake3(reader, path, consume),
         #[cfg(feature = "sha2")]
-        DigestAlgorithmKind::Sha256 => Sha256::digest_opened_file_with_size(file, path),
+        DigestAlgorithmKind::Sha256 => digest_sha256(reader, path, consume),
         #[cfg(not(feature = "blake3"))]
         DigestAlgorithmKind::Blake3 => Err(HashError::io(
             "digest blake3 material",
@@ -531,7 +420,7 @@ fn normalize_hex(value: &str) -> String {
 fn copy_into_hasher(
     path: &Path,
     reader: &mut impl Read,
-    mut update: impl FnMut(&[u8]),
+    mut update: impl FnMut(&[u8]) -> Result<(), HashError>,
 ) -> Result<u64, HashError> {
     let mut buffer = [0; 16 * 1024];
     let mut observed = 0_u64;
@@ -539,7 +428,7 @@ fn copy_into_hasher(
         match reader.read(&mut buffer) {
             Ok(0) => return Ok(observed),
             Ok(n) => {
-                update(&buffer[..n]);
+                update(&buffer[..n])?;
                 observed = observed.saturating_add(n as u64);
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -554,9 +443,7 @@ fn copy_into_hasher(
 mod tests {
     use std::fs;
 
-    use super::*;
-    use crate::local::{LocalExpectation, LocalObservation, LocalReconciliation, LocalTarget};
-    use crate::{Inspect, Reconcile};
+    use crate::local::{LocalExpectation, LocalObservation, LocalPath, LocalReconciliation};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -568,79 +455,6 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "blake3")]
-    #[test]
-    fn blake3_verify_path_returns_digest_evidence() {
-        let root = temp_root("verify-blake3");
-        let source = root.join("source.txt");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&source, "pulith").unwrap();
-        let digest = blake3::hash(b"pulith").to_hex().to_string();
-        let expected = DigestValue::new(DigestAlgorithmKind::Blake3, digest.clone()).unwrap();
-
-        let evidence = verify_path(&source, &expected).unwrap();
-
-        assert_eq!(evidence.algorithm, DigestAlgorithmKind::Blake3);
-        assert_eq!(evidence.expected, expected);
-        assert_eq!(evidence.observed.as_str(), digest);
-        assert_eq!(fs::read_to_string(&source).unwrap(), "pulith");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "blake3")]
-    #[test]
-    fn blake3_verify_path_rejects_digest_mismatch() {
-        let root = temp_root("verify-blake3-mismatch");
-        let source = root.join("source.txt");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&source, "pulith").unwrap();
-        let expected = DigestValue::new(DigestAlgorithmKind::Blake3, "00".repeat(32)).unwrap();
-
-        let error = verify_path(&source, &expected).unwrap_err();
-
-        assert!(matches!(error, HashError::DigestMismatch { .. }));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "sha2")]
-    #[test]
-    fn sha256_verify_path_returns_digest_evidence() {
-        use sha2::Digest as _;
-
-        let root = temp_root("verify-sha256");
-        let source = root.join("source.txt");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&source, "pulith").unwrap();
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"pulith");
-        let digest = hex::encode(hasher.finalize());
-        let expected = DigestValue::new(DigestAlgorithmKind::Sha256, digest.clone()).unwrap();
-
-        let evidence = verify_path(&source, &expected).unwrap();
-
-        assert_eq!(evidence.algorithm, DigestAlgorithmKind::Sha256);
-        assert_eq!(evidence.expected, expected);
-        assert_eq!(evidence.observed.as_str(), digest);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(feature = "sha2")]
-    #[test]
-    fn sha256_verify_path_rejects_digest_mismatch() {
-        let root = temp_root("verify-sha256-mismatch");
-        let source = root.join("source.txt");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(&source, "pulith").unwrap();
-        let expected = DigestValue::new(DigestAlgorithmKind::Sha256, "00".repeat(32)).unwrap();
-
-        let error = verify_path(&source, &expected).unwrap_err();
-
-        assert!(matches!(error, HashError::DigestMismatch { .. }));
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn local_inspection_and_size_reconciliation_of_digest_material() {
         let root = temp_root("hash-local-observation");
@@ -648,22 +462,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&file, "pulith").unwrap();
 
-        let (observation, evidence) = LocalTarget::new(file.as_path())
+        let observation = LocalPath::new(file.as_path())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
         assert_eq!(observation, LocalObservation::File { bytes: 6 });
-        assert_eq!(evidence.path, file);
 
-        let (reconciliation, reconcile_evidence) = observation
-            .reconcile(LocalExpectation::FileSize(6))
-            .unwrap();
+        let reconciliation = observation.compare(&LocalExpectation::FileSize(6));
         assert_eq!(reconciliation, LocalReconciliation::Matches);
-        assert_eq!(reconcile_evidence.expected, LocalExpectation::FileSize(6));
-        assert_eq!(
-            reconcile_evidence.observed,
-            LocalObservation::File { bytes: 6 }
-        );
         assert_eq!(fs::read_to_string(&file).unwrap(), "pulith");
 
         fs::remove_dir_all(root).unwrap();
@@ -675,12 +481,11 @@ mod tests {
         let missing = root.join("missing.txt");
         fs::create_dir_all(&root).unwrap();
 
-        let (observation, evidence) = LocalTarget::new(missing.as_path())
+        let observation = LocalPath::new(missing.as_path())
             .unwrap()
-            .inspect(())
+            .inspect_entry()
             .unwrap();
         assert_eq!(observation, LocalObservation::Missing);
-        assert_eq!(evidence.path, missing);
         assert!(!missing.exists());
 
         fs::remove_dir_all(root).unwrap();

@@ -6,10 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pulith::local::{
-    LinkChange, LocalObservation, LocalSource, LocalTarget, UnlinkChange, UnlinkError,
-};
-use pulith::{Acquire, Link, Unlink};
+use pulith::local::{LinkChange, LocalObservation, LocalPath, UnlinkChange, UnlinkError};
 
 /// Publish one versioned tree at `root/artifacts/demo-tool/<version>` via the trait-only local
 /// chain (acquire -> prepare -> apply) and return the target path.
@@ -20,19 +17,22 @@ fn publish_tree(root: &Path, version: &'static str, contents: &'static [u8]) -> 
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(source.join("tool.txt"), contents).unwrap();
 
-    let material = LocalSource::new(source).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let tree = stage
+        .copy_tree(material, std::path::PathBuf::new())
+        .unwrap();
+    tree.publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     target
 }
 
 /// Link the published tree's root at `view` (occupied views auto-switch) and return the outcome.
 fn activate_root(target: &Path, view: &Path) -> LinkChange {
-    LocalTarget::new(target)
+    LocalPath::new(target)
         .unwrap()
-        .link_root(view)
+        .link_view(view, None)
         .unwrap()
         .change
 }
@@ -54,7 +54,7 @@ fn unlink_removes_only_the_active_view_and_preserves_the_tree() {
     let view = root.path().join("views/demo-tool");
     assert_eq!(activate_root(&target, &view), LinkChange::Created);
 
-    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    let evidence = LocalPath::new(&view).unwrap().unlink_view().unwrap();
 
     assert_eq!(evidence.view, view);
     assert_eq!(evidence.change, UnlinkChange::Removed);
@@ -72,7 +72,7 @@ fn unlink_on_missing_view_is_idempotent_with_missing_prior() {
     let root = tempfile::tempdir().unwrap();
     let view = root.path().join("views/never-activated");
 
-    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    let evidence = LocalPath::new(&view).unwrap().unlink_view().unwrap();
 
     assert_eq!(evidence.view, view);
     assert_eq!(evidence.change, UnlinkChange::Unchanged);
@@ -86,9 +86,9 @@ fn unlink_rejects_a_regular_file_view_without_removal() {
     fs::create_dir_all(view.parent().unwrap()).unwrap();
     fs::write(&view, b"not a view").unwrap();
 
-    let error = LocalTarget::new(&view)
+    let error = LocalPath::new(&view)
         .unwrap()
-        .unlink()
+        .unlink_view()
         .expect_err("a regular file is not an active view");
 
     match error {
@@ -97,7 +97,10 @@ fn unlink_rejects_a_regular_file_view_without_removal() {
             observed,
         } => {
             assert_eq!(seen, view);
-            assert_eq!(observed, LocalObservation::File { bytes: 10 });
+            assert_eq!(
+                observed,
+                pulith::local::ViewEntry::Occupied(LocalObservation::File { bytes: 10 })
+            );
         }
         other => panic!("expected UnlinkNotActiveView, got {other:?}"),
     }
@@ -111,15 +114,15 @@ fn unlink_rejects_directory_and_file_symlink_views_without_removal() {
     // A real directory at the view path is refused and left intact.
     let directory_view = root.path().join("views/plain-directory");
     fs::create_dir_all(&directory_view).unwrap();
-    let error = LocalTarget::new(&directory_view)
+    let error = LocalPath::new(&directory_view)
         .unwrap()
-        .unlink()
+        .unlink_view()
         .expect_err("a directory is not an active view");
     assert!(matches!(
         error,
         UnlinkError::NotActiveView {
             view: _,
-            observed: LocalObservation::Directory,
+            observed: pulith::local::ViewEntry::Occupied(LocalObservation::Directory),
         }
     ));
     assert!(directory_view.is_dir());
@@ -130,9 +133,9 @@ fn unlink_rejects_directory_and_file_symlink_views_without_removal() {
     let file_symlink_view = root.path().join("views/file-symlink");
     fs::create_dir_all(file_symlink_view.parent().unwrap()).unwrap();
     file_symlink(&file, &file_symlink_view);
-    let error = LocalTarget::new(&file_symlink_view)
+    let error = LocalPath::new(&file_symlink_view)
         .unwrap()
-        .unlink()
+        .unlink_view()
         .expect_err("a file symlink is not an active directory view");
     match error {
         UnlinkError::NotActiveView {
@@ -140,7 +143,7 @@ fn unlink_rejects_directory_and_file_symlink_views_without_removal() {
             observed,
         } => {
             assert_eq!(seen, file_symlink_view);
-            assert_eq!(observed, LocalObservation::SymlinkToFile);
+            assert_eq!(observed, pulith::local::ViewEntry::OtherLink);
         }
         other => panic!("expected UnlinkNotActiveView with the link-target kind, got {other:?}"),
     }
@@ -161,7 +164,7 @@ fn unlink_holds_the_view_state_cycle() {
 
     // link_root -> unlink -> link_root -> link_root (auto-switch) -> unlink
     assert_eq!(activate_root(&first_target, &view), LinkChange::Created);
-    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    let evidence = LocalPath::new(&view).unwrap().unlink_view().unwrap();
     assert_eq!(evidence.change, UnlinkChange::Removed);
     assert!(fs::symlink_metadata(&view).is_err());
 
@@ -174,7 +177,7 @@ fn unlink_holds_the_view_state_cycle() {
             .is_symlink()
     );
 
-    let evidence = LocalTarget::new(&view).unwrap().unlink().unwrap();
+    let evidence = LocalPath::new(&view).unwrap().unlink_view().unwrap();
     assert_eq!(evidence.change, UnlinkChange::Removed);
     assert_eq!(evidence.view, view);
     assert!(fs::symlink_metadata(&view).is_err());

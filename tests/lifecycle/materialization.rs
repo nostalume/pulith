@@ -6,31 +6,24 @@ use crate::common::HttpFixture;
 use std::io::Write;
 
 #[cfg(all(feature = "blake3", feature = "http-ureq"))]
-use pulith::Verify;
 use pulith::archive::ArchivePolicy;
 #[cfg(all(feature = "blake3", feature = "http-ureq"))]
 use pulith::hash::{DigestAlgorithmKind, DigestValue};
-use pulith::local::{LocalSource, LocalTarget};
-use pulith::{Acquire, Remove};
-#[cfg(all(feature = "blake3", feature = "http-ureq"))]
-use pulith::{Inspect, Reconcile};
-
+use pulith::local::LocalPath;
 #[cfg(feature = "http-ureq")]
 use pulith::local::{LocalExpectation, LocalReconciliation};
 #[cfg(feature = "http-ureq")]
-use pulith::net::{RemoteSource, RemoteUrl};
+use pulith::net::{RemoteSource, RemoteUrl, UreqResources};
 
 #[cfg(all(feature = "blake3", feature = "http-ureq"))]
 fn assert_applied_then_reconciled(target: &std::path::Path, body: &[u8]) {
     assert_eq!(std::fs::read(target).unwrap(), body);
 
-    let (observation, _) = LocalTarget::new(target.to_path_buf())
+    let observation = LocalPath::new(target.to_path_buf())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
-    let (reconciliation, _) = observation
-        .reconcile(LocalExpectation::FileSize(body.len() as u64))
-        .unwrap();
+    let reconciliation = observation.compare(&LocalExpectation::FileSize(body.len() as u64));
     assert_eq!(reconciliation, LocalReconciliation::Matches);
 }
 
@@ -42,10 +35,8 @@ fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("sync-artifact");
 
-    let (artifact, evidence) = RemoteSource::new(RemoteUrl::parse(&server.url).unwrap())
-        .prepare()
-        .unwrap()
-        .acquire()
+    let (artifact, evidence) = UreqResources::default()
+        .download(RemoteSource::new(RemoteUrl::parse(&server.url).unwrap()))
         .unwrap();
     server.join();
     assert_eq!(evidence.status, 200);
@@ -56,12 +47,13 @@ fn sync_http_acquire_verifies_prepares_and_applies_with_evidence() {
         blake3::hash(body).to_hex().to_string(),
     )
     .unwrap();
-    let (material, digest_evidence) = artifact.verify(expected.clone()).unwrap();
-    assert_eq!(digest_evidence.expected, expected);
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let (material, digest_evidence) = artifact.verify_digest(&expected).unwrap();
+    assert_eq!(digest_evidence.digest, expected);
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let tree = material.stage_into(stage).unwrap();
+    tree.publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     assert_applied_then_reconciled(&target, body);
 }
 
@@ -78,9 +70,9 @@ fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
     writer.write_all(b"zip payload").unwrap();
     writer.finish().unwrap();
 
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let evidence = pulith::archive::prepare_zip(
+    let evidence = pulith::archive::extract_zip(
         std::fs::File::open(&archive).unwrap(),
         stage.root(),
         ArchivePolicy::default(),
@@ -94,7 +86,9 @@ fn zip_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
         b"zip payload"
     );
 
-    stage.publish(admitted).unwrap();
+    stage
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     assert_eq!(
         std::fs::read(target.join("bin/tool.txt")).unwrap(),
         b"zip payload"
@@ -122,9 +116,9 @@ fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
         .unwrap();
     builder.finish().unwrap();
 
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let evidence = pulith::archive::prepare_tar(
+    let evidence = pulith::archive::extract_tar(
         std::fs::File::open(&archive).unwrap(),
         stage.root(),
         ArchivePolicy::default(),
@@ -138,7 +132,9 @@ fn tar_acquire_prepare_apply_keeps_scratch_and_final_authority_separate() {
         b"tar payload"
     );
 
-    stage.publish(admitted).unwrap();
+    stage
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     assert_eq!(
         std::fs::read(target.join("bin/tool.txt")).unwrap(),
         b"tar payload"
@@ -158,10 +154,10 @@ fn unsafe_archive_preparation_leaves_no_final_target_or_contaminated_workspace()
     writer.write_all(b"unsafe payload").unwrap();
     writer.finish().unwrap();
 
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
     assert!(
-        pulith::archive::prepare_zip(
+        pulith::archive::extract_zip(
             std::fs::File::open(&archive).unwrap(),
             stage.root(),
             ArchivePolicy::default()
@@ -179,7 +175,7 @@ fn forget_applies_directly_without_a_synthetic_predecessor() {
     let target = root.path().join("obsolete");
     std::fs::write(&target, b"obsolete").unwrap();
 
-    LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    LocalPath::new(target.clone()).unwrap().remove().unwrap();
 
     assert!(!target.exists());
 }
@@ -193,11 +189,20 @@ fn local_file_materialization_verification_and_reconciliation() {
     let target = root.path().join("local-artifact");
     std::fs::write(&source, body).unwrap();
 
-    let material = LocalSource::new(source).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
-    let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let expected = DigestValue::new(
+        DigestAlgorithmKind::Blake3,
+        blake3::hash(body).to_hex().to_string(),
+    )
+    .unwrap();
+    let input = LocalPath::new(source)
+        .unwrap()
+        .open_file()
+        .unwrap()
+        .unwrap();
+    let destination = LocalPath::new(&target).unwrap();
+    let (publication, observed) = destination.publish_verified_file(input, &expected).unwrap();
+    assert_eq!(publication.bytes, body.len() as u64);
+    assert_eq!(observed.digest, expected);
 
     assert_applied_then_reconciled(&target, body);
 }

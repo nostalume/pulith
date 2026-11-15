@@ -13,9 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pulith::Inspect;
-use pulith::net::RemoteUrl;
-use pulith::net::UreqResources;
+use pulith::net::{HttpInspectPolicy, RemoteSource, RemoteUrl, UreqResources};
 
 const PROXY_KEYS: [&str; 6] = [
     "HTTP_PROXY",
@@ -144,7 +142,10 @@ fn default_resources_ignore_ambient_proxy_environment() {
     let _origin = Responder::start(origin_listener, "200 OK");
     let url = RemoteUrl::parse(&format!("{origin_url}/artifact")).unwrap();
 
-    let (observation, _) = Inspect::inspect(url.clone(), ()).unwrap();
+    let direct = UreqResources::default();
+    let (observation, _) = direct
+        .inspect_headers(&url, HttpInspectPolicy::default())
+        .unwrap();
     assert_eq!(
         observation.status, 200,
         "default ureq resources followed the ambient proxy"
@@ -154,12 +155,16 @@ fn default_resources_ignore_ambient_proxy_environment() {
     let config = ureq::Agent::config_builder()
         .proxy(Some(ureq::Proxy::new(&hostile_url).unwrap()))
         .build();
-    let result = Inspect::inspect(
-        url.with_ureq(UreqResources::from_agent(config.new_agent())),
-        (),
-    );
+    let proxy = UreqResources::from_agent(config.new_agent());
+    let result = proxy.inspect_headers(&url, HttpInspectPolicy::default());
     assert!(
         !matches!(&result, Ok((observation, _)) if observation.status == 200),
         "an explicitly injected ureq proxy did not divert the request: {result:?}"
+    );
+    let error = proxy.download(RemoteSource::new(url.clone())).unwrap_err();
+    assert!(error.to_string().contains("502"), "{error}");
+    assert_eq!(
+        direct.download(RemoteSource::new(url)).unwrap().1.status,
+        200
     );
 }

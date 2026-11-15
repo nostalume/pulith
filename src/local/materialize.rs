@@ -1,24 +1,93 @@
-//! Local materialization: the material-kind law, from material to guarded custody.
-//!
-//! A byte material (`File`/`StagedFile`) or a directory tree is copied into private custody.
-//! Digest verification is a separate behavior owned by `crate::hash`; archive extraction is a
-//! separate behavior owned by `crate::archive`, which takes a decoder stream the caller supplies.
-//! Neither is guessed here: the caller composes the ordering and the encoding it needs.
+//! Byte snapshots and verified local publication.
 
+use std::io::{self, Seek};
 use std::path::PathBuf;
 
-use crate::local::{LocalError, LocalMaterial, LocalSource, StagedTree};
+use crate::local::{FileSnapshot, LocalError, StagedTree};
 
-impl LocalMaterial {
-    /// Copies this local material into caller-selected staged-tree custody.
-    pub fn prepare(self, stage: StagedTree) -> Result<StagedTree, LocalError> {
-        match self {
-            Self::Directory { path } => stage.copy_tree(LocalSource::new(path)?, PathBuf::new()),
-            Self::File { path } => stage.copy_file(LocalSource::new(path)?, PathBuf::new()),
-            Self::StagedFile { path } => {
-                stage.copy_file(LocalSource::new(path.to_path_buf())?, PathBuf::new())
-            }
-        }
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+use super::apply::{FileProtection, publish_single_file};
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+use crate::hash::{ArtifactDescriptor, DigestValue, HashError, copy_verified};
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+use crate::local::{FileAdmission, FilePublication, LocalPath, OpenedFile};
+
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+impl OpenedFile {
+    /// Captures and verifies the complete stream in one pass. The snapshot owns the verified bytes.
+    pub fn snapshot_verified(
+        mut self,
+        expected: &DigestValue,
+    ) -> Result<(FileSnapshot, ArtifactDescriptor), HashError> {
+        self.file
+            .rewind()
+            .map_err(|error| HashError::io("rewind opened file", &self.path, error))?;
+        let mut file = tempfile::tempfile()
+            .map_err(|error| HashError::io("create byte snapshot", &self.path, error))?;
+        let descriptor =
+            copy_verified(&mut self.file, &self.path, &mut file, &self.path, expected)?;
+        file.rewind()
+            .map_err(|error| HashError::io("rewind byte snapshot", &self.path, error))?;
+        Ok((
+            FileSnapshot {
+                file,
+                source: self.path,
+            },
+            descriptor,
+        ))
+    }
+}
+
+#[cfg(any(feature = "blake3", feature = "sha2"))]
+impl LocalPath {
+    /// Publishes at an absent target after verifying the complete stream read from the source handle.
+    ///
+    /// The file stage remains private through verification and is discarded on failure.
+    pub fn publish_verified_file(
+        &self,
+        mut source: OpenedFile,
+        expected: &DigestValue,
+    ) -> Result<(FilePublication, ArtifactDescriptor), HashError> {
+        source
+            .file
+            .rewind()
+            .map_err(|error| HashError::io("rewind opened file", &source.path, error))?;
+        publish_single_file(
+            self.as_path(),
+            FileAdmission::Absent,
+            FileProtection::Ordinary,
+            |error| HashError::local_artifact(self.as_path(), error),
+            |output, destination| {
+                let descriptor = copy_verified(
+                    &mut source.file,
+                    &source.path,
+                    output,
+                    destination,
+                    expected,
+                )?;
+                let permissions = source
+                    .metadata()
+                    .map_err(|error| HashError::io("read source permissions", &source.path, error))?
+                    .permissions();
+                output.set_permissions(permissions).map_err(|error| {
+                    HashError::io("set staged file permissions", destination, error)
+                })?;
+                Ok((descriptor.size, descriptor))
+            },
+        )
+    }
+}
+
+impl FileSnapshot {
+    /// Copies the complete owned byte file into a destination stage.
+    pub fn stage_into(mut self, stage: StagedTree) -> Result<StagedTree, LocalError> {
+        self.file
+            .rewind()
+            .map_err(|error| LocalError::io("rewind file snapshot", &self.source, error))?;
+        let (mut output, destination) = stage.create_file(PathBuf::new())?;
+        io::copy(&mut self.file, &mut output)
+            .map_err(|error| LocalError::io("copy file snapshot into stage", destination, error))?;
+        Ok(stage)
     }
 }
 
@@ -29,8 +98,7 @@ mod tests {
 
     use super::*;
     use crate::hash::{DigestAlgorithmKind, DigestValue, HashError};
-    use crate::local::LocalTarget;
-    use crate::{Acquire, Verify};
+    use crate::local::{CommitOutcome, TreeAdmission};
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -44,12 +112,8 @@ mod tests {
         root
     }
 
-    fn acquire(path: &Path) -> LocalMaterial {
-        // The landed publication law never creates parents; the caller owns the layout.
-        LocalSource::new(path.to_path_buf())
-            .unwrap()
-            .acquire()
-            .unwrap()
+    fn open(path: &Path) -> OpenedFile {
+        LocalPath::new(path).unwrap().open_file().unwrap().unwrap()
     }
 
     fn blake3_hex(bytes: &[u8]) -> String {
@@ -64,22 +128,42 @@ mod tests {
         fs::write(source.join("bin/tool"), b"dir payload").unwrap();
         let target = root.join("target");
 
-        // A directory tree has no byte digest: verification is refused, so the caller skips it.
-        let error = acquire(&source)
-            .verify(
-                DigestValue::new(DigestAlgorithmKind::Blake3, blake3_hex(b"never-verified"))
-                    .unwrap(),
-            )
-            .unwrap_err();
-        assert!(matches!(error, HashError::UnsupportedDigestMaterial(path) if path == source));
-
-        let admitted = LocalTarget::new(target.clone()).unwrap();
+        let admitted = LocalPath::new(target.clone()).unwrap();
         let stage = admitted.stage().unwrap();
-        let prepared = acquire(&source).prepare(stage).unwrap();
-        prepared.publish(admitted).unwrap();
+        let prepared = stage
+            .copy_tree(LocalPath::new(&source).unwrap(), PathBuf::new())
+            .unwrap();
+        prepared.publish(admitted, TreeAdmission::Absent).unwrap();
 
         assert_eq!(fs::read(target.join("bin/tool")).unwrap(), b"dir payload");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn occupied_target_releases_the_verified_read_only_stage() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::write(&source, b"verified bytes").unwrap();
+        fs::write(&target, b"predecessor").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
+        let expected = open(&source)
+            .digest(DigestAlgorithmKind::Blake3)
+            .unwrap()
+            .digest;
+
+        let result = LocalPath::new(&target)
+            .unwrap()
+            .publish_verified_file(open(&source), &expected);
+        assert!(matches!(
+            result,
+            Err(HashError::LocalArtifact { source, .. }) if matches!(*source, LocalError::TargetExists(_))
+        ));
+        assert_eq!(fs::read(target).unwrap(), b"predecessor");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -89,23 +173,22 @@ mod tests {
         fs::write(&source, b"plain payload").unwrap();
         let target = root.join("target");
 
-        let material = acquire(&source);
-        let (material, digest_evidence) = material
-            .verify(
-                DigestValue::new(DigestAlgorithmKind::Blake3, blake3_hex(b"plain payload"))
+        let material = open(&source);
+        let (publication, digest_evidence) = LocalPath::new(&target)
+            .unwrap()
+            .publish_verified_file(
+                material,
+                &DigestValue::new(DigestAlgorithmKind::Blake3, blake3_hex(b"plain payload"))
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(digest_evidence.algorithm, DigestAlgorithmKind::Blake3);
         assert_eq!(
-            digest_evidence.observed.as_str(),
+            digest_evidence.digest.as_str(),
             blake3_hex(b"plain payload")
         );
-
-        let admitted = LocalTarget::new(target.clone()).unwrap();
-        let stage = admitted.stage().unwrap();
-        let prepared = material.prepare(stage).unwrap();
-        prepared.publish(admitted).unwrap();
+        assert_eq!(digest_evidence.size, 13);
+        assert_eq!(publication.outcome, CommitOutcome::Created);
+        assert_eq!(publication.bytes, 13);
         assert_eq!(fs::read(&target).unwrap(), b"plain payload");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -117,9 +200,11 @@ mod tests {
         fs::write(&source, b"plain payload").unwrap();
         let target = root.join("target");
 
-        let error = acquire(&source)
-            .verify(
-                DigestValue::new(
+        let error = LocalPath::new(&target)
+            .unwrap()
+            .publish_verified_file(
+                open(&source),
+                &DigestValue::new(
                     DigestAlgorithmKind::Blake3,
                     blake3_hex(b"different payload"),
                 )

@@ -1,6 +1,6 @@
 [package]
 name = "pulith"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -15,7 +15,8 @@ include = [
     "/src/**",
     "/tests/**",
     "/examples/**",
-    "/docs/**",
+    "/docs/AGENTS.md",
+    "/docs/architecture.md",
     "/CONTRIBUTING.md",
     "/Cargo.toml",
     "/LICENSE",
@@ -29,6 +30,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["local"]
 local = ["dep:rustix", "dep:tempfile", "dep:walkdir", "dep:windows-sys"]
+# Experimental until the two-account Windows acceptance test passes.
+windows-private-preview = ["local"]
 process = ["local"]
 net = ["dep:url", "dep:httpdate", "dep:governor"]
 http-ureq = ["net", "local", "dep:ureq"]
@@ -51,7 +54,7 @@ hex = { version = "0.4", optional = true }
 httpdate = { version = "1.0.3", optional = true }
 sha2 = { version = "0.10", optional = true }
 tar = { version = "0.4.46", optional = true }
-tempfile = { version = "3", optional = true }
+tempfile = { version = "3.27", optional = true }
 ureq = { version = "3.4.1", default-features = false, features = ["rustls"], optional = true }
 url = { version = "2.5", optional = true }
 walkdir = { version = "2.5", optional = true }

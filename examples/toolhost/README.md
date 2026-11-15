@@ -106,7 +106,7 @@ the same.
 | Feature | APIs exercised | Purpose |
 | --- | --- | --- |
 | `process` | `WorktreeProcess`, `ManagedProcess`, `EnvVars`, process evidence and diagnostics | bounded builds, exact verification environments, and supervised payloads |
-| `local` via `process` | `StagedTree`, `LocalSource`, `LocalTarget`, `Link`, `Unlink`, `Remove`, `RecordStore` | harvest, atomic publication, active views, definitions, and Windows receipts |
+| `local` via `process` | `StagedTree`, `LocalPath`, `link_view`, `unlink_view`, `remove`, `RecordStore` | harvest, atomic publication, active views, definitions, and Windows receipts |
 | `serde` | recipe and service declaration parsing | strict declarative input |
 
 `signal-hook` and `sd-notify` are Linux example dependencies used by the systemd host. They are not

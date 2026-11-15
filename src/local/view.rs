@@ -6,26 +6,22 @@
 //! tree, publishes a target, retains a prior generation, or persists active state.
 //! Platform-specific link mechanics are cfg-split here. Feature-gated on `local`.
 #![allow(clippy::result_large_err)] // receipt-preserving errors are the family law
-#![allow(clippy::type_complexity)] // the node methods echo the family's full typestate
 use std::fs;
 #[cfg(windows)]
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{Link, Unlink};
-
 use super::{
     LinkChange, LinkError, LinkEvidence, LocalError, LocalObservation, UnlinkChange, UnlinkError,
-    UnlinkEvidence, observe_path,
+    UnlinkEvidence, ViewEntry, ViewStatus, inspect_entry,
 };
 
 /// D7 shape law: an expose subpath is relative, non-empty, and cannot escape the tree.
 fn is_safe_expose(expose: &Path) -> bool {
-    // An empty expose is the root (link_root); any other expose must be a relative,
-    // non-escaping sequence of normal components.
+    // An explicit exposure is a non-escaping sequence of normal components.
     if expose.as_os_str().is_empty() {
-        return true;
+        return false;
     }
     if expose.is_absolute() {
         return false;
@@ -163,42 +159,85 @@ fn create_directory_symlink(source: &Path, view: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_dir(source, view)
 }
 
-impl Link for super::LocalTarget {
-    type Error = LinkError;
-    type Output = LinkEvidence;
-
-    fn link(self, view: &Path, expose: &Path) -> Result<Self::Output, Self::Error> {
-        let target = self.0;
-        if !is_safe_expose(expose) {
-            return Err(LinkError::InvalidExpose {
-                expose: expose.to_path_buf(),
-            });
-        }
-        let source = if expose.as_os_str().is_empty() {
-            target
-        } else {
-            target.join(expose)
-        };
-        link_view(view, source)
+impl super::LocalPath {
+    /// Observes a view and compares its directory referent with the declared exposure.
+    pub fn inspect_view(
+        &self,
+        view: &Path,
+        expose: Option<&Path>,
+    ) -> Result<ViewStatus, LocalError> {
+        let source = self
+            .exposed_path(expose)
+            .map_err(|path| LocalError::InvalidExpose(path.into()))?;
+        inspect_view(view, &source)
     }
 
-    fn link_root(self, view: &Path) -> Result<Self::Output, Self::Error> {
-        self.link(view, Path::new(""))
+    fn exposed_path<'a>(&self, expose: Option<&'a Path>) -> Result<PathBuf, &'a Path> {
+        match expose {
+            None => Ok(self.as_path().to_path_buf()),
+            Some(path) if is_safe_expose(path) => Ok(self.as_path().join(path)),
+            Some(path) => Err(path),
+        }
     }
 }
 
-impl Unlink for super::LocalTarget {
-    type Error = UnlinkError;
-    type Output = UnlinkEvidence;
+fn view_entry(view: &Path) -> Result<ViewEntry, LocalError> {
+    match inspect_entry(view)? {
+        LocalObservation::Missing => Ok(ViewEntry::Missing),
+        LocalObservation::Symlink => match fs::metadata(view) {
+            Ok(metadata) if metadata.is_dir() => Ok(ViewEntry::DirectoryLink),
+            Ok(_) => Ok(ViewEntry::OtherLink),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ViewEntry::DanglingLink),
+            Err(error) => Err(LocalError::io("resolve view", view, error)),
+        },
+        observed => Ok(ViewEntry::Occupied(observed)),
+    }
+}
 
-    fn unlink(self) -> Result<Self::Output, Self::Error> {
-        let view = self.0;
-        let change = match observe_path(&view).map_err(|cause| UnlinkError::Observe {
+fn inspect_view(view: &Path, source: &Path) -> Result<ViewStatus, LocalError> {
+    match view_entry(view)? {
+        ViewEntry::Missing => Ok(ViewStatus::Missing),
+        ViewEntry::Occupied(entry) => Ok(ViewStatus::Occupied(entry)),
+        ViewEntry::DanglingLink => Ok(ViewStatus::Dangling),
+        ViewEntry::OtherLink => Ok(ViewStatus::WrongTarget),
+        ViewEntry::DirectoryLink => {
+            if inspect_entry(source)? != LocalObservation::Directory {
+                return Ok(ViewStatus::WrongTarget);
+            }
+            let actual = fs::canonicalize(view)
+                .map_err(|error| LocalError::io("resolve active view", view, error))?;
+            match fs::canonicalize(source) {
+                Ok(expected) if actual == expected => Ok(ViewStatus::Matches),
+                Ok(_) => Ok(ViewStatus::WrongTarget),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(ViewStatus::WrongTarget)
+                }
+                Err(error) => Err(LocalError::io("resolve exposed directory", source, error)),
+            }
+        }
+    }
+}
+
+impl super::LocalPath {
+    /// Creates or switches the directory link at the consumer view.
+    pub fn link_view(&self, view: &Path, expose: Option<&Path>) -> Result<LinkEvidence, LinkError> {
+        let source = self
+            .exposed_path(expose)
+            .map_err(|path| LinkError::InvalidExpose {
+                expose: path.into(),
+            })?;
+        link_view(view, source)
+    }
+
+    /// Removes an active directory view and leaves the source directory in place.
+    pub fn unlink_view(&self) -> Result<UnlinkEvidence, UnlinkError> {
+        let view = self.as_path().to_path_buf();
+        let change = match view_entry(&view).map_err(|cause| UnlinkError::Observe {
             view: view.clone(),
             cause,
         })? {
-            LocalObservation::Missing => UnlinkChange::Unchanged,
-            LocalObservation::SymlinkToDirectory => {
+            ViewEntry::Missing => UnlinkChange::Unchanged,
+            ViewEntry::DirectoryLink => {
                 remove_active_view(&view).map_err(|error| UnlinkError::Remove {
                     view: view.clone(),
                     cause: LocalError::io("remove active directory symlink", &view, error),
@@ -212,7 +251,7 @@ impl Unlink for super::LocalTarget {
 }
 
 fn link_view(view: &Path, source: PathBuf) -> Result<LinkEvidence, LinkError> {
-    let source_observed = observe_path(&source).map_err(|cause| LinkError::BeforeLink {
+    let source_observed = inspect_entry(&source).map_err(|cause| LinkError::BeforeLink {
         view: view.to_path_buf(),
         cause,
     })?;
@@ -222,6 +261,14 @@ fn link_view(view: &Path, source: PathBuf) -> Result<LinkEvidence, LinkError> {
             observed: source_observed,
         });
     }
+    let source = if source.is_absolute() {
+        source
+    } else {
+        std::path::absolute(&source).map_err(|error| LinkError::BeforeLink {
+            view: view.to_path_buf(),
+            cause: LocalError::io("resolve exposed directory", &source, error),
+        })?
+    };
     if let Some(parent) = view.parent()
         && let Err(cause) = std::fs::create_dir_all(parent)
     {
@@ -230,12 +277,12 @@ fn link_view(view: &Path, source: PathBuf) -> Result<LinkEvidence, LinkError> {
             cause: LocalError::io("create view parent", parent, cause),
         });
     }
-    let observed = observe_path(view).map_err(|cause| LinkError::BeforeLink {
+    let observed = view_entry(view).map_err(|cause| LinkError::BeforeLink {
         view: view.to_path_buf(),
         cause,
     })?;
     match observed {
-        LocalObservation::Missing => {
+        ViewEntry::Missing => {
             match create_directory_symlink(&source, view) {
                 Ok(()) => {}
                 Err(error) => {
@@ -254,18 +301,35 @@ fn link_view(view: &Path, source: PathBuf) -> Result<LinkEvidence, LinkError> {
                     };
                 }
             }
-            Ok(LinkEvidence {
+            confirm_link(LinkEvidence {
                 source,
                 view: view.to_path_buf(),
                 change: LinkChange::Created,
             })
         }
-        LocalObservation::SymlinkToDirectory => switch_view(view, &source),
+        ViewEntry::DirectoryLink => switch_view(view, &source),
+        ViewEntry::DanglingLink if accepts_dangling_view(view)? => switch_view(view, &source),
         observed => Err(LinkError::ViewConflict {
             view: view.to_path_buf(),
             observed,
         }),
     }
+}
+
+#[cfg(windows)]
+fn accepts_dangling_view(view: &Path) -> Result<bool, LinkError> {
+    use std::os::windows::fs::FileTypeExt;
+    let metadata = fs::symlink_metadata(view).map_err(|error| LinkError::BeforeLink {
+        view: view.to_path_buf(),
+        cause: LocalError::io("inspect dangling view", view, error),
+    })?;
+    Ok(metadata.file_type().is_symlink_dir())
+}
+
+#[cfg(unix)]
+fn accepts_dangling_view(_view: &Path) -> Result<bool, LinkError> {
+    // POSIX symlinks do not encode a file-versus-directory hint.
+    Ok(true)
 }
 
 /// Natively replace one existing directory-symlink view (the switch law: the previous source is
@@ -309,7 +373,7 @@ fn switch_view(view: &Path, source: &Path) -> Result<LinkEvidence, LinkError> {
             return if active_view_is_busy(error_code) {
                 Err(LinkError::ViewConflict {
                     view: view.to_path_buf(),
-                    observed: LocalObservation::SymlinkToDirectory,
+                    observed: ViewEntry::DirectoryLink,
                 })
             } else if active_view_capability_unavailable(error_code) {
                 Err(LinkError::CapabilityUnavailable {
@@ -324,19 +388,46 @@ fn switch_view(view: &Path, source: &Path) -> Result<LinkEvidence, LinkError> {
             };
         }
     }
-    match observe_path(view) {
-        Ok(LocalObservation::SymlinkToDirectory) => Ok(LinkEvidence {
-            source: source.to_path_buf(),
-            view: view.to_path_buf(),
-            change: LinkChange::Replaced,
-        }),
-        Ok(observed) => Err(LinkError::ViewConflict {
-            view: view.to_path_buf(),
-            observed,
-        }),
-        Err(cause) => Err(LinkError::BeforeLink {
-            view: view.to_path_buf(),
-            cause,
-        }),
+    confirm_link(LinkEvidence {
+        source: source.to_path_buf(),
+        view: view.to_path_buf(),
+        change: LinkChange::Replaced,
+    })
+}
+
+fn confirm_link(evidence: LinkEvidence) -> Result<LinkEvidence, LinkError> {
+    let cause = match inspect_view(&evidence.view, &evidence.source) {
+        Ok(ViewStatus::Matches) => return Ok(evidence),
+        Ok(observed) => LocalError::io(
+            "confirm active view",
+            &evidence.view,
+            io::Error::other(format!("observed {observed:?}")),
+        ),
+        Err(error) => error,
+    };
+    Err(LinkError::AfterLink { evidence, cause })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_link_failure_keeps_the_committed_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let view = root.path().join("view");
+        fs::create_dir(&source).unwrap();
+        let evidence = super::super::LocalPath::new(&source)
+            .unwrap()
+            .link_view(&view, None)
+            .unwrap();
+        remove_active_view(&view).unwrap();
+
+        assert!(
+            matches!(confirm_link(evidence.clone()), Err(LinkError::AfterLink {
+            evidence: committed, ..
+        }) if committed == evidence)
+        );
     }
 }

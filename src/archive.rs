@@ -39,7 +39,9 @@ pub enum ArchiveError {
     },
     /// The archive path conflict outcome.
     ArchivePathConflict(PathBuf),
-    /// Extraction failed and resetting the exclusive workspace also failed.
+    /// The extraction root already contains entries or is not a regular directory.
+    InvalidExtractRoot(PathBuf),
+    /// Extraction failed and clearing the exclusive workspace also failed.
     ///
     /// `extraction` is the primary source. `cleanup` remains available for callers that need to
     /// detect a contaminated workspace.
@@ -94,6 +96,13 @@ impl std::fmt::Display for ArchiveError {
             ),
             Self::ArchivePathConflict(path) => {
                 write!(f, "archive entries conflict at path: {}", path.display())
+            }
+            Self::InvalidExtractRoot(path) => {
+                write!(
+                    f,
+                    "archive root must be absent or an empty regular directory: {}",
+                    path.display()
+                )
             }
             Self::ArchiveCleanupFailed { workspace, .. } => write!(
                 f,
@@ -277,7 +286,7 @@ pub struct ArchivePolicy {
 }
 
 impl ArchivePolicy {
-    /// Constructs the default restrictive extraction policy without optional limits.
+    /// Constructs the default restrictive extraction policy.
     pub fn new() -> Self {
         Self::default()
     }
@@ -288,7 +297,7 @@ impl ArchivePolicy {
         self
     }
 
-    /// Sets the maximum number of materialized entries.
+    /// Sets the maximum number of archive entries, including entries skipped after stripping.
     pub fn max_entries(mut self, max_entries: u64) -> Self {
         self.max_entries = Some(max_entries);
         self
@@ -364,19 +373,20 @@ impl ArchiveEvidence {
     }
 }
 
-/// Shared driver: reset the exclusive root, extract, clean up on failure, and pair the prepared
+/// Shared driver: admit the exclusive root, extract, clean up on failure, and pair the prepared
 /// tree with its attestation.
 fn prepare_into(
     root: &Path,
     policy: ArchivePolicy,
     extract: impl FnOnce(&Path, &ArchivePolicy) -> Result<ArchiveEvidence, ArchiveError>,
 ) -> Result<ArchiveEvidence, ArchiveError> {
-    let root = root.to_path_buf();
-    reset_extract_root(&root)?;
+    // Inspect the final entry even when the caller supplied a trailing separator or `/.`.
+    let root: PathBuf = root.components().collect();
+    admit_extract_root(&root)?;
     match extract(&root, &policy) {
         Ok(evidence) => Ok(evidence),
         Err(error) => {
-            let cleanup = reset_extract_root(&root);
+            let cleanup = clear_extract_root(&root);
             Err(combine_archive_failure(&root, error, cleanup))
         }
     }
@@ -384,13 +394,15 @@ fn prepare_into(
 
 /// Prepares a TAR stream into caller-owned exclusive custody.
 ///
+/// The root must be absent or an empty regular directory. Keep it exclusive through cleanup.
+///
 /// The caller owns the encoding. Pass a `File` for plain TAR, or any reader that yields TAR bytes
 /// (`flate2::read::GzDecoder`, `xz2::read::XzDecoder`, `zstd::stream::Decoder`) for a compressed
 /// stream; this function takes no position on how those bytes were produced. `max_decoded_bytes`
 /// bounds the bytes pulled through `reader`, so a decompression bomb is stopped before it reaches
 /// the entry parser.
 #[cfg(feature = "tar")]
-pub fn prepare_tar<R: Read>(
+pub fn extract_tar<R: Read>(
     reader: R,
     root: &Path,
     policy: ArchivePolicy,
@@ -402,17 +414,19 @@ pub fn prepare_tar<R: Read>(
 
 /// Prepares a ZIP stream into caller-owned exclusive custody.
 ///
+/// The root must be absent or an empty regular directory. Keep it exclusive through cleanup.
+///
 /// The stream is parsed by `zip`: entry names, entry types, and header consistency are its
 /// knowledge. Path policy, collision policy, limits, evidence, and failure atomicity are this
 /// module's.
 #[cfg(feature = "zip")]
-pub fn prepare_zip<R: Read + io::Seek>(
+pub fn extract_zip<R: Read + io::Seek>(
     reader: R,
     root: &Path,
     policy: ArchivePolicy,
 ) -> Result<ArchiveEvidence, ArchiveError> {
     prepare_into(root, policy, |root, policy| {
-        extract_zip(reader, root, policy)
+        extract_zip_entries(reader, root, policy)
     })
 }
 
@@ -432,13 +446,14 @@ fn combine_archive_failure(
 }
 
 #[cfg(feature = "zip")]
-fn extract_zip<R: Read + io::Seek>(
+fn extract_zip_entries<R: Read + io::Seek>(
     reader: R,
     root: &Path,
     policy: &ArchivePolicy,
 ) -> Result<ArchiveEvidence, ArchiveError> {
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip archive: {err}")))?;
+    check_limit("entry-count", archive.len() as u64, policy.max_entries)?;
     // Delegate header validation to `zip`: it rejects duplicate names, local/central mismatches,
     // overlapping entries, and local headers missing from the central directory. Entries that
     // defer sizes to a trailing data descriptor are still accepted.
@@ -450,8 +465,6 @@ fn extract_zip<R: Read + io::Seek>(
 
     for index in 0..archive.len() {
         evidence.entries += 1;
-        check_limit("entry-count", evidence.entries, policy.max_entries)?;
-
         let mut file = archive
             .by_index(index)
             .map_err(|err| ArchiveError::InvalidPreparation(format!("invalid zip entry: {err}")))?;
@@ -468,8 +481,6 @@ fn extract_zip<R: Read + io::Seek>(
             continue;
         };
         let target = root.join(&relative);
-        ensure_under_root(root, &target)?;
-        reject_existing_symlink_path(root, &target)?;
 
         if file.is_symlink() {
             evidence.symlinks += 1;
@@ -558,8 +569,6 @@ fn extract_tar_reader<R: Read>(
             continue;
         };
         let target = root.join(&relative);
-        ensure_under_root(root, &target)?;
-        reject_existing_symlink_path(root, &target)?;
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -773,21 +782,66 @@ fn check_limit(limit: &'static str, actual: u64, max: Option<u64>) -> Result<(),
     Ok(())
 }
 
-fn reset_extract_root(root: &Path) -> Result<(), ArchiveError> {
-    if let Ok(metadata) = fs::symlink_metadata(root) {
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(ArchiveError::UnsupportedArchiveEntry(root.to_path_buf()));
-        }
-        if file_type.is_dir() {
-            fs::remove_dir_all(root)
-                .map_err(|err| ArchiveError::io("clear archive root", root, err))?;
-        } else {
-            fs::remove_file(root)
-                .map_err(|err| ArchiveError::io("clear archive root file", root, err))?;
+fn is_regular_directory(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
         }
     }
-    fs::create_dir_all(root).map_err(|err| ArchiveError::io("create archive root", root, err))
+    metadata.is_dir() && !metadata.is_symlink()
+}
+
+fn admit_extract_root(root: &Path) -> Result<(), ArchiveError> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if is_regular_directory(&metadata) => {
+            let mut children = fs::read_dir(root)
+                .map_err(|err| ArchiveError::io("read archive root", root, err))?;
+            match children.next().transpose() {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err(ArchiveError::InvalidExtractRoot(root.to_path_buf())),
+                Err(err) => Err(ArchiveError::io("read archive root", root, err)),
+            }
+        }
+        Ok(_) => Err(ArchiveError::InvalidExtractRoot(root.to_path_buf())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = root
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent)
+                    .map_err(|err| ArchiveError::io("create archive parent", parent, err))?;
+            }
+            fs::create_dir(root).map_err(|err| ArchiveError::io("create archive root", root, err))
+        }
+        Err(err) => Err(ArchiveError::io("inspect archive root", root, err)),
+    }
+}
+
+fn clear_extract_root(root: &Path) -> Result<(), ArchiveError> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|err| ArchiveError::io("inspect archive root", root, err))?;
+    if !is_regular_directory(&metadata) {
+        return Err(ArchiveError::InvalidExtractRoot(root.to_path_buf()));
+    }
+    let children =
+        fs::read_dir(root).map_err(|err| ArchiveError::io("read archive root", root, err))?;
+    for child in children {
+        let child = child.map_err(|err| ArchiveError::io("read archive root", root, err))?;
+        let path = child.path();
+        let kind = child
+            .file_type()
+            .map_err(|err| ArchiveError::io("inspect archive entry", &path, err))?;
+        let removed = if kind.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.map_err(|err| ArchiveError::io("clear archive entry", &path, err))?;
+    }
+    Ok(())
 }
 
 fn sanitize_relative(
@@ -857,33 +911,6 @@ fn validate_archive_component(_component: &std::ffi::OsStr) -> Result<(), Archiv
     Ok(())
 }
 
-fn ensure_under_root(root: &Path, target: &Path) -> Result<(), ArchiveError> {
-    if !target.starts_with(root) {
-        return Err(ArchiveError::ArchiveInvalidPath(
-            target.display().to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn reject_existing_symlink_path(root: &Path, target: &Path) -> Result<(), ArchiveError> {
-    let relative = target
-        .strip_prefix(root)
-        .map_err(|_| ArchiveError::ArchiveInvalidPath(target.display().to_string()))?;
-    let mut cursor = root.to_path_buf();
-    for component in relative.components() {
-        if let Component::Normal(part) = component {
-            cursor.push(part);
-            if let Ok(metadata) = fs::symlink_metadata(&cursor)
-                && metadata.file_type().is_symlink()
-            {
-                return Err(ArchiveError::UnsupportedArchiveEntry(cursor));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(all(test, feature = "zip"))]
 mod tests {
     use std::error::Error as _;
@@ -900,7 +927,7 @@ mod tests {
         workspace: &Path,
         policy: ArchivePolicy,
     ) -> Result<super::ArchiveEvidence, ArchiveError> {
-        super::prepare_zip(File::open(source).unwrap(), workspace, policy)
+        super::extract_zip(File::open(source).unwrap(), workspace, policy)
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1080,21 +1107,27 @@ mod tests {
     }
 
     #[test]
-    fn zip_prepare_clears_stale_extract_root() {
-        let root = temp_root("clear-stale");
+    fn zip_prepare_leaves_an_occupied_root_untouched() {
+        let root = temp_root("occupied");
         let zip_path = root.join("payload.zip");
         let extract_root = root.join("extract");
         fs::create_dir_all(extract_root.join("old")).unwrap();
         fs::write(extract_root.join("old/stale.txt"), "stale").unwrap();
         write_zip(&zip_path, &[("fresh.txt", b"fresh")]);
 
-        prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap();
+        let err = prepare(&zip_path, &extract_root, ArchivePolicy::default()).unwrap_err();
+        assert!(matches!(err, ArchiveError::InvalidExtractRoot(path) if path == extract_root));
 
         assert_eq!(
-            fs::read_to_string(extract_root.join("fresh.txt")).unwrap(),
-            "fresh"
+            fs::read_to_string(extract_root.join("old/stale.txt")).unwrap(),
+            "stale"
         );
-        assert!(!extract_root.join("old/stale.txt").exists());
+        assert!(!extract_root.join("fresh.txt").exists());
+        let occupied_file = root.join("file");
+        fs::write(&occupied_file, b"keep me").unwrap();
+        let err = prepare(&zip_path, &occupied_file, ArchivePolicy::default()).unwrap_err();
+        assert!(matches!(err, ArchiveError::InvalidExtractRoot(path) if path == occupied_file));
+        assert_eq!(fs::read(&occupied_file).unwrap(), b"keep me");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1374,9 +1407,9 @@ mod tar_tests {
     ) -> Result<super::ArchiveEvidence, ArchiveError> {
         let file = File::open(source).unwrap();
         match codec {
-            Codec::Plain => super::prepare_tar(file, workspace, policy),
+            Codec::Plain => super::extract_tar(file, workspace, policy),
             Codec::Gzip => {
-                super::prepare_tar(flate2::read::GzDecoder::new(file), workspace, policy)
+                super::extract_tar(flate2::read::GzDecoder::new(file), workspace, policy)
             }
         }
     }

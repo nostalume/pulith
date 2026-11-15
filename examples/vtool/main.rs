@@ -18,6 +18,7 @@ fn main() -> ExitCode {
             eprintln!("vtool: {error}");
             ExitCode::FAILURE
         }
+        Err(CliError::RepairFailed) => ExitCode::FAILURE,
     }
 }
 
@@ -32,6 +33,7 @@ enum Command {
 enum CliError {
     Usage(String),
     Operation(BoxError),
+    RepairFailed,
 }
 
 impl Command {
@@ -80,47 +82,74 @@ impl Command {
     }
 
     fn execute(self) -> Result<(), CliError> {
-        let result = (|| -> Result<(), BoxError> {
-            let (root, manifest) = match &self {
-                Self::Plan(root, manifest)
-                | Self::Install(root, manifest)
-                | Self::Activate(root, manifest)
-                | Self::Deactivate(root, manifest)
-                | Self::Repair(root, manifest, _) => (root, manifest),
-            };
-            let resolved = manifest::Manifest::load(manifest)?.resolve(root)?;
-            match self {
-                Self::Plan(..) => {
-                    println!(
-                        "plan: {}@{}",
-                        resolved.manifest.name.as_str(),
-                        resolved.manifest.version.as_str()
-                    );
-                    println!("source={}", describe_source(&resolved.source));
-                    println!("target={}", resolved.target.display());
-                }
-                Self::Install(..) => {
-                    resolved.install(root)?;
-                    println!("installed");
-                }
-                Self::Activate(..) => println!("outcome={:?}", resolved.activate(root)?),
-                Self::Deactivate(..) => {
-                    resolved.deactivate(root)?;
-                    println!("deactivated");
-                }
-                Self::Repair(_, _, attempts) => println!(
-                    "{:?}",
-                    realize::repair(
-                        &resolved,
-                        root,
-                        attempts,
-                        std::time::Duration::from_millis(100),
-                    )?
-                ),
+        let (root, path) = match &self {
+            Self::Plan(root, manifest)
+            | Self::Install(root, manifest)
+            | Self::Activate(root, manifest)
+            | Self::Deactivate(root, manifest)
+            | Self::Repair(root, manifest, _) => (root, manifest),
+        };
+        let resolved = manifest::Manifest::load(path)
+            .map_err(CliError::Operation)?
+            .resolve(root)
+            .map_err(|error| CliError::Operation(error.into()))?;
+        match self {
+            Self::Plan(..) => {
+                println!(
+                    "plan: {}@{}",
+                    resolved.manifest.name.as_str(),
+                    resolved.manifest.version.as_str()
+                );
+                println!("source={}", describe_source(&resolved.source));
+                println!("target={}", resolved.target.display());
             }
-            Ok(())
-        })();
-        result.map_err(CliError::Operation)
+            Self::Install(..) => {
+                resolved.install(root).map_err(CliError::Operation)?;
+                println!("installed");
+            }
+            Self::Activate(..) => {
+                let change = resolved.activate(root).map_err(CliError::Operation)?;
+                println!("outcome={change:?}");
+            }
+            Self::Deactivate(..) => {
+                resolved.deactivate(root).map_err(CliError::Operation)?;
+                println!("deactivated");
+            }
+            Self::Repair(_, _, attempts) => {
+                let report = realize::repair(
+                    &resolved,
+                    root,
+                    attempts,
+                    std::time::Duration::from_millis(100),
+                )
+                .map_err(|error| CliError::Operation(error.into()))?;
+                let name = resolved.manifest.name.as_str();
+                let version = resolved.manifest.version.as_str();
+                for diagnostic in report.diagnostics {
+                    eprintln!("vtool: {name}@{version} {diagnostic}");
+                }
+                use realize::RepairOutcome;
+                match report.outcome {
+                    RepairOutcome::NotInstalled => println!("{name}@{version}: not installed"),
+                    RepairOutcome::Deactivated => println!("{name}@{version}: deactivated"),
+                    RepairOutcome::Unchanged(evidence) => {
+                        println!("{name}@{version}: unchanged; {evidence}");
+                    }
+                    RepairOutcome::Repaired(evidence) => {
+                        println!("{name}@{version}: repaired; {evidence}");
+                    }
+                    RepairOutcome::Failed { published } => {
+                        if let Some(evidence) = published {
+                            println!("{name}@{version}: failed after publication; {evidence}");
+                        } else {
+                            println!("{name}@{version}: failed");
+                        }
+                        return Err(CliError::RepairFailed);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

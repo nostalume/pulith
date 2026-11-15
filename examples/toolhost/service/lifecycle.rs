@@ -1,5 +1,4 @@
 use super::{NormalizedDecl, ServiceError, ServiceRoot, platform};
-use pulith::Remove;
 use std::fmt::{self, Display};
 
 pub struct Service {
@@ -131,7 +130,7 @@ impl Service {
         }
         self.platform().remove()?;
         self.root.recheck()?;
-        let target = ServiceError::effect(pulith::local::LocalTarget::new(
+        let target = ServiceError::effect(pulith::local::LocalPath::new(
             self.root.directory(&self.declaration),
         ))?;
         ServiceError::effect(target.remove())?;

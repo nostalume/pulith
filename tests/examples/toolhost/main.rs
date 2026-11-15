@@ -100,16 +100,16 @@ fn activation_selects_one_release_or_reports_capability_unavailable() {
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
     let current = root.path().join("current");
-    let activated = LocalTarget::new(&first).unwrap().link_root(&current);
+    let activated = LocalPath::new(&first).unwrap().link_view(&current, None);
     match activated {
         Ok(_) => {
             assert_eq!(
                 current.canonicalize().unwrap(),
                 first.canonicalize().unwrap()
             );
-            LocalTarget::new(&second)
+            LocalPath::new(&second)
                 .unwrap()
-                .link_root(&current)
+                .link_view(&current, None)
                 .unwrap();
             assert_eq!(
                 current.canonicalize().unwrap(),

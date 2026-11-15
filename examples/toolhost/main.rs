@@ -2,8 +2,7 @@ mod recipe;
 #[allow(dead_code)]
 mod service;
 
-use pulith::local::LocalTarget;
-use pulith::{Link, Unlink};
+use pulith::local::LocalPath;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -132,11 +131,11 @@ impl Command {
                 recipe::component(&name, "name")?;
                 recipe::component(&version, "version")?;
                 let release = root.join("installs").join(name).join(version);
-                LocalTarget::new(release)?.link_root(&root.join("current"))?;
+                LocalPath::new(release)?.link_view(&root.join("current"), None)?;
                 Ok(0)
             }
             Self::Deactivate(root) => {
-                LocalTarget::new(root.join("current"))?.unlink()?;
+                LocalPath::new(root.join("current"))?.unlink_view()?;
                 Ok(0)
             }
             Self::Env(root) => {

@@ -5,23 +5,79 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "blake3", feature = "sha2"))]
-use pulith::Verify;
 use pulith::local::{
-    Admission, LocalEntryKind, LocalExpectation, LocalObservation, LocalReconciliation,
-    LocalSource, LocalTarget, Occupancy, RemoveEvidence,
+    CommitOutcome, LocalEntryKind, LocalExpectation, LocalObservation, LocalPath,
+    LocalReconciliation, RemoveEvidence, TreeAdmission,
 };
+
+#[test]
+fn publish_file_reports_the_branch_at_commit_time() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("target");
+    let target = LocalPath::new(&path).unwrap();
+
+    assert_eq!(target.inspect_entry().unwrap(), LocalObservation::Missing);
+    fs::write(&path, b"arrived after observation").unwrap();
+    let publication = target
+        .publish_file(b"new", TreeAdmission::ReplaceRegularFile)
+        .unwrap();
+    assert_eq!(publication.outcome, CommitOutcome::Replaced);
+    assert_eq!(publication.bytes, 3);
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+
+    assert!(matches!(
+        target.inspect_entry().unwrap(),
+        LocalObservation::File { .. }
+    ));
+    fs::remove_file(&path).unwrap();
+    let publication = target
+        .publish_file(b"next", TreeAdmission::ReplaceRegularFile)
+        .unwrap();
+    assert_eq!(publication.outcome, CommitOutcome::Created);
+    assert_eq!(publication.bytes, 4);
+    assert_eq!(fs::read(&path).unwrap(), b"next");
+}
+
+#[test]
+fn publish_file_reports_no_commit_when_another_writer_occupies_the_name() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("target");
+    let target = LocalPath::new(&path).unwrap();
+    assert_eq!(target.inspect_entry().unwrap(), LocalObservation::Missing);
+
+    let start = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            start.wait();
+            target.publish_file(b"first", TreeAdmission::Absent)
+        });
+        start.wait();
+        let second = target.publish_file(b"second", TreeAdmission::Absent);
+        (first.join().unwrap(), second)
+    });
+    let (publication, error, expected) = match (first, second) {
+        (Ok(publication), Err(error)) => (publication, error, b"first".as_slice()),
+        (Err(error), Ok(publication)) => (publication, error, b"second".as_slice()),
+        results => panic!("expected one successful publication, got {results:?}"),
+    };
+    assert_eq!(publication.outcome, CommitOutcome::Created);
+    assert_eq!(publication.bytes, expected.len() as u64);
+    assert!(matches!(error, pulith::local::LocalError::TargetExists(found) if found == path));
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
 
 #[test]
 fn staged_tree_writes_generated_bytes_inside_its_boundary() {
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("generated");
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     target
         .stage()
         .unwrap()
         .write_file(b"schema = 1\n", "service.toml")
         .unwrap()
-        .publish(target)
+        .publish(target, pulith::local::TreeAdmission::Absent)
         .unwrap();
     assert_eq!(
         fs::read(target_path.join("service.toml")).unwrap(),
@@ -32,15 +88,14 @@ fn staged_tree_writes_generated_bytes_inside_its_boundary() {
 /// a tree. The target's neighbours are the observable proof: after a successful write and after
 /// a refusal alike, the directory holds what it held before plus the target itself.
 #[test]
-fn write_atomic_publishes_one_file_and_leaves_nothing_beside_it() {
+fn publish_file_publishes_one_file_and_leaves_nothing_beside_it() {
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("nested/deeper/a.txt");
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     let evidence = target
-        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .publish_file(b"fresh", TreeAdmission::ReplaceRegularFile)
         .unwrap();
-    assert_eq!(evidence.files, 1);
-    assert_eq!(evidence.directories, 0);
+    assert_eq!(evidence.outcome, pulith::local::CommitOutcome::Created);
     assert_eq!(evidence.bytes, 5);
     assert_eq!(fs::read(&target_path).unwrap(), b"fresh");
     let siblings: Vec<_> = fs::read_dir(target_path.parent().unwrap())
@@ -51,13 +106,13 @@ fn write_atomic_publishes_one_file_and_leaves_nothing_beside_it() {
 }
 
 #[test]
-fn write_atomic_replaces_the_predecessor_bytes() {
+fn publish_file_replaces_the_predecessor_bytes() {
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("a.txt");
     fs::write(&target_path, "stale").unwrap();
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     target
-        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .publish_file(b"fresh", TreeAdmission::ReplaceRegularFile)
         .unwrap();
     assert_eq!(fs::read(&target_path).unwrap(), b"fresh");
 }
@@ -65,14 +120,16 @@ fn write_atomic_replaces_the_predecessor_bytes() {
 /// The immutable admission keeps its promise here too: an existing predecessor is reported, not
 /// replaced, and the bytes that were there are still there.
 #[test]
-fn write_atomic_under_absent_admission_refuses_a_predecessor() {
+fn publish_file_under_absent_admission_refuses_a_predecessor() {
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("a.txt");
     fs::write(&target_path, "keep").unwrap();
-    let target = LocalTarget::new(&target_path).unwrap();
-    let error = target.write_atomic(b"new", Admission::Absent).unwrap_err();
+    let target = LocalPath::new(&target_path).unwrap();
+    let error = target
+        .publish_file(b"new", TreeAdmission::Absent)
+        .unwrap_err();
     assert!(
-        matches!(error, pulith::local::LocalError::AlreadyPublished(_)),
+        matches!(error, pulith::local::LocalError::TargetExists(_)),
         "{error:?}"
     );
     assert_eq!(fs::read(&target_path).unwrap(), b"keep");
@@ -86,13 +143,13 @@ fn write_atomic_under_absent_admission_refuses_a_predecessor() {
 /// A refusal happens before the rename, so the occupant is untouched and no temporary file is
 /// left where a later run would trip over it.
 #[test]
-fn write_atomic_refuses_a_directory_without_leaving_a_temporary_file() {
+fn publish_file_refuses_a_directory_without_leaving_a_temporary_file() {
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("a.txt");
     fs::create_dir(&target_path).unwrap();
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     let error = target
-        .write_atomic(b"new", Admission::ReplaceRegularFile)
+        .publish_file(b"new", TreeAdmission::ReplaceRegularFile)
         .unwrap_err();
     assert!(matches!(
         error,
@@ -110,21 +167,19 @@ fn write_atomic_refuses_a_directory_without_leaving_a_temporary_file() {
 /// onto the staged file before the rename.
 #[cfg(unix)]
 #[test]
-fn write_atomic_keeps_the_mode_of_the_file_it_replaces() {
+fn publish_file_keeps_the_mode_of_the_file_it_replaces() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let target_path = root.path().join("a.txt");
     fs::write(&target_path, "stale").unwrap();
     fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).unwrap();
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     target
-        .write_atomic(b"fresh", Admission::ReplaceRegularFile)
+        .publish_file(b"fresh", TreeAdmission::ReplaceRegularFile)
         .unwrap();
     let mode = fs::metadata(&target_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
-
-use pulith::{Acquire, Inspect, Reconcile, Remove};
 
 fn temp_root(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -144,12 +199,16 @@ fn materialize_local_file_without_synthetic_transitions() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&source, "pulith").unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
     let target_path = target;
-    let target = LocalTarget::new(target_path.clone()).unwrap();
+    let target = LocalPath::new(target_path.clone()).unwrap();
     let stage = target.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    let evidence = tree.publish(target).unwrap();
+    let tree = stage
+        .copy_file(material, std::path::PathBuf::new())
+        .unwrap();
+    let evidence = tree
+        .publish(target, pulith::local::TreeAdmission::Absent)
+        .unwrap();
 
     assert_eq!(fs::read_to_string(&target_path).unwrap(), "pulith");
     assert_eq!(evidence.files, 1);
@@ -168,15 +227,19 @@ fn create_new_conflict_is_typed_and_non_mutating() {
     fs::write(&source, "replacement").unwrap();
     fs::write(&target, "winner").unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    let error = tree.publish(admitted).unwrap_err();
+    let tree = stage
+        .copy_file(material, std::path::PathBuf::new())
+        .unwrap();
+    let error = tree
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap_err();
 
     assert!(matches!(
         error,
-        pulith::local::LocalError::AlreadyPublished(path) if path == target
+        pulith::local::LocalError::TargetExists(path) if path == target
     ));
     assert_eq!(fs::read_to_string(&target).unwrap(), "winner");
     assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
@@ -192,11 +255,11 @@ fn thirty_two_publishers_have_one_complete_winner() {
         .map(|value| {
             let source = root.join(format!("source-{value}"));
             fs::write(&source, [value]).unwrap();
-            let target = LocalTarget::new(&target).unwrap();
+            let target = LocalPath::new(&target).unwrap();
             target
                 .stage()
                 .unwrap()
-                .copy_file(LocalSource::new(source).unwrap(), PathBuf::new())
+                .copy_file(LocalPath::new(source).unwrap(), PathBuf::new())
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -208,7 +271,10 @@ fn thirty_two_publishers_have_one_complete_winner() {
             let target = target.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                stage.publish(LocalTarget::new(target).unwrap())
+                stage.publish(
+                    LocalPath::new(target).unwrap(),
+                    pulith::local::TreeAdmission::Absent,
+                )
             })
         })
         .collect::<Vec<_>>()
@@ -220,7 +286,7 @@ fn thirty_two_publishers_have_one_complete_winner() {
     assert_eq!(
         results
             .iter()
-            .filter(|result| matches!(result, Err(pulith::local::LocalError::AlreadyPublished(path)) if path == &target))
+            .filter(|result| matches!(result, Err(pulith::local::LocalError::TargetExists(path)) if path == &target))
             .count(),
         31
     );
@@ -235,11 +301,11 @@ fn stage_rejects_escaping_destinations_without_leaking_a_target() {
     let target = root.join("target");
     fs::create_dir_all(&root).unwrap();
     fs::write(&source, b"safe").unwrap();
-    let admitted = LocalTarget::new(&target).unwrap();
+    let admitted = LocalPath::new(&target).unwrap();
     let error = admitted
         .stage()
         .unwrap()
-        .copy_file(LocalSource::new(source).unwrap(), "../escape")
+        .copy_file(LocalPath::new(source).unwrap(), "../escape")
         .unwrap_err();
     assert!(matches!(
         error,
@@ -266,11 +332,11 @@ fn copy_tree_rejects_a_source_link_without_leaking_a_target() {
         return;
     }
 
-    let admitted = LocalTarget::new(&target).unwrap();
+    let admitted = LocalPath::new(&target).unwrap();
     let error = admitted
         .stage()
         .unwrap()
-        .copy_tree(LocalSource::new(source).unwrap(), PathBuf::new())
+        .copy_tree(LocalPath::new(source).unwrap(), PathBuf::new())
         .unwrap_err();
     assert!(matches!(
         error,
@@ -289,11 +355,11 @@ fn precommit_rescan_rejects_an_injected_link() {
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("file"), b"safe").unwrap();
     fs::write(&outside, b"outside").unwrap();
-    let admitted = LocalTarget::new(&target).unwrap();
+    let admitted = LocalPath::new(&target).unwrap();
     let stage = admitted
         .stage()
         .unwrap()
-        .copy_tree(LocalSource::new(source).unwrap(), PathBuf::new())
+        .copy_tree(LocalPath::new(source).unwrap(), PathBuf::new())
         .unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, stage.root().join("injected")).unwrap();
@@ -305,7 +371,9 @@ fn precommit_rescan_rejects_an_injected_link() {
         fs::remove_dir_all(root).unwrap();
         return;
     }
-    let error = stage.publish(admitted).unwrap_err();
+    let error = stage
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap_err();
     assert!(matches!(
         error,
         pulith::local::LocalError::UnsupportedLocalEntry(_)
@@ -323,21 +391,23 @@ fn hard_link_input_is_normalized_into_independent_stage_bytes() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&source, b"before").unwrap();
     fs::hard_link(&source, &alias).unwrap();
-    let admitted = LocalTarget::new(&target).unwrap();
+    let admitted = LocalPath::new(&target).unwrap();
     let stage = admitted
         .stage()
         .unwrap()
-        .copy_file(LocalSource::new(alias).unwrap(), PathBuf::new())
+        .copy_file(LocalPath::new(alias).unwrap(), PathBuf::new())
         .unwrap();
     fs::write(source, b"after").unwrap();
-    stage.publish(admitted).unwrap();
+    stage
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"before");
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 #[cfg(feature = "blake3")]
-fn verify_then_apply_exact_local_artifact() {
+fn verified_publication_keeps_the_installed_bytes_after_source_changes() {
     use pulith::hash::{DigestAlgorithmKind, DigestValue};
 
     let root = temp_root("descriptor");
@@ -348,14 +418,14 @@ fn verify_then_apply_exact_local_artifact() {
     let digest = blake3::hash(b"pulith").to_hex().to_string();
     let expected = DigestValue::new(DigestAlgorithmKind::Blake3, digest).unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
-    let (material, evidence) = material.verify(expected.clone()).unwrap();
-    assert_eq!(evidence.expected, expected);
-
-    let admitted = LocalTarget::new(target.clone()).unwrap();
-    let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
+    let file = material.open_file().unwrap().unwrap();
+    fs::rename(&source, root.join("old.txt")).unwrap();
+    fs::write(&source, "replaced").unwrap();
+    let (publication, evidence) = admitted.publish_verified_file(file, &expected).unwrap();
+    assert_eq!(evidence.digest, expected);
+    assert_eq!(publication.bytes, 6);
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
     fs::remove_dir_all(root).unwrap();
@@ -368,11 +438,11 @@ fn remove_local_target_reports_changed_and_unchanged() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&target, "obsolete").unwrap();
 
-    let removed = LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    let removed = LocalPath::new(target.clone()).unwrap().remove().unwrap();
 
     assert!(!target.exists());
     assert_eq!(removed, RemoveEvidence::Removed);
-    let unchanged = LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    let unchanged = LocalPath::new(target.clone()).unwrap().remove().unwrap();
     assert_eq!(unchanged, RemoveEvidence::Unchanged);
 
     fs::remove_dir_all(root).unwrap();
@@ -385,22 +455,14 @@ fn inspect_and_reconcile_without_mutating_local_target() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&target, "pulith").unwrap();
 
-    let (observation, evidence) = LocalTarget::new(target.clone())
+    let observation = LocalPath::new(target.clone())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
     assert_eq!(observation, LocalObservation::File { bytes: 6 });
-    assert_eq!(evidence.path, target);
 
-    let (reconciliation, reconcile_evidence) = observation
-        .reconcile(LocalExpectation::FileSize(6))
-        .unwrap();
+    let reconciliation = observation.compare(&LocalExpectation::FileSize(6));
     assert_eq!(reconciliation, LocalReconciliation::Matches);
-    assert_eq!(reconcile_evidence.expected, LocalExpectation::FileSize(6));
-    assert_eq!(
-        reconcile_evidence.observed,
-        LocalObservation::File { bytes: 6 }
-    );
     assert_eq!(fs::read_to_string(&target).unwrap(), "pulith");
 
     fs::remove_dir_all(root).unwrap();
@@ -414,21 +476,23 @@ fn post_inspect_preserves_apply_evidence_and_reconciles() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&source, "pulith").unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    let apply_evidence = tree.publish(admitted).unwrap();
+    let tree = stage
+        .copy_file(material, std::path::PathBuf::new())
+        .unwrap();
+    let apply_evidence = tree
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
 
-    let (observation, _) = LocalTarget::new(target.clone())
+    let observation = LocalPath::new(target.clone())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
     assert_eq!(observation, LocalObservation::File { bytes: 6 });
 
-    let (reconciliation, _) = observation
-        .reconcile(LocalExpectation::FileSize(6))
-        .unwrap();
+    let reconciliation = observation.compare(&LocalExpectation::FileSize(6));
     assert_eq!(reconciliation, LocalReconciliation::Matches);
     let _ = apply_evidence;
 
@@ -443,20 +507,21 @@ fn post_inspect_reports_later_mutation_without_reapplying() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&source, "pulith").unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let tree = stage
+        .copy_file(material, std::path::PathBuf::new())
+        .unwrap();
+    tree.publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     fs::write(&target, "changed!").unwrap();
 
-    let (observation, _) = LocalTarget::new(target.clone())
+    let observation = LocalPath::new(target.clone())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
-    let (reconciliation, _) = observation
-        .reconcile(LocalExpectation::FileSize(6))
-        .unwrap();
+    let reconciliation = observation.compare(&LocalExpectation::FileSize(6));
     assert_eq!(
         reconciliation,
         LocalReconciliation::Modified {
@@ -476,11 +541,11 @@ fn post_inspect_forget_observes_missing_without_acquisition() {
     fs::create_dir_all(&root).unwrap();
     fs::write(&target, "obsolete").unwrap();
 
-    LocalTarget::new(target.clone()).unwrap().remove().unwrap();
+    LocalPath::new(target.clone()).unwrap().remove().unwrap();
 
-    let (observation, _) = LocalTarget::new(target.clone())
+    let observation = LocalPath::new(target.clone())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
     assert_eq!(observation, LocalObservation::Missing);
 
@@ -488,33 +553,30 @@ fn post_inspect_forget_observes_missing_without_acquisition() {
 }
 
 #[test]
-fn occupancy_reports_a_regular_file_and_refuses_a_directory() {
+fn inspect_entry_distinguishes_regular_file_and_directory() {
     let root = temp_root("occupancy");
     fs::create_dir_all(root.join("directory")).unwrap();
     fs::write(root.join("file.txt"), b"four").unwrap();
 
     assert_eq!(
-        LocalTarget::new(root.join("missing.txt"))
+        LocalPath::new(root.join("missing.txt"))
             .unwrap()
-            .occupancy()
+            .inspect_entry()
             .unwrap(),
-        Occupancy::Absent
+        LocalObservation::Missing
     );
     assert_eq!(
-        LocalTarget::new(root.join("file.txt"))
+        LocalPath::new(root.join("file.txt"))
             .unwrap()
-            .occupancy()
+            .inspect_entry()
             .unwrap(),
-        Occupancy::RegularFile { bytes: 4 }
+        LocalObservation::File { bytes: 4 }
     );
     assert!(matches!(
-        LocalTarget::new(root.join("directory"))
+        LocalPath::new(root.join("directory"))
             .unwrap()
-            .occupancy(),
-        Err(pulith::local::LocalError::OccupiedTarget {
-            kind: LocalEntryKind::Directory,
-            ..
-        })
+            .inspect_entry(),
+        Ok(LocalObservation::Directory)
     ));
 
     fs::remove_dir_all(root).unwrap();
@@ -532,13 +594,13 @@ fn commit_replaces_a_regular_file_and_keeps_its_mode() {
         fs::set_permissions(&target_path, fs::Permissions::from_mode(0o640)).unwrap();
     }
 
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
     let evidence = target
         .stage()
         .unwrap()
         .write_file(b"after", PathBuf::new())
         .unwrap()
-        .commit(target.clone(), Admission::ReplaceRegularFile)
+        .publish(target.clone(), TreeAdmission::ReplaceRegularFile)
         .unwrap();
 
     assert_eq!(fs::read(&target_path).unwrap(), b"after");
@@ -560,14 +622,14 @@ fn commit_replaces_a_regular_file_and_keeps_its_mode() {
 fn commit_creates_the_target_when_the_replacing_admission_finds_it_absent() {
     let root = temp_root("commit-create");
     let target_path = root.join("created.txt");
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
 
     target
         .stage()
         .unwrap()
         .write_file(b"created", PathBuf::new())
         .unwrap()
-        .commit(target, Admission::ReplaceRegularFile)
+        .publish(target, TreeAdmission::ReplaceRegularFile)
         .unwrap();
 
     assert_eq!(fs::read(&target_path).unwrap(), b"created");
@@ -579,14 +641,14 @@ fn commit_refuses_a_directory_target_without_touching_it() {
     let root = temp_root("commit-directory");
     fs::create_dir_all(root.join("occupied/inner")).unwrap();
     fs::write(root.join("occupied/inner/keep.txt"), b"keep").unwrap();
-    let target = LocalTarget::new(root.join("occupied")).unwrap();
+    let target = LocalPath::new(root.join("occupied")).unwrap();
 
     let error = target
         .stage()
         .unwrap()
         .write_file(b"replacement", PathBuf::new())
         .unwrap()
-        .commit(target, Admission::ReplaceRegularFile)
+        .publish(target, TreeAdmission::ReplaceRegularFile)
         .unwrap_err();
 
     assert!(matches!(
@@ -619,13 +681,13 @@ fn commit_refuses_a_symlink_target_without_following_it() {
         return;
     }
 
-    let target = LocalTarget::new(&link).unwrap();
+    let target = LocalPath::new(&link).unwrap();
     let error = target
         .stage()
         .unwrap()
         .write_file(b"replacement", PathBuf::new())
         .unwrap()
-        .commit(target, Admission::ReplaceRegularFile)
+        .publish(target, TreeAdmission::ReplaceRegularFile)
         .unwrap_err();
 
     assert!(matches!(
@@ -652,20 +714,58 @@ fn absent_admission_still_refuses_an_existing_regular_file() {
     fs::create_dir_all(&root).unwrap();
     let target_path = root.join("target.txt");
     fs::write(&target_path, b"before").unwrap();
-    let target = LocalTarget::new(&target_path).unwrap();
+    let target = LocalPath::new(&target_path).unwrap();
 
     let error = target
         .stage()
         .unwrap()
         .write_file(b"after", PathBuf::new())
         .unwrap()
-        .commit(target, Admission::Absent)
+        .publish(target, TreeAdmission::Absent)
         .unwrap_err();
 
     assert!(matches!(
         error,
-        pulith::local::LocalError::AlreadyPublished(path) if path == target_path
+        pulith::local::LocalError::TargetExists(path) if path == target_path
     ));
     assert_eq!(fs::read(&target_path).unwrap(), b"before");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_tree_publishes_an_empty_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let path = root.path().join("target");
+    fs::create_dir(&source).unwrap();
+    let target = LocalPath::new(&path).unwrap();
+    let tree = target
+        .stage()
+        .unwrap()
+        .copy_tree(LocalPath::new(source).unwrap(), PathBuf::new())
+        .unwrap();
+    let receipt = tree.publish(target, TreeAdmission::Absent).unwrap();
+    assert_eq!(receipt.directories, 1);
+    assert_eq!(receipt.files, 0);
+    assert_eq!(fs::read_dir(path).unwrap().count(), 0);
+}
+
+#[test]
+fn copy_file_does_not_follow_an_existing_stage_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let outside = root.path().join("outside");
+    let target = LocalPath::new(root.path().join("target")).unwrap();
+    fs::write(&source, b"new bytes").unwrap();
+    fs::write(&outside, b"original").unwrap();
+
+    let stage = target.stage().unwrap();
+    fs::create_dir(stage.root()).unwrap();
+    crate::common::file_symlink(&outside, stage.root().join("occupied")).unwrap();
+    assert!(matches!(
+        stage.copy_file(LocalPath::new(source).unwrap(), "occupied"),
+        Err(pulith::local::LocalError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read(outside).unwrap(), b"original");
+    assert!(!target.as_path().exists());
 }

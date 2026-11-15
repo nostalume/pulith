@@ -300,11 +300,11 @@ impl ServiceRoot {
             }
         }
         let target =
-            ServiceError::effect(pulith::local::LocalTarget::new(self.directory(declaration)))?;
+            ServiceError::effect(pulith::local::LocalPath::new(self.directory(declaration)))?;
         let stage = ServiceError::effect(target.stage())?;
         let stage = ServiceError::effect(stage.write_file(declaration.bytes(), "service.toml"))?;
         let stage = ServiceError::effect(stage.write_file([], "state/lock"))?;
-        ServiceError::effect(stage.publish(target))?;
+        ServiceError::effect(stage.publish(target, pulith::local::TreeAdmission::Absent))?;
         Ok(true)
     }
 }

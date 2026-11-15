@@ -14,3 +14,7 @@ mod record;
 
 #[path = "local/switch.rs"]
 mod switch;
+
+#[cfg(all(windows, feature = "windows-private-preview"))]
+#[path = "local/private_windows.rs"]
+mod private_windows;

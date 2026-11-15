@@ -181,8 +181,8 @@ fn post_verification_shape_check_rejects_a_deleted_dispatcher() {
 
 fn companions(path: PathBuf) -> Companions {
     Companions {
-        dispatcher: LocalSource::new(&path).unwrap(),
-        service_host: LocalSource::new(path).unwrap(),
+        dispatcher: LocalPath::new(&path).unwrap(),
+        service_host: LocalPath::new(path).unwrap(),
     }
 }
 

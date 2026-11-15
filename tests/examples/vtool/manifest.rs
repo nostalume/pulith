@@ -42,7 +42,7 @@ fn parses_a_full_valid_manifest() {
     assert_eq!(manifest.version.as_str(), "1.2.0");
     let windows = manifest.windows.as_ref().unwrap();
     match &windows.source {
-        Source::Url { url } => {
+        Source::Url { url, .. } => {
             assert_eq!(
                 url.as_str(),
                 "https://example.com/demo-tool/1.2.0/demo-tool-win.zip"
@@ -380,6 +380,7 @@ fn manifest() -> Manifest {
         windows: Some(PlatformSpec {
             source: Source::Url {
                 url: Box::new("https://example.com/demo-tool-win.zip".parse().unwrap()),
+                format: ArchiveFormat::Zip,
             },
             hash: DigestValue::new(pulith::hash::DigestAlgorithmKind::Blake3, "0".repeat(64))
                 .unwrap(),
@@ -391,6 +392,7 @@ fn manifest() -> Manifest {
                         .parse()
                         .unwrap(),
                 ),
+                format: ArchiveFormat::Tar,
             },
             hash: DigestValue::new(pulith::hash::DigestAlgorithmKind::Blake3, "1".repeat(64))
                 .unwrap(),
@@ -519,6 +521,7 @@ fn legacy_state_is_an_explicit_conflict() {
 fn duplicate_snapshot_identity_is_an_explicit_conflict() {
     let root = temp_root("duplicate");
     let state = State::open(&root).unwrap();
+    std::fs::create_dir_all(root.join(".vtool/state")).unwrap();
     let duplicate = r#"{"schema":1,"records":[{"name":"demo","version":"1","phase":"Installed","generation":1},{"name":"demo","version":"1","phase":"Installed","generation":2}]}"#;
     std::fs::write(root.join(".vtool/state/snapshot.json"), duplicate).unwrap();
     assert!(matches!(state.read(), Err(StateError::Conflict { .. })));

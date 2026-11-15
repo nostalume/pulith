@@ -1,5 +1,4 @@
-use pulith::Inspect;
-use pulith::local::{LocalObservation, LocalSource, LocalTarget, StagedTree};
+use pulith::local::{LocalObservation, LocalPath, StagedTree};
 use pulith::process::{EnvVars, WorktreeProcess, WorktreeResult};
 use serde::Deserialize;
 use std::ffi::OsString;
@@ -71,8 +70,8 @@ pub struct ResolvedBuild {
 }
 
 struct Companions {
-    dispatcher: LocalSource,
-    service_host: LocalSource,
+    dispatcher: LocalPath,
+    service_host: LocalPath,
 }
 
 pub enum InstallOutcome {
@@ -160,7 +159,7 @@ impl ResolvedBuild {
             .join("installs")
             .join(self.identity.0)
             .join(self.identity.1);
-        let admitted = LocalTarget::new(&target)?;
+        let admitted = LocalPath::new(&target)?;
         let stage = admitted
             .stage()?
             .copy_file(
@@ -182,7 +181,7 @@ impl ResolvedBuild {
             paths = verification.verify(paths)?;
         }
         Self::validate(&stage, &executable, has_runtime)?;
-        stage.publish(admitted)?;
+        stage.publish(admitted, pulith::local::TreeAdmission::Absent)?;
         Ok(InstallOutcome::Published {
             release: target,
             process,
@@ -199,7 +198,7 @@ impl ResolvedBuild {
             stage.root().join("shims").join(executable),
         ] {
             if !matches!(
-                LocalTarget::new(path)?.inspect(())?.0,
+                LocalPath::new(path)?.inspect_entry()?,
                 LocalObservation::File { .. }
             ) {
                 return Err(std::io::Error::other("missing staged binary or dispatcher").into());
@@ -207,9 +206,7 @@ impl ResolvedBuild {
         }
         if runtime
             && !matches!(
-                LocalTarget::new(stage.root().join("private-runtime"))?
-                    .inspect(())?
-                    .0,
+                LocalPath::new(stage.root().join("private-runtime"))?.inspect_entry()?,
                 LocalObservation::Directory
             )
         {
@@ -261,14 +258,14 @@ fn companions() -> Result<Companions, crate::BoxError> {
         .parent()
         .ok_or_else(|| std::io::Error::other("toolhost executable has no parent"))?;
     Ok(Companions {
-        dispatcher: LocalSource::new(parent.join(executable_name("toolhost-shim")))?,
-        service_host: LocalSource::new(parent.join(executable_name("toolhost-service")))?,
+        dispatcher: LocalPath::new(parent.join(executable_name("toolhost-shim")))?,
+        service_host: LocalPath::new(parent.join(executable_name("toolhost-service")))?,
     })
 }
 
-fn admitted_source(path: PathBuf, boundary: &Path) -> Result<LocalSource, crate::BoxError> {
+fn admitted_source(path: PathBuf, boundary: &Path) -> Result<LocalPath, crate::BoxError> {
     if path.canonicalize()?.starts_with(boundary) {
-        LocalSource::new(path).map_err(Into::into)
+        LocalPath::new(path).map_err(Into::into)
     } else {
         Err(std::io::Error::other(format!("artifact escapes worktree: {}", path.display())).into())
     }

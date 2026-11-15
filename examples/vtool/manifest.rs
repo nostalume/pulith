@@ -113,7 +113,7 @@ impl Manifest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArchiveFormat {
-    /// The source is copied as a file or tree.
+    /// The source is published as a verified regular file.
     #[default]
     Plain,
     /// The source is a ZIP stream.
@@ -217,7 +217,7 @@ impl std::error::Error for ManifestError {}
 
 use std::io::Cursor;
 
-use pulith::local::{RecordError, RecordLimit, RecordObservation, RecordStore};
+use pulith::local::{RecordError, RecordLimit, RecordStore};
 use serde::Serialize;
 
 const STATE_LIMIT: u64 = 1024 * 1024;
@@ -260,11 +260,7 @@ impl State {
         match std::fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => return Err(StateError::Conflict { path: directory }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(&directory).map_err(|source| {
-                    StateError::io("create state directory", &directory, source)
-                })?;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(StateError::io(
                     "inspect state directory",
@@ -277,15 +273,28 @@ impl State {
     }
 
     pub fn read(&self) -> Result<Vec<Record>, StateError> {
+        match std::fs::symlink_metadata(&self.directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(StateError::io(
+                    "inspect state directory",
+                    &self.directory,
+                    source,
+                ));
+            }
+            Ok(_) => {}
+        }
         let store = RecordStore::new(&self.directory)?;
-        Self::decode(store.inspect(SNAPSHOT, Self::limit())?.0, &self.directory)
+        Self::decode(store.read(SNAPSHOT, Self::limit())?, &self.directory)
     }
 
     pub fn commit(&self, name: &str, version: &str, phase: Phase) -> Result<(), StateError> {
+        std::fs::create_dir_all(&self.directory)
+            .map_err(|source| StateError::io("create state directory", &self.directory, source))?;
         let store = RecordStore::new(&self.directory)?;
         let mut edit = store.edit()?;
-        let observed = edit.inspect(SNAPSHOT, Self::limit())?.0;
-        let missing = matches!(observed, RecordObservation::Missing);
+        let observed = edit.read(SNAPSHOT, Self::limit())?;
+        let missing = observed.is_none();
         let mut records = Self::decode(observed, &self.directory)?;
         let generation = records
             .iter()
@@ -311,8 +320,8 @@ impl State {
         Ok(())
     }
 
-    fn decode(observed: RecordObservation, directory: &Path) -> Result<Vec<Record>, StateError> {
-        let RecordObservation::Present(bytes) = observed else {
+    fn decode(observed: Option<Vec<u8>>, directory: &Path) -> Result<Vec<Record>, StateError> {
+        let Some(bytes) = observed else {
             return Ok(Vec::new());
         };
         let snapshot: Snapshot =

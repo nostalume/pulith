@@ -20,10 +20,9 @@ use std::time::Duration;
 use pulith::process::{Arg, EnvVars, OutputPath, OutputProcess};
 
 #[cfg(any(feature = "process", feature = "zip", feature = "tar"))]
-use pulith::Acquire;
 #[cfg(any(feature = "zip", feature = "tar"))]
 #[cfg(any(feature = "zip", feature = "tar"))]
-use pulith::local::{LocalSource, LocalTarget};
+use pulith::local::LocalPath;
 
 /// Runs one real process fixture: a hand-rolled local server or child process script.
 #[derive(Clone, Copy)]
@@ -53,18 +52,22 @@ pub fn publish_tree(
     root: &Path,
     version: &'static str,
     contents: &'static [u8],
-) -> (PathBuf, pulith::local::ApplyEvidence) {
+) -> (PathBuf, pulith::local::TreePublication) {
     let source = root.join(format!("source-{version}"));
     let target = root.join(format!("artifacts/demo-tool/{version}"));
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(source.join("tool.txt"), contents).unwrap();
 
-    let material = LocalSource::new(source).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    let evidence = tree.publish(admitted).unwrap();
+    let tree = stage
+        .copy_tree(material, std::path::PathBuf::new())
+        .unwrap();
+    let evidence = tree
+        .publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
 
     (target, evidence)
 }
@@ -271,7 +274,7 @@ pub fn assert_failure_keeps_target_missing(
     let target = root.path().join("published");
     let result = fixture_process(fixture, "tree", timeout)
         .prepare()
-        .and_then(Acquire::acquire);
+        .and_then(pulith::process::PreparedProcess::execute);
 
     assert!(
         matches!(&result, Err(error) if is_expected(error)),
@@ -314,8 +317,7 @@ pub fn assert_marker_stable(marker: &Path, before: u64, window: Duration) {
 // ---------------------------------------------------------------------------
 // Mock HTTP server (previously HttpFixture in lifecycle/materialization.rs).
 //
-// The listener, port, and bytes all belong to the test. Callers inject `without_proxy()`
-// resources, so host-wide proxy settings are never an input to these tests.
+// The listener, port, and bytes belong to the test. Default HTTP resources connect directly.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "http-ureq")]

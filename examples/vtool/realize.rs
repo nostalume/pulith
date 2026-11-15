@@ -1,63 +1,63 @@
-//! Caller-owned vtool realization: acquire, verify, prepare, apply, link, and state repair.
-use std::fs::File;
+//! Caller-owned vtool realization: capture, verify, stage, publish, link, and repair.
 use std::path::Path;
 use std::time::Duration;
 
-use pulith::archive::{ArchivePolicy, prepare_tar, prepare_zip};
+use pulith::archive::{ArchivePolicy, extract_tar, extract_zip};
 use pulith::local::{
-    LinkChange, LocalExpectation, LocalMaterial, LocalReconciliation, LocalSource, LocalTarget,
+    LinkChange, LinkError, LocalError, LocalObservation, LocalPath, TreeAdmission, ViewStatus,
 };
-use pulith::net::RemoteSource;
-use pulith::{Acquire, Inspect, Link, Reconcile, Unlink, Verify};
+use pulith::net::{RemoteSource, UreqResources};
 
 use crate::manifest::{ArchiveFormat, Phase, Resolved, Source, State, StateError};
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn material_path(material: &LocalMaterial) -> &Path {
-    match material {
-        LocalMaterial::File { path } => path,
-        LocalMaterial::Directory { path } => path,
-        LocalMaterial::StagedFile { path } => path.as_ref(),
-    }
+fn prepare_archive(
+    file: pulith::local::FileSnapshot,
+    format: ArchiveFormat,
+    stage: pulith::local::StagedTree,
+) -> BoxResult<pulith::local::StagedTree> {
+    match format {
+        ArchiveFormat::Plain => return Ok(file.stage_into(stage)?),
+        ArchiveFormat::Zip => extract_zip(file, stage.root(), ArchivePolicy::new())?,
+        ArchiveFormat::Tar => extract_tar(file, stage.root(), ArchivePolicy::new())?,
+    };
+    Ok(stage)
 }
 
 impl Resolved {
-    fn realize(source: Source, hash: pulith::hash::DigestValue, target: &Path) -> BoxResult<()> {
-        let target = LocalTarget::new(target)?;
-        let stage = target.stage()?;
+    fn realize(
+        source: Source,
+        hash: pulith::hash::DigestValue,
+        target: &Path,
+    ) -> BoxResult<RepairEvidence> {
+        let target = LocalPath::new(target)?;
         let format = source.format();
-        let material = match source {
-            Source::Local { path, .. } => LocalSource::new(path)?.acquire()?,
-            Source::Url { url, .. } => RemoteSource::new(*url).prepare()?.acquire()?.0,
-        };
-        let material = match material {
-            LocalMaterial::Directory { .. } => material,
-            _ => material.verify(hash)?.0,
-        };
-        // The recipe declares the encoding, so the caller composes the decoder explicitly. pulith
-        // owns the custody contract, not format detection.
-        let stage = match format {
-            ArchiveFormat::Plain => material.prepare(stage)?,
-            ArchiveFormat::Zip => {
-                prepare_zip(
-                    File::open(material_path(&material))?,
-                    stage.root(),
-                    ArchivePolicy::new(),
-                )?;
-                stage
+        let stage = match source {
+            Source::Local { path, .. } => {
+                let file = match LocalPath::new(&path)?.open_file() {
+                    Ok(Some(file)) => file,
+                    Ok(None) => return Err(LocalError::MissingSource(path).into()),
+                    Err(error) => return Err(error.into()),
+                };
+                if format == ArchiveFormat::Plain {
+                    target.publish_verified_file(file, &hash)?;
+                    return Ok(RepairEvidence::FileDigest);
+                }
+                let (snapshot, _) = file.snapshot_verified(&hash)?;
+                prepare_archive(snapshot, format, target.stage()?)?
             }
-            ArchiveFormat::Tar => {
-                prepare_tar(
-                    File::open(material_path(&material))?,
-                    stage.root(),
-                    ArchivePolicy::new(),
-                )?;
-                stage
+            Source::Url { url, .. } => {
+                let (snapshot, _) = UreqResources::default().download(RemoteSource::new(*url))?;
+                let (snapshot, _) = snapshot.verify_digest(&hash)?;
+                prepare_archive(snapshot, format, target.stage()?)?
             }
         };
-        stage.publish(target)?;
-        Ok(())
+        stage.publish(target, TreeAdmission::Absent)?;
+        Ok(match format {
+            ArchiveFormat::Plain => RepairEvidence::FileDigest,
+            ArchiveFormat::Zip | ArchiveFormat::Tar => RepairEvidence::ArchiveInput,
+        })
     }
 
     pub fn install(self, root: &Path) -> BoxResult<()> {
@@ -76,11 +76,10 @@ impl Resolved {
             .view
             .as_deref()
             .ok_or_else(|| std::io::Error::other("manifest does not declare an activation view"))?;
-        let target = LocalTarget::new(&self.target)?;
-        let outcome = match self.manifest.expose.as_deref() {
-            Some(expose) => target.link(view, expose)?.change,
-            None => target.link_root(view)?.change,
-        };
+        let target = LocalPath::new(&self.target)?;
+        let outcome = target
+            .link_view(view, self.manifest.expose.as_deref())?
+            .change;
         commit(
             root,
             self.manifest.name.as_str(),
@@ -94,7 +93,7 @@ impl Resolved {
         let Some(view) = self.view else {
             return Ok(());
         };
-        LocalTarget::new(view)?.unlink()?;
+        LocalPath::new(view)?.unlink_view()?;
         commit(
             root,
             self.manifest.name.as_str(),
@@ -105,12 +104,36 @@ impl Resolved {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairEvidence {
+    FileDigest,
+    ArchiveDirectory,
+    ArchiveInput,
+}
+
+impl std::fmt::Display for RepairEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FileDigest => "file digest verified",
+            Self::ArchiveDirectory => "archive directory present (contents unchecked)",
+            Self::ArchiveInput => "archive input verified",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RepairOutcome {
+    NotInstalled,
+    Deactivated,
+    Unchanged(RepairEvidence),
+    Repaired(RepairEvidence),
+    Failed { published: Option<RepairEvidence> },
+}
+
+#[derive(Debug)]
 pub struct RepairReport {
-    pub satisfied: Vec<String>,
-    pub repaired: Vec<String>,
-    pub failed: Vec<String>,
-    pub attempts: Vec<String>,
+    pub outcome: RepairOutcome,
+    pub diagnostics: Vec<String>,
 }
 
 pub fn repair(
@@ -120,14 +143,8 @@ pub fn repair(
     backoff: Duration,
 ) -> Result<RepairReport, StateError> {
     let state = State::open(root)?;
-    let mut report = RepairReport::default();
-    let address = || {
-        format!(
-            "{}@{}",
-            resolved.manifest.name.as_str(),
-            resolved.manifest.version.as_str()
-        )
-    };
+    let mut failures = Vec::new();
+    let mut published = None;
 
     let records = state.read()?;
     let Some(latest) = records
@@ -138,76 +155,130 @@ pub fn repair(
         })
         .max_by_key(|record| record.generation)
     else {
-        return Ok(report); // never installed: nothing to repair
+        return Ok(RepairReport {
+            outcome: RepairOutcome::NotInstalled,
+            diagnostics: failures,
+        });
     };
     if latest.phase != Phase::Installed {
-        return Ok(report); // explicitly deactivated: repair does not resurrect
-    }
-    if is_satisfied(resolved) {
-        report.satisfied.push(address());
-        return Ok(report);
+        return Ok(RepairReport {
+            outcome: RepairOutcome::Deactivated,
+            diagnostics: failures,
+        });
     }
 
+    let mut observed = inspect_target(resolved);
+    if let Ok(TargetState::Ready(evidence)) = &observed
+        && view_matches(resolved)
+    {
+        return Ok(RepairReport {
+            outcome: RepairOutcome::Unchanged(*evidence),
+            diagnostics: failures,
+        });
+    }
     for attempt in 1..=attempts {
-        let target_ready = matches!(
-            LocalTarget::new(&resolved.target)
-                .and_then(|target| target.inspect(()))
-                .map(|(observation, _)| observation),
-            Ok(pulith::local::LocalObservation::Directory)
-        );
-        let realized = if target_ready {
-            Ok(())
-        } else {
-            Resolved::realize(
+        let evidence = match observed {
+            Ok(TargetState::Conflict(error)) => {
+                failures.push(error);
+                break;
+            }
+            Ok(TargetState::Ready(evidence)) => Ok(evidence),
+            Ok(TargetState::Missing) => Resolved::realize(
                 resolved.source.clone(),
                 resolved.hash.clone(),
                 &resolved.target,
             )
+            .inspect(|evidence| published = Some(*evidence)),
+            Err(error) => Err(error),
         };
-        let repaired = realized.and_then(|()| match &resolved.view {
-            Some(_) => resolved.activate(root).map(|_| ()),
-            None => Ok(()),
+        let repaired = evidence.and_then(|evidence| {
+            if resolved.view.is_some() {
+                resolved.activate(root)?;
+            } else {
+                commit(
+                    root,
+                    resolved.manifest.name.as_str(),
+                    resolved.manifest.version.as_str(),
+                    Phase::Installed,
+                )?;
+            }
+            Ok(evidence)
         });
         match repaired {
-            Ok(()) => {
-                if resolved.view.is_none() {
-                    commit(
-                        root,
-                        resolved.manifest.name.as_str(),
-                        resolved.manifest.version.as_str(),
-                        Phase::Installed,
-                    )?;
-                }
-                report.repaired.push(address());
-                return Ok(report);
+            Ok(evidence) => {
+                return Ok(RepairReport {
+                    outcome: RepairOutcome::Repaired(evidence),
+                    diagnostics: failures,
+                });
             }
             Err(error) => {
-                report
-                    .attempts
-                    .push(format!("{} attempt {attempt}: {error}", address()));
+                let view_conflict = matches!(
+                    error.downcast_ref::<LinkError>(),
+                    Some(LinkError::ViewConflict { .. })
+                );
+                failures.push(format!("attempt {attempt}: {error}"));
+                if view_conflict || attempt == attempts {
+                    break;
+                }
                 std::thread::sleep(backoff);
+                observed = inspect_target(resolved);
             }
         }
     }
-    report.failed.push(address());
-    Ok(report)
+    Ok(RepairReport {
+        outcome: RepairOutcome::Failed { published },
+        diagnostics: failures,
+    })
 }
 
-fn is_satisfied(resolved: &Resolved) -> bool {
-    reconciles(&resolved.target, LocalExpectation::Directory)
-        && resolved
-            .view
-            .as_deref()
-            .is_none_or(|view| reconciles(view, LocalExpectation::Symlink))
+fn view_matches(resolved: &Resolved) -> bool {
+    resolved.view.as_deref().is_none_or(|view| {
+        LocalPath::new(&resolved.target).is_ok_and(|target| {
+            matches!(
+                target.inspect_view(view, resolved.manifest.expose.as_deref()),
+                Ok(ViewStatus::Matches)
+            )
+        })
+    })
 }
 
-fn reconciles(path: &Path, expectation: LocalExpectation) -> bool {
-    matches!(
-        LocalTarget::new(path)
-            .and_then(|target| target.inspect(()))
-            .map(|(observed, _)| observed.reconcile(expectation)),
-        Ok(Ok((LocalReconciliation::Matches, _)))
-    )
+enum TargetState {
+    Missing,
+    Ready(RepairEvidence),
+    Conflict(String),
+}
+
+fn inspect_target(resolved: &Resolved) -> BoxResult<TargetState> {
+    let target = LocalPath::new(&resolved.target)?;
+    if resolved.source.format() != ArchiveFormat::Plain {
+        return match target.inspect_entry()? {
+            LocalObservation::Missing => Ok(TargetState::Missing),
+            LocalObservation::Directory => Ok(TargetState::Ready(RepairEvidence::ArchiveDirectory)),
+            entry => Ok(TargetState::Conflict(
+                LocalError::OccupiedTarget {
+                    path: resolved.target.clone(),
+                    kind: entry.kind(),
+                }
+                .to_string(),
+            )),
+        };
+    }
+    let file = match target.open_file() {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(TargetState::Missing),
+        Err(error @ LocalError::NotRegularFile { .. }) => {
+            return Ok(TargetState::Conflict(error.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let descriptor = file.digest(resolved.hash.algorithm())?;
+    if descriptor.digest != resolved.hash {
+        return Ok(TargetState::Conflict(format!(
+            "installed file digest differs at {}; review the file before reinstalling",
+            resolved.target.display()
+        )));
+    }
+    Ok(TargetState::Ready(RepairEvidence::FileDigest))
 }
 
 fn commit(root: &Path, name: &str, version: &str, phase: Phase) -> Result<(), StateError> {

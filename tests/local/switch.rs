@@ -3,9 +3,8 @@
 use std::fs;
 
 use crate::common::publish_tree;
-use pulith::Link;
 use pulith::local::LinkError;
-use pulith::local::{LinkChange, LocalObservation, LocalTarget};
+use pulith::local::{LinkChange, LocalObservation, LocalPath};
 
 #[test]
 fn switch_replaces_only_the_active_view_and_records_the_outcome() {
@@ -14,14 +13,14 @@ fn switch_replaces_only_the_active_view_and_records_the_outcome() {
     let (second_target, _) = publish_tree(root.path(), "2.0.0", b"second artifact");
     let view = root.path().join("views/demo-tool");
     fs::create_dir_all(view.parent().unwrap()).unwrap();
-    LocalTarget::new(first_target.clone())
+    LocalPath::new(first_target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
 
-    let evidence = LocalTarget::new(second_target.clone())
+    let evidence = LocalPath::new(second_target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
 
     assert_eq!(evidence.change, LinkChange::Replaced);
@@ -53,15 +52,15 @@ fn switch_rejects_a_non_symlink_view_without_mutation() {
     fs::create_dir_all(view.parent().unwrap()).unwrap();
     fs::write(&view, b"existing winner").unwrap();
 
-    let error = LocalTarget::new(second_target)
+    let error = LocalPath::new(second_target)
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap_err();
 
     assert!(matches!(
         error,
         LinkError::ViewConflict {
-            observed: LocalObservation::File { .. },
+            observed: pulith::local::ViewEntry::Occupied(LocalObservation::File { .. }),
             ..
         }
     ));
@@ -77,14 +76,14 @@ fn switch_rejects_directory_views_without_mutation() {
     let view = root.path().join("views/demo-tool");
     fs::create_dir_all(&view).unwrap();
 
-    let error = LocalTarget::new(second_target)
+    let error = LocalPath::new(second_target)
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap_err();
     assert!(matches!(
         error,
         LinkError::ViewConflict {
-            observed: LocalObservation::Directory,
+            observed: pulith::local::ViewEntry::Occupied(LocalObservation::Directory),
             ..
         }
     ));
@@ -98,15 +97,15 @@ fn switch_rejects_non_directory_sources_without_changing_the_old_view() {
     let (first_target, _) = publish_tree(root.path(), "1.0.0", b"first artifact");
     let view = root.path().join("views/demo-tool");
     fs::create_dir_all(view.parent().unwrap()).unwrap();
-    LocalTarget::new(first_target.clone())
+    LocalPath::new(first_target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
 
     let missing = root.path().join("missing");
-    let missing_error = LocalTarget::new(missing)
+    let missing_error = LocalPath::new(missing)
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap_err();
     assert!(matches!(
         missing_error,
@@ -118,9 +117,9 @@ fn switch_rejects_non_directory_sources_without_changing_the_old_view() {
 
     let file = root.path().join("file");
     fs::write(&file, b"not a directory").unwrap();
-    let file_error = LocalTarget::new(file)
+    let file_error = LocalPath::new(file)
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap_err();
     assert!(matches!(
         file_error,
@@ -142,16 +141,16 @@ fn switch_retries_an_occupied_staged_name_without_deleting_it() {
     let view = root.path().join("views/demo-tool");
     let parent = view.parent().unwrap();
     fs::create_dir_all(parent).unwrap();
-    LocalTarget::new(first_target.clone())
+    LocalPath::new(first_target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
     let occupied = parent.join(format!(".pulith-switch-{}-0", std::process::id()));
     fs::write(&occupied, b"caller-owned collision").unwrap();
 
-    let evidence = LocalTarget::new(second_target.clone())
+    let evidence = LocalPath::new(second_target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
 
     assert_eq!(evidence.change, LinkChange::Replaced);

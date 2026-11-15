@@ -2,7 +2,6 @@ use super::{
     Binding, Boot, ManagerObservation, NormalizedDecl, Registration, Runtime, ServiceError,
     ServiceRoot,
 };
-use pulith::Remove;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -159,7 +158,7 @@ impl PlatformService<'_> {
 
     pub(super) fn rebind(&self, binding: &Binding) -> Result<(), ServiceError> {
         let path = unit_path(self.root, self.declaration);
-        let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
+        let target = ServiceError::effect(pulith::local::LocalPath::new(path.parent().unwrap()))?;
         ServiceError::effect(target.remove())?;
         self.root.write_unit(self.declaration, binding)?;
         systemctl(self.root, ["daemon-reload"]).map(drop)
@@ -176,7 +175,7 @@ impl PlatformService<'_> {
             systemctl(self.root, ["disable", self.declaration.id.as_str()])?;
         }
         let path = unit_path(self.root, self.declaration);
-        let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
+        let target = ServiceError::effect(pulith::local::LocalPath::new(path.parent().unwrap()))?;
         ServiceError::effect(target.remove())?;
         systemctl(self.root, ["daemon-reload"]).map(drop)
     }
@@ -227,13 +226,13 @@ impl ServiceRoot {
         binding: &Binding,
     ) -> Result<(), ServiceError> {
         let path = unit_path(self, declaration);
-        let target = ServiceError::effect(pulith::local::LocalTarget::new(path.parent().unwrap()))?;
+        let target = ServiceError::effect(pulith::local::LocalPath::new(path.parent().unwrap()))?;
         let stage = ServiceError::effect(target.stage())?;
         let stage = ServiceError::effect(stage.write_file(
             render_definition(self, declaration, binding).as_bytes(),
             path.file_name().unwrap(),
         ))?;
-        ServiceError::effect(stage.publish(target))?;
+        ServiceError::effect(stage.publish(target, pulith::local::TreeAdmission::Absent))?;
         Ok(())
     }
 }

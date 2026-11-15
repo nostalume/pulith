@@ -50,6 +50,34 @@ RUSTDOCFLAGS="-D warnings -D missing-docs" cargo doc --locked --all-features --n
 For feature work, check the smallest feature combination that owns the behavior. The CI workflow is
 the authoritative matrix.
 
+## Windows private-file acceptance
+
+Use two ordinary Windows users with distinct SIDs and an empty local NTFS fixture directory.
+Give the publishing user write access and both users read access to the fixture and inherited
+read access to its ordinary files. The reader must open the public control before each denied
+open is counted. Set `PULITH_PRIVATE_TEST_ROOT` to its full path. Run the following twice,
+with `PULITH_PRIVATE_TEST_PHASE=create` as the publisher and `PULITH_PRIVATE_TEST_PHASE=read`
+as the reader. The test binaries can also be run directly under the corresponding account.
+
+```text
+cargo test --locked --all-features --test local windows_private_publication_two_accounts -- --ignored --nocapture --test-threads=1
+cargo test --locked --all-features --lib windows_private_ -- --ignored --nocapture --test-threads=1
+```
+
+Cleanup uses phase `remove` as the publisher, with the two commands in reverse order. Repeat
+with a restrictive inherited ACL that still lets the reader open the public control. To check
+an unsupported volume, set `PULITH_TEST_UNSUPPORTED_VOLUME` to a writable directory on that
+volume and run the following. It creates a disposable control and exercises the actual publish
+operation.
+
+```text
+cargo test --locked --all-features --test local windows_private_volume_refuses_before_creating_parent -- --ignored --nocapture
+```
+
+Record the control read, restricted file opens, and cleanup state for each account. A run of
+`create` alone records publisher behavior. Use the second account's local token for the reader
+phase. Keep file publication and editor-session results separate when recording support.
+
 ## Change requirements
 
 - Keep observable behavior covered by contract tests.

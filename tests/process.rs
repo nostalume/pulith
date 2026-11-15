@@ -8,7 +8,6 @@ use common::{
     Fixture, assert_failure_keeps_target_missing, assert_marker_stable, captured_contains,
     fixture_process, marker_environment,
 };
-use pulith::Acquire;
 use pulith::process::{
     CancelToken, ConfigError, EnvVars, ManagedProcess, OutputProcess, OutputResult, ProcessEnd,
     ProcessObservation, RunError, StagedInput, WorktreeProcess,
@@ -18,7 +17,7 @@ type ProcessOutput = OutputResult;
 
 fn acquire(root: &std::path::Path, action: OutputProcess) -> Result<ProcessOutput, RunError> {
     let _ = root;
-    action.prepare()?.acquire()
+    action.prepare()?.execute()
 }
 
 #[test]
@@ -64,13 +63,46 @@ fn managed_process_observes_running_and_stops_explicitly() {
             .start()
             .unwrap();
     assert!(matches!(
-        session.observe().unwrap(),
+        session.poll_exit().unwrap(),
         ProcessObservation::Running
     ));
     assert!(matches!(
         session.stop_within(Duration::from_secs(2)).unwrap(),
         ProcessEnd::Stopped { .. }
     ));
+}
+
+#[test]
+fn managed_stop_at_zero_deadline_keeps_the_session_available() {
+    let _guard = common::process_fixture_guard();
+    #[cfg(unix)]
+    let arguments = ["-c", "sleep 5"].map(OsString::from);
+    #[cfg(windows)]
+    let arguments = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 5",
+    ]
+    .map(OsString::from);
+    let mut session =
+        ManagedProcess::new(common::absolute_program(), std::env::current_dir().unwrap())
+            .unwrap()
+            .with_arguments(arguments)
+            .start()
+            .unwrap();
+    match session.stop_within(Duration::ZERO) {
+        Err(pulith::process::SessionError::StopTimedOut { .. }) => {
+            assert!(matches!(session.wait().unwrap(), ProcessEnd::Exited { .. }));
+        }
+        Ok(ProcessEnd::Stopped { .. }) => {
+            assert!(matches!(
+                session.poll_exit().unwrap(),
+                ProcessObservation::Exited(_)
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -352,7 +384,10 @@ fn output_process_stages_tree_before_local_apply() {
     );
     acquired
         .tree
-        .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
+        .publish(
+            pulith::local::LocalPath::new(target.clone()).unwrap(),
+            pulith::local::TreeAdmission::Absent,
+        )
         .unwrap();
     assert_eq!(std::fs::read(target.join("bin/tool")).unwrap(), b"pulith");
 }
@@ -478,6 +513,33 @@ fn capture_cap_zero_disables_capture() {
     assert_eq!(current.cap, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn capture_reports_the_child_stream_even_if_workspace_names_change() {
+    use pulith::process::{Arg, OutputPath, OutputProcess};
+
+    let root = common::temp_dir();
+    let script = "printf 'actual stdout'; printf 'actual stderr' >&2; \
+        printf 'another file' > stdout.log; printf 'another file' > stderr.log; \
+        mkdir -p \"$PULITH_OUTPUT_ROOT\"";
+    let process = OutputProcess::new(
+        "/bin/sh",
+        OutputPath::new("tree").unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .with_arguments([Arg::Literal("-c".into()), Arg::Literal(script.into())]);
+    let result = acquire(root.path(), process).unwrap();
+    assert_eq!(
+        result.diagnostics.stdout.as_deref(),
+        Some(b"actual stdout".as_slice())
+    );
+    assert_eq!(
+        result.diagnostics.stderr.as_deref(),
+        Some(b"actual stderr".as_slice())
+    );
+}
+
 #[test]
 fn timeout_kills_direct_child_and_leaves_final_target_untouched() {
     let _guard = common::process_fixture_guard();
@@ -496,7 +558,9 @@ fn timeout_stops_descendant_and_carries_captured_diagnostics() {
     let action = fixture_process(Fixture::SpawnsDescendant, "tree", Duration::from_secs(10))
         .with_environment(marker_environment(&marker));
 
-    let result = action.prepare().and_then(Acquire::acquire);
+    let result = action
+        .prepare()
+        .and_then(pulith::process::PreparedProcess::execute);
 
     match result {
         Err(RunError::TimedOut { diagnostics, .. }) => {
@@ -558,7 +622,7 @@ fn cancel_stops_descendant_and_returns_cancelled_with_captured_diagnostics() {
 
     let result = action
         .prepare()
-        .and_then(|prepared| prepared.acquire_cancellable(&token));
+        .and_then(|prepared| prepared.execute_cancellable(&token));
 
     canceler.join().unwrap();
 
@@ -601,7 +665,7 @@ fn pre_cancelled_token_fails_fast_without_spawning() {
     let result = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_capture_cap(4096)
         .prepare()
-        .and_then(|prepared| prepared.acquire_cancellable(&token));
+        .and_then(|prepared| prepared.execute_cancellable(&token));
 
     match result {
         Err(RunError::Cancelled { diagnostics, .. }) => {
@@ -628,7 +692,10 @@ fn staged_input_is_reachable_with_exact_bytes_via_input_root() {
     let acquired = acquire(root.path(), action).unwrap();
     acquired
         .tree
-        .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
+        .publish(
+            pulith::local::LocalPath::new(target.clone()).unwrap(),
+            pulith::local::TreeAdmission::Absent,
+        )
         .unwrap();
     assert_eq!(
         std::fs::read(target.join("file.txt")).unwrap(),
@@ -650,7 +717,10 @@ fn structured_argument_can_reference_a_staged_input() {
     let acquired = acquire(root.path(), action).unwrap();
     acquired
         .tree
-        .publish(pulith::local::LocalTarget::new(target.clone()).unwrap())
+        .publish(
+            pulith::local::LocalPath::new(target.clone()).unwrap(),
+            pulith::local::TreeAdmission::Absent,
+        )
         .unwrap();
     assert_eq!(
         std::fs::read(target.join("arg-file.txt")).unwrap(),
@@ -668,7 +738,9 @@ fn missing_declared_input_fails_pre_spawn_and_keeps_target_missing() {
     let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_inputs([StagedInput::new(&missing, "nope.txt").unwrap()]);
 
-    let result = action.prepare().and_then(Acquire::acquire);
+    let result = action
+        .prepare()
+        .and_then(pulith::process::PreparedProcess::execute);
 
     match result {
         Err(RunError::InputMissing { path }) => assert_eq!(path, missing),
@@ -686,7 +758,7 @@ fn non_regular_declared_input_fails_pre_spawn() {
     let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
         .with_inputs([StagedInput::new(&directory, "input").unwrap()]);
     assert!(matches!(
-        action.prepare().and_then(Acquire::acquire),
+        action.prepare().and_then(pulith::process::PreparedProcess::execute),
         Err(RunError::InputWrongKind { path }) if path == directory
     ));
 
@@ -697,7 +769,7 @@ fn non_regular_declared_input_fails_pre_spawn() {
         let action = fixture_process(Fixture::Success, "tree", Duration::from_secs(30))
             .with_inputs([StagedInput::new(&link, "input").unwrap()]);
         assert!(matches!(
-            action.prepare().and_then(Acquire::acquire),
+            action.prepare().and_then(pulith::process::PreparedProcess::execute),
             Err(RunError::InputWrongKind { path }) if path == link
         ));
     }
@@ -718,7 +790,9 @@ fn colliding_staged_names_fail_pre_spawn() {
         StagedInput::new(&second, "same").unwrap(),
     ]);
 
-    let result = action.prepare().and_then(Acquire::acquire);
+    let result = action
+        .prepare()
+        .and_then(pulith::process::PreparedProcess::execute);
 
     match result {
         Err(RunError::InputCollision { name }) => assert_eq!(name, "same"),

@@ -11,10 +11,9 @@
 //! group (Unix) or breaks away from the job (Windows) is outside the claim. No sandbox, namespace,
 //! cgroup, resource-limit, or network-isolation guarantee is made.
 //!
-//! Standard output and error are captured with a caller-configurable byte cap. The synchronous
-//! adapter drains workspace files after exit; the Tokio adapter concurrently drains pipes while
-//! retaining only the cap, so a noisy child cannot fill a pipe or grow retained memory without
-//! bound.
+//! Standard output and error are redirected to workspace files. After exit, the adapter reads
+//! back at most the caller-configurable byte cap per stream. The cap bounds returned diagnostics;
+//! the files can grow while the process runs. A cap of zero sends both streams to the null device.
 //! Captured diagnostics are payload, not safe-facts attestation; they are never rendered in
 //! [`fmt::Display`] error text and never copied into [`OutputEvidence`].
 //!
@@ -32,7 +31,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -45,8 +44,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::local::{LocalObservation, LocalTarget, StagedTree};
-use crate::{Acquire, Inspect};
+use crate::local::{LocalObservation, LocalPath, StagedTree};
 
 const OUTPUT_ENV: &str = "PULITH_OUTPUT_ROOT";
 const INPUT_ENV: &str = "PULITH_INPUT_ROOT";
@@ -240,17 +238,24 @@ impl ManagedProcess {
     }
 
     fn spawn(self, command: &mut Command) -> Result<ProcessSession, SessionError> {
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_SUSPENDED);
-        let started = Instant::now();
-        let child = command.spawn().map_err(|source| SessionError::Spawn {
-            program: self.program.clone(),
-            source,
+        let SpawnedProcess {
+            child,
+            started,
+            #[cfg(windows)]
+            job,
+        } = spawn_process(command).map_err(|error| match error {
+            SpawnProcessError::Spawn(source) => SessionError::Spawn {
+                program: self.program.clone(),
+                source,
+            },
+            #[cfg(windows)]
+            SpawnProcessError::CapabilityUnavailable(source) => {
+                SessionError::CapabilityUnavailable {
+                    program: self.program.clone(),
+                    source,
+                }
+            }
         })?;
-        #[cfg(windows)]
-        let (child, job) = managed_job(child, &self.program)?;
         Ok(ProcessSession {
             child,
             #[cfg(windows)]
@@ -262,25 +267,47 @@ impl ManagedProcess {
     }
 }
 
-#[cfg(windows)]
-fn managed_job(
-    mut child: std::process::Child,
-    program: &Path,
-) -> Result<(std::process::Child, JobHandle), SessionError> {
-    let job = assign_to_job(child.id()).map_err(|source| {
-        let _ = child.kill();
-        let _ = child.wait();
-        SessionError::CapabilityUnavailable {
-            program: program.to_path_buf(),
-            source,
-        }
-    })?;
-    Ok((child, job))
+struct SpawnedProcess {
+    child: std::process::Child,
+    started: Instant,
+    #[cfg(windows)]
+    job: JobHandle,
+}
+
+enum SpawnProcessError {
+    Spawn(io::Error),
+    #[cfg(windows)]
+    CapabilityUnavailable(io::Error),
+}
+
+fn spawn_process(command: &mut Command) -> Result<SpawnedProcess, SpawnProcessError> {
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_SUSPENDED);
+    let started = Instant::now();
+    let child = command.spawn().map_err(SpawnProcessError::Spawn)?;
+    #[cfg(windows)]
+    let (child, job) = {
+        let mut child = child;
+        let job = assign_to_job(child.id()).map_err(|source| {
+            let _ = child.kill();
+            let _ = child.wait();
+            SpawnProcessError::CapabilityUnavailable(source)
+        })?;
+        (child, job)
+    };
+    Ok(SpawnedProcess {
+        child,
+        started,
+        #[cfg(windows)]
+        job,
+    })
 }
 
 impl ProcessSession {
     /// Observes the child without consuming a running session.
-    pub fn observe(&mut self) -> Result<ProcessObservation, SessionError> {
+    pub fn poll_exit(&mut self) -> Result<ProcessObservation, SessionError> {
         match self
             .child
             .try_wait()
@@ -308,7 +335,10 @@ impl ProcessSession {
     }
 
     /// Stops the admitted tree and waits no longer than the caller's deadline for reaping.
-    pub fn stop_within(mut self, deadline: Duration) -> Result<ProcessEnd, SessionError> {
+    ///
+    /// The caller retains the session on timeout and can retry or wait. Dropping an unresolved
+    /// session performs synchronous cleanup.
+    pub fn stop_within(&mut self, deadline: Duration) -> Result<ProcessEnd, SessionError> {
         self.stop_tree();
         let stop_started = Instant::now();
         loop {
@@ -323,13 +353,14 @@ impl ProcessSession {
                     elapsed: self.started.elapsed(),
                 });
             }
-            if stop_started.elapsed() >= deadline {
+            let remaining = deadline.saturating_sub(stop_started.elapsed());
+            if remaining.is_zero() {
                 return Err(SessionError::StopTimedOut {
                     program: self.program.clone(),
                     deadline,
                 });
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 
@@ -705,8 +736,8 @@ impl OutputProcess {
 
     /// Bounds each captured stream to `cap` bytes at read time.
     ///
-    /// The cap bounds retained memory; both adapters continue draining bytes beyond it to avoid
-    /// blocking the child. `cap = 0` disables capture entirely. Defaults to 1 MiB per stream.
+    /// The cap bounds returned bytes. The capture files can grow during execution unless
+    /// `cap = 0`, which discards both streams. Defaults to 1 MiB per stream.
     pub fn with_capture_cap(mut self, cap: usize) -> Self {
         self.capture_cap = cap;
         self
@@ -816,7 +847,7 @@ impl Diagnostics {
 /// Caller-owned cancellation signal for one process.
 ///
 /// The token is sticky (once cancelled it stays cancelled), `Send + Sync`, and carries no data
-/// beyond the cancelled bit. [`PreparedProcess::acquire_cancellable`] polls it once per wait-loop
+/// beyond the cancelled bit. [`PreparedProcess::execute_cancellable`] polls it once per wait-loop
 /// tick and stops the admitted tree via the frozen tree-stop path; a token already cancelled at
 /// entry fails fast before the program spawns. Cancellation is the caller's explicit stop request
 /// and is never confused with a timeout: it surfaces as [`RunError::Cancelled`].
@@ -1106,10 +1137,6 @@ impl std::error::Error for RunError {
 /// The material and evidence returned by a successful process realization: the adapter-owned
 /// [`StagedTree`] custody, the safe-facts [`OutputEvidence`], and the capped captured
 /// diagnostics (payload, never part of the safe facts).
-type ProcessAcquiredOutput = OutputResult;
-
-type WorktreeExecutedOutput = WorktreeResult;
-
 struct WorktreeExecution {
     session: ChildSession,
     program: PathBuf,
@@ -1126,7 +1153,7 @@ struct PrivateExecution {
 }
 
 impl PrivateExecution {
-    fn wait(self) -> Result<ProcessAcquiredOutput, RunError> {
+    fn wait(self) -> Result<OutputResult, RunError> {
         let PrivateExecution {
             session,
             workspace,
@@ -1140,7 +1167,7 @@ impl PrivateExecution {
         }
     }
 
-    fn wait_cancellable(self, cancel: &CancelToken) -> Result<ProcessAcquiredOutput, RunError> {
+    fn wait_cancellable(self, cancel: &CancelToken) -> Result<OutputResult, RunError> {
         let PrivateExecution {
             session,
             workspace,
@@ -1160,7 +1187,7 @@ impl PrivateExecution {
         output: OutputPath,
         program: PathBuf,
         completion: ChildCompletion,
-    ) -> Result<ProcessAcquiredOutput, RunError> {
+    ) -> Result<OutputResult, RunError> {
         if !completion.status.success() {
             return fail_cleanup(
                 workspace,
@@ -1172,12 +1199,11 @@ impl PrivateExecution {
             );
         }
         let diagnostics = completion.diagnostics;
-        let observation = match Inspect::inspect(
-            LocalTarget::new(selected_output.clone())
-                .expect("a selected output path is always a nonempty contained workspace path"),
-            (),
-        ) {
-            Ok((observation, _)) => observation,
+        let observation = match LocalPath::new(&selected_output)
+            .expect("a selected output path is always a nonempty contained workspace path")
+            .inspect_entry()
+        {
+            Ok(observation) => observation,
             Err(source) => {
                 return fail_cleanup(
                     workspace,
@@ -1221,7 +1247,7 @@ impl PrivateExecution {
 }
 
 impl WorktreeExecution {
-    fn wait(self) -> Result<WorktreeExecutedOutput, RunError> {
+    fn wait(self) -> Result<WorktreeResult, RunError> {
         let WorktreeExecution {
             session,
             program,
@@ -1231,7 +1257,7 @@ impl WorktreeExecution {
         Self::finish(program, working_dir, session.wait()?)
     }
 
-    fn wait_cancellable(self, cancel: &CancelToken) -> Result<WorktreeExecutedOutput, RunError> {
+    fn wait_cancellable(self, cancel: &CancelToken) -> Result<WorktreeResult, RunError> {
         let WorktreeExecution {
             session,
             program,
@@ -1245,7 +1271,7 @@ impl WorktreeExecution {
         program: PathBuf,
         working_dir: PathBuf,
         completion: ChildCompletion,
-    ) -> Result<WorktreeExecutedOutput, RunError> {
+    ) -> Result<WorktreeResult, RunError> {
         if !completion.status.success() {
             return Err(RunError::ExitedNonZero {
                 program,
@@ -1271,8 +1297,54 @@ struct ChildSession {
     program: PathBuf,
     timeout: Duration,
     started: Instant,
-    capture_root: PathBuf,
-    capture_cap: usize,
+    capture: Capture,
+}
+
+struct Capture {
+    stdout: Option<File>,
+    stderr: Option<File>,
+    cap: usize,
+}
+
+impl Capture {
+    fn attach(command: &mut Command, root: &Path, cap: usize) -> io::Result<Self> {
+        if cap == 0 {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            return Ok(Self {
+                stdout: None,
+                stderr: None,
+                cap,
+            });
+        }
+        let stdout = tempfile::tempfile_in(root)?;
+        let stderr = tempfile::tempfile_in(root)?;
+        command
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?);
+        Ok(Self {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            cap,
+        })
+    }
+
+    fn read(&self) -> Diagnostics {
+        let (stdout, stdout_truncated) = self
+            .stdout
+            .as_ref()
+            .map_or((None, false), |file| read_capped(file, self.cap));
+        let (stderr, stderr_truncated) = self
+            .stderr
+            .as_ref()
+            .map_or((None, false), |file| read_capped(file, self.cap));
+        Diagnostics {
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            cap: self.cap,
+        }
+    }
 }
 
 struct ChildCompletion {
@@ -1294,52 +1366,34 @@ impl ChildSession {
         capture_root: &Path,
         capture_cap: usize,
     ) -> Result<Self, RunError> {
-        if capture_cap > 0 {
-            let stdout = File::create(capture_root.join("stdout.log"));
-            let stderr = File::create(capture_root.join("stderr.log"));
-            match (stdout, stderr) {
-                (Ok(stdout), Ok(stderr)) => {
-                    command.stdout(stdout).stderr(stderr);
-                }
-                (stdout, stderr) => {
-                    let source = match (stdout, stderr) {
-                        (Err(source), _) | (_, Err(source)) => source,
-                        _ => unreachable!(),
-                    };
-                    return Err(RunError::Spawn {
-                        program: program.to_path_buf(),
-                        source,
-                        diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
-                    });
-                }
+        let capture = Capture::attach(command, capture_root, capture_cap).map_err(|source| {
+            RunError::Spawn {
+                program: program.to_path_buf(),
+                source,
+                diagnostics: Box::new(Diagnostics {
+                    cap: capture_cap,
+                    ..Diagnostics::disabled()
+                }),
             }
-        } else {
-            command.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_SUSPENDED);
-        let started = Instant::now();
-        let child = command.spawn().map_err(|source| RunError::Spawn {
-            program: program.to_path_buf(),
-            source,
-            diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
         })?;
-        #[cfg(windows)]
-        let (child, job) = {
-            let mut child = child;
-            let job = assign_to_job(child.id()).map_err(|source| {
-                let _ = child.kill();
-                let _ = child.wait();
-                RunError::CapabilityUnavailable {
-                    program: program.to_path_buf(),
-                    source,
-                    diagnostics: Box::new(read_diagnostics(capture_root, capture_cap)),
-                }
-            })?;
-            (child, job)
-        };
+        let SpawnedProcess {
+            child,
+            started,
+            #[cfg(windows)]
+            job,
+        } = spawn_process(command).map_err(|error| match error {
+            SpawnProcessError::Spawn(source) => RunError::Spawn {
+                program: program.to_path_buf(),
+                source,
+                diagnostics: Box::new(capture.read()),
+            },
+            #[cfg(windows)]
+            SpawnProcessError::CapabilityUnavailable(source) => RunError::CapabilityUnavailable {
+                program: program.to_path_buf(),
+                source,
+                diagnostics: Box::new(capture.read()),
+            },
+        })?;
         Ok(Self {
             child,
             #[cfg(windows)]
@@ -1347,8 +1401,7 @@ impl ChildSession {
             program: program.to_path_buf(),
             timeout,
             started,
-            capture_root: capture_root.to_path_buf(),
-            capture_cap,
+            capture,
         })
     }
 
@@ -1425,29 +1478,23 @@ impl ChildSession {
     }
 
     fn diagnostics(&self) -> Diagnostics {
-        read_diagnostics(&self.capture_root, self.capture_cap)
+        self.capture.read()
     }
 }
 
 impl WorktreeProcess {
     /// Executes the admitted program in its existing caller-owned worktree.
-    pub fn execute(self) -> Result<WorktreeExecutedOutput, RunError> {
+    pub fn execute(self) -> Result<WorktreeResult, RunError> {
         start_worktree(self)?.wait()
     }
 
     /// Executes with only the admitted environment entries instead of inheriting the caller.
-    pub fn execute_in_environment(
-        self,
-        environment: EnvVars,
-    ) -> Result<WorktreeExecutedOutput, RunError> {
+    pub fn execute_in_environment(self, environment: EnvVars) -> Result<WorktreeResult, RunError> {
         start_worktree_in_environment(self, environment)?.wait()
     }
 
     /// Runs in the admitted caller worktree and stops the admitted tree when cancelled.
-    pub fn execute_cancellable(
-        self,
-        cancel: &CancelToken,
-    ) -> Result<WorktreeExecutedOutput, RunError> {
+    pub fn execute_cancellable(self, cancel: &CancelToken) -> Result<WorktreeResult, RunError> {
         if cancel.is_cancelled() {
             return Err(RunError::Cancelled {
                 program: self.program,
@@ -1462,7 +1509,7 @@ impl WorktreeProcess {
         self,
         environment: EnvVars,
         cancel: &CancelToken,
-    ) -> Result<WorktreeExecutedOutput, RunError> {
+    ) -> Result<WorktreeResult, RunError> {
         if cancel.is_cancelled() {
             return Err(RunError::Cancelled {
                 program: self.program,
@@ -1538,27 +1585,18 @@ fn start_worktree_command(
     })
 }
 
-impl Acquire for PreparedProcess {
-    type Error = RunError;
-    type Output = ProcessAcquiredOutput;
-
-    fn acquire(self) -> Result<Self::Output, Self::Error> {
+impl PreparedProcess {
+    /// Runs the process to completion and takes custody of its output.
+    pub fn execute(self) -> Result<OutputResult, RunError> {
         self.start()?.wait()
     }
-}
 
-impl PreparedProcess {
     /// Runs one cooperative process to staged-tree custody, stopping the admitted tree when the
     /// caller's token is set (sticky; polled once per wait-loop tick).
     ///
-    /// Prefer the trait's [`Acquire::acquire`] for token-free calls; this inherent entry exists so
-    /// the caller can stop a long realization without waiting for the timeout. Cancellation
-    /// reuses the frozen tree-stop path and surfaces as [`RunError::Cancelled`], never as
+    /// Cancellation surfaces as [`RunError::Cancelled`], never as
     /// [`RunError::TimedOut`].
-    pub fn acquire_cancellable(
-        self,
-        cancel: &CancelToken,
-    ) -> Result<ProcessAcquiredOutput, RunError> {
+    pub fn execute_cancellable(self, cancel: &CancelToken) -> Result<OutputResult, RunError> {
         if cancel.is_cancelled() {
             return Err(RunError::Cancelled {
                 program: self.program,
@@ -1605,9 +1643,9 @@ fn stage_inputs(workspace: &Path, inputs: &[StagedInput]) -> Result<(), RunError
                 name: spec.name.clone(),
             });
         }
-        admit_staged_source(&spec.source)?;
+        let file = open_staged_source(&spec.source)?;
         let destination = input_root.join(&spec.name);
-        if let Err(source) = std::fs::copy(&spec.source, &destination) {
+        if let Err(source) = crate::local::copy_open_file(file, &destination) {
             return Err(RunError::InputStaging {
                 path: destination,
                 source,
@@ -1617,36 +1655,27 @@ fn stage_inputs(workspace: &Path, inputs: &[StagedInput]) -> Result<(), RunError
     Ok(())
 }
 
-fn admit_staged_source(path: &Path) -> Result<(), RunError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(RunError::InputMissing {
-                path: path.to_path_buf(),
-            });
-        }
-        Err(source) => {
-            return Err(RunError::InputStaging {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    #[cfg(windows)]
-    let reparse = {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-    };
-    #[cfg(unix)]
-    let reparse = false;
-    if !metadata.file_type().is_file() || reparse {
-        return Err(RunError::InputWrongKind {
+fn open_staged_source(path: &Path) -> Result<crate::local::OpenedFile, RunError> {
+    use crate::local::{LocalError, LocalPath};
+
+    let source = LocalPath::new(path).and_then(|target| target.open_file());
+    match source {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => Err(RunError::InputMissing {
             path: path.to_path_buf(),
-        });
+        }),
+        Err(LocalError::NotRegularFile { .. }) => Err(RunError::InputWrongKind {
+            path: path.to_path_buf(),
+        }),
+        Err(LocalError::Io { source, .. }) => Err(RunError::InputStaging {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(error) => Err(RunError::InputStaging {
+            path: path.to_path_buf(),
+            source: io::Error::other(error),
+        }),
     }
-    Ok(())
 }
 
 fn resolve_argument(argument: &Arg, workspace: &Path, output: &Path) -> OsString {
@@ -1773,36 +1802,34 @@ fn assign_to_job(pid: u32) -> io::Result<JobHandle> {
     }
 }
 
-/// Reads the workspace diagnostic files under the per-stream cap.
-fn read_diagnostics(workspace: &Path, cap: usize) -> Diagnostics {
-    if cap == 0 {
-        return Diagnostics::disabled();
-    }
-    let (stdout, stdout_truncated) = read_capped(&workspace.join("stdout.log"), cap);
-    let (stderr, stderr_truncated) = read_capped(&workspace.join("stderr.log"), cap);
-    Diagnostics {
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-        cap,
-    }
-}
-
 /// Reads at most `cap` bytes from one diagnostic file.
 ///
 /// A read failure yields `(None, false)`: capture is best-effort after the outcome decision and
 /// must never turn a successful acquisition into a failure.
-fn read_capped(path: &Path, cap: usize) -> (Option<Vec<u8>>, bool) {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return (None, false),
+fn read_capped(file: &File, cap: usize) -> (Option<Vec<u8>>, bool) {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+
+    let read_at = |bytes: &mut [u8], offset| {
+        #[cfg(unix)]
+        return file.read_at(bytes, offset);
+        #[cfg(windows)]
+        return file.seek_read(bytes, offset);
     };
-    let length = file.metadata().map(|meta| meta.len() as usize).unwrap_or(0);
-    let truncated = length > cap;
-    let mut buffer = vec![0u8; length.min(cap)];
-    let read = file.read(&mut buffer).unwrap_or(0);
-    buffer.truncate(read);
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 8192];
+    while buffer.len() < cap {
+        let size = chunk.len().min(cap - buffer.len());
+        match read_at(&mut chunk[..size], buffer.len() as u64) {
+            Ok(0) => return (Some(buffer), false),
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return (None, false),
+        }
+    }
+    let truncated = read_at(&mut chunk[..1], buffer.len() as u64).is_ok_and(|read| read != 0);
     (Some(buffer), truncated)
 }
 

@@ -3,8 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pulith::local::{LinkChange, LinkError, LocalSource, LocalTarget};
-use pulith::{Acquire, Link};
+use pulith::local::{LinkChange, LinkError, LocalPath};
 
 /// Publish a versioned tree with a `bin/tool` subpath and return the target path.
 fn publish_tree_with_bin(root: &Path, version: &str, bytes: &[u8]) -> PathBuf {
@@ -14,11 +13,14 @@ fn publish_tree_with_bin(root: &Path, version: &str, bytes: &[u8]) -> PathBuf {
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(source.join("bin/tool"), bytes).unwrap();
 
-    let material = LocalSource::new(source.clone()).unwrap().acquire().unwrap();
-    let admitted = LocalTarget::new(target.clone()).unwrap();
+    let material = LocalPath::new(source.clone()).unwrap();
+    let admitted = LocalPath::new(target.clone()).unwrap();
     let stage = admitted.stage().unwrap();
-    let tree = material.prepare(stage).unwrap();
-    tree.publish(admitted).unwrap();
+    let tree = stage
+        .copy_tree(material, std::path::PathBuf::new())
+        .unwrap();
+    tree.publish(admitted, pulith::local::TreeAdmission::Absent)
+        .unwrap();
     target
 }
 
@@ -29,9 +31,9 @@ fn link_creates_the_view_parent_and_exposes_the_subpath() {
     let view = root.path().join("views/demo-tool");
 
     // No views/ parent exists: the link law creates it.
-    let evidence = LocalTarget::new(target.clone())
+    let evidence = LocalPath::new(target.clone())
         .unwrap()
-        .link(&view, Path::new("bin"))
+        .link_view(&view, Some(Path::new("bin")))
         .unwrap();
 
     assert_eq!(evidence.change, LinkChange::Created);
@@ -51,9 +53,9 @@ fn link_root_exposes_the_tree_root() {
     let target = publish_tree_with_bin(root.path(), "1.0.0", b"tool-bytes\n");
     let view = root.path().join("views/demo-tool");
 
-    let evidence = LocalTarget::new(target.clone())
+    let evidence = LocalPath::new(target.clone())
         .unwrap()
-        .link_root(&view)
+        .link_view(&view, None)
         .unwrap();
 
     assert_eq!(evidence.change, LinkChange::Created);
@@ -65,15 +67,15 @@ fn link_auto_switches_an_occupied_directory_symlink_view() {
     let root = tempfile::tempdir().unwrap();
     let view = root.path().join("views/demo-tool");
     let first = publish_tree_with_bin(root.path(), "1.0.0", b"v1\n");
-    LocalTarget::new(first.clone())
+    LocalPath::new(first.clone())
         .unwrap()
-        .link(&view, Path::new("bin"))
+        .link_view(&view, Some(Path::new("bin")))
         .unwrap();
 
     let second = publish_tree_with_bin(root.path(), "2.0.0", b"v2\n");
-    let evidence = LocalTarget::new(second.clone())
+    let evidence = LocalPath::new(second.clone())
         .unwrap()
-        .link(&view, Path::new("bin"))
+        .link_view(&view, Some(Path::new("bin")))
         .unwrap();
 
     assert_eq!(evidence.change, LinkChange::Replaced);
@@ -89,9 +91,9 @@ fn link_rejects_an_escaping_expose() {
     let target = publish_tree_with_bin(root.path(), "1.0.0", b"tool-bytes\n");
     let view = root.path().join("views/demo-tool");
 
-    let error = LocalTarget::new(target)
+    let error = LocalPath::new(target)
         .unwrap()
-        .link(&view, Path::new(".."))
+        .link_view(&view, Some(Path::new("..")))
         .unwrap_err();
     assert!(matches!(error, LinkError::InvalidExpose { .. }));
     assert!(!view.exists());
@@ -103,9 +105,9 @@ fn link_rejects_a_missing_expose_and_creates_no_view() {
     let target = publish_tree_with_bin(root.path(), "1.0.0", b"tool-bytes\n");
     let view = root.path().join("views/demo-tool");
 
-    let error = LocalTarget::new(target)
+    let error = LocalPath::new(target)
         .unwrap()
-        .link(&view, Path::new("missing"))
+        .link_view(&view, Some(Path::new("missing")))
         .unwrap_err();
 
     assert!(matches!(error, LinkError::ExposeNotDirectory { .. }));
@@ -120,15 +122,17 @@ fn link_rejects_an_occupied_non_symlink_entry() {
     fs::create_dir_all(view.parent().unwrap()).unwrap();
     fs::write(&view, b"existing winner").unwrap();
 
-    let error = LocalTarget::new(target)
+    let error = LocalPath::new(target)
         .unwrap()
-        .link(&view, Path::new("bin"))
+        .link_view(&view, Some(Path::new("bin")))
         .unwrap_err();
 
     assert!(matches!(
         error,
         LinkError::ViewConflict {
-            observed: pulith::local::LocalObservation::File { .. },
+            observed: pulith::local::ViewEntry::Occupied(
+                pulith::local::LocalObservation::File { .. }
+            ),
             ..
         }
     ));

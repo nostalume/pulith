@@ -4,8 +4,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 mod native;
+use super::{LocalEntryKind, entry_kind};
 use native::{
-    Entry, classify, commit, copy_bounded, ensure_stage, inspect, lock_exclusive, reclaim,
+    Entry, classify, commit, copy_bounded, ensure_stage, lock_exclusive, read, reclaim,
     record_path, sync_parent,
 };
 
@@ -25,17 +26,10 @@ impl RecordLimit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Read-only state of one bounded record entry.
-pub enum RecordObservation {
-    /// The missing outcome.
-    Missing,
-    /// The present outcome.
-    Present(Vec<u8>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Path and byte length committed for a record write.
+/// The effect, path and byte length committed for a record write.
 pub struct RecordEvidence {
+    /// The publication branch that completed.
+    pub change: RecordChange,
     /// The path value.
     pub path: PathBuf,
     /// The bytes value.
@@ -163,22 +157,22 @@ impl RecordStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, RecordError> {
         let root = root.into();
         let valid = root.is_absolute()
-            && fs::symlink_metadata(&root)
-                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                .unwrap_or(false);
+            && fs::symlink_metadata(&root).is_ok_and(|metadata| {
+                matches!(entry_kind(&root, &metadata), Ok(LocalEntryKind::Directory))
+            });
         if !valid {
             return Err(RecordError::InvalidStore(root));
         }
         Ok(Self { root })
     }
 
-    /// Observes one record without acquiring an edit lock.
-    pub fn inspect(
+    /// Reads one bounded record without acquiring an edit lock.
+    pub fn read(
         &self,
         name: impl AsRef<Path>,
         limit: RecordLimit,
-    ) -> Result<(RecordObservation, RecordEvidence), RecordError> {
-        inspect(&self.path(name)?, limit)
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        read(&self.path(name)?, limit)
     }
 
     /// Acquires an exclusive edit session for this record store.
@@ -187,7 +181,16 @@ impl RecordStore {
         if matches!(classify(&path)?, Entry::Other) {
             return Err(RecordError::Conflict { path });
         }
-        let lock = OpenOptions::new()
+        let mut options = OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+            // Keep an active lock in its namespace until the edit session releases it.
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let lock = options
             .read(true)
             .write(true)
             .create(true)
@@ -215,12 +218,12 @@ pub struct RecordEdit {
 
 impl RecordEdit {
     /// Observes one record while retaining the exclusive edit session.
-    pub fn inspect(
+    pub fn read(
         &self,
         name: impl AsRef<Path>,
         limit: RecordLimit,
-    ) -> Result<(RecordObservation, RecordEvidence), RecordError> {
-        inspect(&record_path(&self.root, name.as_ref())?, limit)
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        read(&record_path(&self.root, name.as_ref())?, limit)
     }
 
     /// Streams a new record from `source`, rejecting an existing entry or size-limit violation.
@@ -230,7 +233,7 @@ impl RecordEdit {
         limit: RecordLimit,
         source: impl Read,
     ) -> Result<RecordEvidence, RecordError> {
-        self.write(name.as_ref(), limit, source, false)
+        self.write(name.as_ref(), limit, source, RecordAdmission::Absent)
     }
 
     /// Streams a replacement record from `source`, requiring the entry to exist.
@@ -240,7 +243,17 @@ impl RecordEdit {
         limit: RecordLimit,
         source: impl Read,
     ) -> Result<RecordEvidence, RecordError> {
-        self.write(name.as_ref(), limit, source, true)
+        self.write(name.as_ref(), limit, source, RecordAdmission::Present)
+    }
+
+    /// Streams a record, creating an absent entry or replacing an existing regular record.
+    pub fn publish_from(
+        &mut self,
+        name: impl AsRef<Path>,
+        limit: RecordLimit,
+        source: impl Read,
+    ) -> Result<RecordEvidence, RecordError> {
+        self.write(name.as_ref(), limit, source, RecordAdmission::Either)
     }
 
     /// Removes one existing record or reports an unchanged missing entry.
@@ -256,9 +269,6 @@ impl RecordEdit {
                     path: path.clone(),
                     source,
                 })?;
-                if !matches!(classify(&path)?, Entry::Missing) {
-                    return Err(RecordError::Conflict { path });
-                }
                 Ok(RecordChange::Removed)
             }
             Entry::Other => Err(RecordError::Conflict { path }),
@@ -270,13 +280,14 @@ impl RecordEdit {
         name: &Path,
         limit: RecordLimit,
         mut source: impl Read,
-        replace: bool,
+        admission: RecordAdmission,
     ) -> Result<RecordEvidence, RecordError> {
         let target = record_path(&self.root, name)?;
-        match (replace, classify(&target)?) {
-            (false, Entry::Missing) | (true, Entry::File) => {}
+        let replace = match (admission, classify(&target)?) {
+            (RecordAdmission::Absent | RecordAdmission::Either, Entry::Missing) => false,
+            (RecordAdmission::Present | RecordAdmission::Either, Entry::File) => true,
             _ => return Err(RecordError::Conflict { path: target }),
-        }
+        };
         let stage_dir = self.root.join("stage");
         ensure_stage(&stage_dir)?;
         let stage = stage_dir.join(name);
@@ -302,10 +313,16 @@ impl RecordEdit {
             path: target.clone(),
             source,
         })?;
-        let evidence = inspect(&target, limit)?.1;
-        if evidence.bytes != bytes {
-            return Err(RecordError::Conflict { path: target });
-        }
-        Ok(evidence)
+        Ok(RecordEvidence {
+            change,
+            path: target,
+            bytes,
+        })
     }
+}
+
+enum RecordAdmission {
+    Absent,
+    Present,
+    Either,
 }

@@ -2,9 +2,8 @@
 
 use pulith::hash::{ArtifactDescriptor, ArtifactReconciliation, DigestAlgorithmKind, DigestValue};
 #[cfg(feature = "blake3")]
-use pulith::local::{LocalArtifactObservation, LocalEntryKind};
-use pulith::local::{LocalExpectation, LocalObservation, LocalSource, LocalTarget};
-use pulith::{Acquire, Inspect, Reconcile, Verify};
+use pulith::local::{LocalEntryKind, LocalError};
+use pulith::local::{LocalExpectation, LocalObservation, LocalPath};
 
 #[cfg(feature = "blake3")]
 fn blake3_digest(bytes: &[u8]) -> DigestValue {
@@ -24,24 +23,22 @@ fn sha256_digest(bytes: &[u8]) -> DigestValue {
 
 #[cfg(feature = "blake3")]
 #[test]
-fn blake3_verify_path_proves_the_declared_digest() {
+fn blake3_snapshot_verified_proves_the_declared_digest() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"pulith").unwrap();
     let expected = blake3_digest(b"pulith");
 
-    let (_, evidence) = LocalSource::new(path.clone())
+    let (_, evidence) = LocalPath::new(path.clone())
         .unwrap()
-        .acquire()
+        .open_file()
         .unwrap()
-        .verify(expected.clone())
+        .unwrap()
+        .snapshot_verified(&expected)
         .unwrap();
-    assert_eq!(evidence.algorithm, DigestAlgorithmKind::Blake3);
-    assert_eq!(evidence.expected, expected);
-    assert_eq!(
-        evidence.observed.as_str(),
-        blake3_digest(b"pulith").as_str()
-    );
+    assert_eq!(evidence.digest.algorithm(), DigestAlgorithmKind::Blake3);
+    assert_eq!(evidence.digest, expected);
+    assert_eq!(evidence.digest.as_str(), blake3_digest(b"pulith").as_str());
     assert_eq!(std::fs::read(&path).unwrap(), b"pulith");
 }
 
@@ -58,14 +55,15 @@ fn exact_inspection_and_reconciliation_use_the_digest_need() {
     )
     .unwrap();
 
-    let (observation, evidence) = LocalTarget::new(path)
+    let observation = LocalPath::new(path)
         .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
+        .open_file()
+        .unwrap()
+        .unwrap()
+        .digest(DigestAlgorithmKind::Blake3)
         .unwrap();
-    assert_eq!(evidence.algorithm, DigestAlgorithmKind::Blake3);
-    let (reconciliation, receipt) = observation.reconcile(expected.clone()).unwrap();
+    let reconciliation = observation.compare(&expected);
     assert_eq!(reconciliation, ArtifactReconciliation::Matches);
-    assert_eq!(receipt.expected, expected);
 }
 
 #[cfg(feature = "blake3")]
@@ -75,20 +73,21 @@ fn exact_inspection_classifies_same_size_content_drift() {
     let path = root.path().join("artifact");
     std::fs::write(&path, b"PULITH").unwrap();
 
-    let (observation, _) = LocalTarget::new(path)
+    let observation = LocalPath::new(path)
         .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
+        .open_file()
+        .unwrap()
+        .unwrap()
+        .digest(DigestAlgorithmKind::Blake3)
         .unwrap();
-    let (reconciliation, _) = observation
-        .reconcile(
-            ArtifactDescriptor::new(
-                DigestAlgorithmKind::Blake3,
-                blake3::hash(b"pulith").to_hex().to_string(),
-                6,
-            )
-            .unwrap(),
+    let reconciliation = observation.compare(
+        &ArtifactDescriptor::new(
+            DigestAlgorithmKind::Blake3,
+            blake3::hash(b"pulith").to_hex().to_string(),
+            6,
         )
-        .unwrap();
+        .unwrap(),
+    );
     assert!(matches!(
         reconciliation,
         ArtifactReconciliation::DigestMismatch { .. }
@@ -102,20 +101,21 @@ fn exact_inspection_reconciles_unequal_bytes_as_size_mismatch() {
     let path = root.path().join("artifact");
     std::fs::write(&path, b"longer").unwrap();
 
-    let (observation, _) = LocalTarget::new(path)
+    let observation = LocalPath::new(path)
         .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
+        .open_file()
+        .unwrap()
+        .unwrap()
+        .digest(DigestAlgorithmKind::Blake3)
         .unwrap();
-    let (reconciliation, _) = observation
-        .reconcile(
-            ArtifactDescriptor::new(
-                DigestAlgorithmKind::Blake3,
-                blake3::hash(b"short").to_hex().to_string(),
-                5,
-            )
-            .unwrap(),
+    let reconciliation = observation.compare(
+        &ArtifactDescriptor::new(
+            DigestAlgorithmKind::Blake3,
+            blake3::hash(b"short").to_hex().to_string(),
+            5,
         )
-        .unwrap();
+        .unwrap(),
+    );
     assert_eq!(
         reconciliation,
         ArtifactReconciliation::SizeMismatch {
@@ -127,81 +127,44 @@ fn exact_inspection_reconciles_unequal_bytes_as_size_mismatch() {
 
 #[cfg(feature = "blake3")]
 #[test]
-fn exact_inspection_reports_missing_and_directory() {
+fn open_distinguishes_missing_directory_and_symlink_before_digest() {
     let root = tempfile::tempdir().unwrap();
-    let expected = ArtifactDescriptor::new(
-        DigestAlgorithmKind::Blake3,
-        blake3::hash(b"expected").to_hex().to_string(),
-        8,
-    )
-    .unwrap();
+    let missing = LocalPath::new(root.path().join("missing")).unwrap();
+    assert!(missing.open_file().unwrap().is_none());
+    assert!(matches!(
+        LocalPath::new(root.path()).unwrap().open_file(),
+        Err(LocalError::NotRegularFile {
+            kind: LocalEntryKind::Directory,
+            ..
+        })
+    ));
 
-    let (missing, _) = LocalTarget::new(root.path().join("missing"))
-        .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
-        .unwrap();
-    assert_eq!(missing, LocalArtifactObservation::Missing);
-    assert_eq!(
-        missing.reconcile(expected.clone()).unwrap().0,
-        ArtifactReconciliation::Missing
-    );
-
-    let (directory, _) = LocalTarget::new(root.path().to_path_buf())
-        .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
-        .unwrap();
-    assert_eq!(
-        directory.reconcile(expected).unwrap().0,
-        ArtifactReconciliation::WrongKind {
-            observed: LocalEntryKind::Directory,
-        }
-    );
-}
-
-#[cfg(feature = "blake3")]
-#[test]
-fn exact_inspection_does_not_follow_final_symlinks() {
-    let root = tempfile::tempdir().unwrap();
     let target = root.path().join("target");
     let link = root.path().join("link");
     std::fs::write(&target, b"secret").unwrap();
     crate::common::file_symlink(&target, &link).unwrap();
-
-    let (observation, _) = LocalTarget::new(link)
-        .unwrap()
-        .inspect(DigestAlgorithmKind::Blake3)
-        .unwrap();
-    assert_eq!(observation, LocalArtifactObservation::Symlink);
-    assert_eq!(
-        observation
-            .reconcile(
-                ArtifactDescriptor::new(
-                    DigestAlgorithmKind::Blake3,
-                    blake3::hash(b"secret").to_hex().to_string(),
-                    6,
-                )
-                .unwrap()
-            )
-            .unwrap()
-            .0,
-        ArtifactReconciliation::WrongKind {
-            observed: LocalEntryKind::Symlink,
-        }
-    );
+    assert!(matches!(
+        LocalPath::new(link).unwrap().open_file(),
+        Err(LocalError::NotRegularFile {
+            kind: LocalEntryKind::Symlink,
+            ..
+        })
+    ));
 }
 
 #[cfg(feature = "blake3")]
 #[test]
-fn blake3_verify_path_rejects_content_drift() {
+fn blake3_snapshot_verified_rejects_content_drift() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"PULITH").unwrap();
 
-    let error = LocalSource::new(path)
+    let error = LocalPath::new(path)
         .unwrap()
-        .acquire()
+        .open_file()
         .unwrap()
-        .verify(blake3_digest(b"pulith"))
+        .unwrap()
+        .snapshot_verified(&blake3_digest(b"pulith"))
         .unwrap_err();
     assert!(matches!(
         error,
@@ -211,23 +174,32 @@ fn blake3_verify_path_rejects_content_drift() {
 
 #[cfg(feature = "sha2")]
 #[test]
-fn sha256_verify_path_proves_the_declared_digest() {
+fn sha256_snapshot_verified_proves_the_declared_digest() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("artifact");
     std::fs::write(&path, b"pulith").unwrap();
     let expected = sha256_digest(b"pulith");
 
-    let (_, evidence) = LocalSource::new(path)
+    let (_, evidence) = LocalPath::new(path)
         .unwrap()
-        .acquire()
+        .open_file()
         .unwrap()
-        .verify(expected)
+        .unwrap()
+        .snapshot_verified(&expected)
         .unwrap();
-    assert_eq!(evidence.algorithm, DigestAlgorithmKind::Sha256);
-    assert_eq!(
-        evidence.observed.as_str(),
-        sha256_digest(b"pulith").as_str()
-    );
+    assert_eq!(evidence.digest.algorithm(), DigestAlgorithmKind::Sha256);
+    assert_eq!(evidence.digest.as_str(), sha256_digest(b"pulith").as_str());
+}
+
+#[cfg(all(feature = "blake3", feature = "sha2"))]
+#[test]
+fn exact_reconciliation_compares_algorithm_as_well_as_hex() {
+    let observed = ArtifactDescriptor::new(DigestAlgorithmKind::Blake3, "a".repeat(64), 7).unwrap();
+    let expected = ArtifactDescriptor::new(DigestAlgorithmKind::Sha256, "a".repeat(64), 7).unwrap();
+    assert!(matches!(
+        observed.compare(&expected),
+        ArtifactReconciliation::DigestMismatch { .. }
+    ));
 }
 
 #[cfg(feature = "sha2")]
@@ -243,13 +215,15 @@ fn sha256_exact_inspection_uses_the_explicit_digest_need() {
     )
     .unwrap();
 
-    let (observation, evidence) = LocalTarget::new(path)
+    let observation = LocalPath::new(path)
         .unwrap()
-        .inspect(DigestAlgorithmKind::Sha256)
+        .open_file()
+        .unwrap()
+        .unwrap()
+        .digest(DigestAlgorithmKind::Sha256)
         .unwrap();
-    assert_eq!(evidence.algorithm, DigestAlgorithmKind::Sha256);
     assert_eq!(
-        observation.reconcile(expected).unwrap().0,
+        observation.compare(&expected),
         ArtifactReconciliation::Matches
     );
 }
@@ -260,13 +234,13 @@ fn local_inspection_and_size_reconciliation_of_digest_material() {
     let path = root.path().join("artifact");
     std::fs::write(&path, b"pulith").unwrap();
 
-    let (observation, evidence) = LocalTarget::new(path.clone()).unwrap().inspect(()).unwrap();
-    assert_eq!(observation, LocalObservation::File { bytes: 6 });
-    assert_eq!(evidence.path, path);
-
-    let (reconciliation, _) = observation
-        .reconcile(LocalExpectation::FileSize(6))
+    let observation = LocalPath::new(path.clone())
+        .unwrap()
+        .inspect_entry()
         .unwrap();
+    assert_eq!(observation, LocalObservation::File { bytes: 6 });
+
+    let reconciliation = observation.compare(&LocalExpectation::FileSize(6));
     assert_eq!(reconciliation, pulith::local::LocalReconciliation::Matches);
     assert_eq!(std::fs::read(&path).unwrap(), b"pulith");
 }
@@ -275,22 +249,22 @@ fn local_inspection_and_size_reconciliation_of_digest_material() {
 fn local_inspection_reports_missing_and_directory_without_mutation() {
     let root = tempfile::tempdir().unwrap();
     let missing = root.path().join("missing");
-    let (observation, _) = LocalTarget::new(missing.clone())
+    let observation = LocalPath::new(missing.clone())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
     assert_eq!(observation, LocalObservation::Missing);
 
-    let (observation, _) = LocalTarget::new(root.path().to_path_buf())
+    let observation = LocalPath::new(root.path().to_path_buf())
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
     assert_eq!(observation, LocalObservation::Directory);
 }
 
 #[cfg(unix)]
 #[test]
-fn symlink_is_classified_by_resolved_target() {
+fn entry_inspection_classifies_symlinks_without_following_them() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("file");
     let directory = root.path().join("directory");
@@ -299,17 +273,17 @@ fn symlink_is_classified_by_resolved_target() {
     crate::common::file_symlink(&file, root.path().join("file-link")).unwrap();
     crate::common::dir_symlink(&directory, root.path().join("dir-link")).unwrap();
 
-    let (observation, _) = LocalTarget::new(root.path().join("file-link"))
+    let observation = LocalPath::new(root.path().join("file-link"))
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
-    assert_eq!(observation, LocalObservation::SymlinkToFile);
+    assert_eq!(observation, LocalObservation::Symlink);
 
-    let (observation, _) = LocalTarget::new(root.path().join("dir-link"))
+    let observation = LocalPath::new(root.path().join("dir-link"))
         .unwrap()
-        .inspect(())
+        .inspect_entry()
         .unwrap();
-    assert_eq!(observation, LocalObservation::SymlinkToDirectory);
+    assert_eq!(observation, LocalObservation::Symlink);
 }
 
 #[test]

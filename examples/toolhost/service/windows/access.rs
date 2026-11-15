@@ -1,6 +1,6 @@
 use super::super::{Binding, NormalizedDecl, ServiceError, ServiceRoot};
 use super::{WindowsService, security};
-use pulith::local::{RecordEdit, RecordLimit, RecordObservation, RecordStore};
+use pulith::local::{RecordEdit, RecordLimit, RecordStore};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
@@ -302,10 +302,7 @@ impl<'a> AccessState<'a> {
             return Ok(None);
         }
         let store = RecordStore::new(directory).map_err(record)?;
-        match store.inspect(name, limit()).map_err(record)?.0 {
-            RecordObservation::Missing => Ok(None),
-            RecordObservation::Present(bytes) => Ok(Some(bytes)),
-        }
+        store.read(name, limit()).map_err(record)
     }
 
     fn store(&self) -> Result<RecordStore, ServiceError> {
@@ -358,10 +355,7 @@ impl RebindEdit<'_> {
 }
 
 fn present(edit: &RecordEdit, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
-    match edit.inspect(name, limit()).map_err(record)?.0 {
-        RecordObservation::Missing => Ok(None),
-        RecordObservation::Present(bytes) => Ok(Some(bytes)),
-    }
+    edit.read(name, limit()).map_err(record)
 }
 
 fn create(edit: &mut RecordEdit, name: &str, value: &impl Serialize) -> Result<(), ServiceError> {

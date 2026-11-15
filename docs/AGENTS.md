@@ -17,7 +17,6 @@ system, service ecosystem, or global workflow engine.
 - Keep behavior law, resource semantics, and concrete adapter separate.
 - Make effects explicit; inspection and reconciliation remain non-mutating.
 - Return typed evidence from the operation that observed or changed the resource.
-- Keep sync and async semantics equal; only execution modality may differ.
 - Preserve private staging custody until an explicit publication boundary.
 - Admit filesystem paths, URLs, environment entries, and process inputs before effects.
 - Reject traversal, collision, unsafe-link, unbounded-resource, and overwrite hazards where the API
