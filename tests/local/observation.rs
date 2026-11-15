@@ -51,8 +51,8 @@ fn open_file_keeps_bytes_and_metadata_on_the_same_handle() {
 #[cfg(unix)]
 #[test]
 fn open_file_refuses_symlinks_and_fifos() {
-    use rustix::fs::{CWD, Mode, mkfifoat};
     use std::os::unix::fs::symlink;
+    use std::process::Command;
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("file");
@@ -60,7 +60,16 @@ fn open_file_refuses_symlinks_and_fifos() {
     let fifo = root.path().join("fifo");
     std::fs::write(&path, b"original").unwrap();
     symlink(&path, &link).unwrap();
-    mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    let result = Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(&fifo)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let open_kind = |path| match LocalPath::new(path).unwrap().open_file().unwrap_err() {
         LocalError::NotRegularFile { kind, .. } => kind,
         error => panic!("{error}"),
